@@ -65,7 +65,7 @@ gdog-1 (pluginId)
 
 | 用途 | 契约 | 要点 |
 |---|---|---|
-| 自动发声钩子 | `conversation.chat.turnTail`（chain） | `select(owner) → matched`；owner 含 `turn: TurnLocation`、`seq`；标准 props 含 `useSession: SnapshotSelectorHook<ConversationSnapshot>` |
+| 自动发声数据源（v2 裁决） | host `session/event`（post-commit 追加流）+ `sessionQuery.readSession` | 消息事件含回复文本（与渲染同一内容）；client 轮询 `guide-dog/voice-queue` 播放（`timerSvc.interval` 已确认可用） |
 | 麦克风按钮 | `conversation.input.right`（list） | 空座位；owner props `{session, input}`；标准 props 含 `inputActions: InputActions` |
 | 语音模式徽章/通话状态条 | `conversation.input.dock`（list） | 现有占用 order 0/10/20 → 本插件用 **30** |
 | 通话发起按钮 | `conversation.session.header.actions`（list） | 现有占用 -10/10/20 → 本插件用 **30** |
@@ -134,15 +134,15 @@ gdog-1 (pluginId)
 2. **文字与语音逐字一致**：TTS 输入文本 = 该回复在对话中渲染的同一份 text blocks（唯一来源）；仅按 audio-conversation 规则做朗读性变换（剥离代码块/URL/符号），语义与文字不变。
 3. **失败必反馈**：TTS 失败时播放失败提示音 + 口头短句（"语音生成失败：原因"）+ dock 徽章显示失败状态，绝不静默。
 
-**机制实现（自动发声钩子）**：
+**机制实现（自动发声钩子，v2 裁决：host 事件驱动）**：
 
-- 在 `conversation.chat.turnTail` 注册 chain 条目（id 用插件自有标识，select 纯路由）：
-  - `select(owner)`：当 `语音模式生效值 === true` 且该 turn 未被朗读过时返回 `{ turn: owner.turn, seq: owner.seq }`，否则返回 `null`（全拒绝时链渲染为空，无副作用）。语音模式生效值由 client 模块内存态提供：插件启动时经 `host.call('guide-dog/get-config')` 加载，开关/会话切换后同步更新（select 为纯同步路由，不发起 RPC）。
-  - 组件挂载后：`useSession()` 快照中定位 `seq` 对应的 assistant 消息 → 提取 text blocks（代码块剔除、URL 剔除，规则与 audio-conversation `transform.py` 一致）→ `host.call('guide-dog/speak', { text, sessionId, turnSeq: seq, source: 'voice-mode' })`。
-  - **去重**：client 模块级 `Set<sessionId:seq>` + host 端 `Map<sessionId, Set<seq>>` 双保险；重复调用返回 `{ ok: true, skipped: true }`。
-  - 组件渲染 `null`（链规范允许；"全部拒绝则什么都不渲染"）。
-- 播放：host 走 v1 TTS 管线 → 媒体库 → 返回 `{ ok, url, bytes }`（时长由浏览器 `<audio>` 自行处理，不依赖 host 估算）→ client `<audio src="/guide-dog/media/...">` 播放（串行队列：新回复打断未播完的旧回复，符合 audio-conversation "一文件一播放" 约束）。
-- **失败反馈**：host 返回 `{ ok: false, code, message }` → client 用 WebAudio 播放短促提示音（不依赖 TTS 本身），dock 徽章显示"朗读失败：<原因>" 8 秒；尝试次数 ≤2，不重试循环。
+> 实施期探测证实：client 的 `useSession()` 快照为 Proxy/类实例（`Object.keys` 为空，`messages/turns/nodes` 均 undefined），`turnTail` 的 owner.turn 亦无消息文本字段——client 侧无法可靠提取回复文本。故机制改为 host 事件驱动（三条硬指标不变）：
+
+- host 监听 `session/event`（post-commit 追加流）：命中 assistant 消息事件且该会话语音模式生效时，从事件消息内容提取文本（与对话渲染的同一份内容）→ 去重（`spokenTurns`，sessionId+seq）→ `speakImpl({text, sessionId, turnSeq, source:'voice-mode'})` → 成功入队 `voiceQueue[sessionId]`（含 url/key），失败入队错误项。
+- client 在 dock 徽章内以 `timerSvc.interval`（1s）轮询 RPC `guide-dog/voice-queue`（带 sessionId，host 弹出即交付一次）→ `<audio autoPlay>` 播放 / 错误项显示失败 + 提示音。
+- **去重**：host 级 `Map<sessionId, Set<seq>>` 双保险（speakImpl 内已有）；队列弹出即消费，不重复播放。
+- 播放：client `<audio src="/guide-dog/media/...">`（React 自管元素，串行队列：新回复打断未播完的旧回复）。
+- **失败反馈**：speakImpl 失败 → 队列错误项（error code）→ client 播放失败提示音（beep RPC data-URI）+ dock 徽章显示"朗读失败：<原因>" 8 秒；尝试次数 ≤2，不重试循环。
 - **两层设置**：
   - 全局默认：`config.json → voiceMode.default`（默认 `false`），设置页（settings.section `guide-dog`）管理。
   - 会话 override：`voiceMode.sessions[sessionId]`，由 dock 徽章点击切换。
