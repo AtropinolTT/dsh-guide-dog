@@ -874,7 +874,7 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
 - Produces:
   - 模块级 `voiceState = { cfg, loaded, spoken: Set, lastError, errorAt, beepUri }`；`voiceEffective(sid)`；`loadVoiceCfg()`；`setVoiceOverride(sid, v)`
   - `conversation.chat.turnTail` 条目：select 粗筛（**无 spoken 检查**——select 拿不到 sessionId，去重只在组件内做，审查 M8 修复）；组件按 `props.sessionId` 精确判定 → speak RPC → 播放
-  - `conversation.input.dock` 条目 id `guide_dog_voice_mode` order 30：徽章（点击切换会话 override）+ 失败提示（8s 过期，经 `timerSvc.interval` 每秒 tick，timer 不可用时仅在下一次渲染过期）+ 隐藏 `<audio autoPlay>`
+  - `conversation.input.dock` 条目 id `guide-dog-voice-mode` order 30：徽章（点击切换会话 override）+ 失败提示（8s 过期，经 `timerSvc.interval` 每秒 tick，timer 不可用时仅在下一次渲染过期）+ 隐藏 `<audio autoPlay>`
 
 - [ ] **Step 1: 记录探测形状（决策门注释）**
 
@@ -982,7 +982,7 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
     ctx.effect(function () {
       return slots.inject('conversation.input.dock', function () {
         return slots.register(
-          { name: 'conversation.input.dock', id: 'guide_dog_voice_mode', order: 30, label: function () { return 'Voice mode' } },
+          { name: 'conversation.input.dock', id: 'guide-dog-voice-mode', order: 30, label: function () { return 'Voice mode' } },
           function (props) {
             const sid = props.sessionId
             const effective = voiceEffective(sid)
