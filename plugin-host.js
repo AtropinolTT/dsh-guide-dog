@@ -675,7 +675,7 @@ if __name__ == '__main__':
       }
     })
     if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide-dog-voice-mode', function (context) {
+      systemPrompt.variable('guide_dog_voice_mode', function (context) {
         const cfg = loadConfig()
         const sid = (context && (context.sessionId || (context.session && context.session.id))) || ''
         const vm = cfg.voiceMode || {}
@@ -1084,7 +1084,7 @@ if __name__ == '__main__':
     })
     // variable context 形状探测：下次提示词组装时把 context 键列表并入 probe.json（审查 M7）
     if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide-dog-probe-context', function (context) {
+      systemPrompt.variable('guide_dog_probe_context', function (context) {
         const root = guideRoot || ''
         if (root) {
           try {

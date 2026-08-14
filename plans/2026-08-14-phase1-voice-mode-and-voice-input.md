@@ -532,7 +532,7 @@ Expected: 全部 exit 0，commit 成功。
   - `speakImpl(args)` 入参扩展 `{text, sessionId?, turnSeq?, source?}`；**TTS 音色/语速接线 `loadConfig().tts`**（审查 I3 修复：`args.voice` 显式值 > config voiceEn/voiceZh（按 CJK 判定）> `resolveVoice` 默认）；去重命中 `{ok:true, skipped:true}`；**全部失败出口映射枚举**（`text is required` → `bad_args`；`TTS finished but the mp3 is missing` → `tts_failed`；`generateTts` error 含 timeout → `tts_timeout`，否则 `tts_failed`）
   - `pushIndex` 条目新增：`source`、`turnSeq`、`spoken`（transform 后文本前 160 字符）
   - RPC `guide-dog/beep` → `{ok, dataUri}`（150ms 880Hz 8bit PCM 8kHz WAV，Uint8Array+btoa）
-  - `systemPrompt.variable('guide-dog-voice-mode', provider)`：按会话生效值返回约束文本或 undefined（context 形状以 Task 4 探测为准，provider 内防御式取 sessionId）
+  - `systemPrompt.variable('guide_dog_voice_mode', provider)`：按会话生效值返回约束文本或 undefined（context 形状以 Task 4 探测为准，provider 内防御式取 sessionId）
 
 - [ ] **Step 1: 声明去重表**
 
@@ -629,7 +629,7 @@ Expected: 全部 exit 0，commit 成功。
 
 ```js
       if (systemPrompt && systemPrompt.variable) {
-        systemPrompt.variable('guide-dog-voice-mode', function (context) {
+        systemPrompt.variable('guide_dog_voice_mode', function (context) {
           const cfg = loadConfig()
           const sid = (context && (context.sessionId || (context.session && context.session.id))) || ''
           const vm = cfg.voiceMode || {}
@@ -777,7 +777,7 @@ Expected: exit 0，commit 成功。
     })
     // variable context 形状探测：下次提示词组装时把 context 键列表并入 probe.json（审查 M7）
     if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide-dog-probe-context', function (context) {
+      systemPrompt.variable('guide_dog_probe_context', function (context) {
         const root = guideRoot || ''
         if (root) {
           try {
@@ -874,7 +874,7 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
 - Produces:
   - 模块级 `voiceState = { cfg, loaded, spoken: Set, lastError, errorAt, beepUri }`；`voiceEffective(sid)`；`loadVoiceCfg()`；`setVoiceOverride(sid, v)`
   - `conversation.chat.turnTail` 条目：select 粗筛（**无 spoken 检查**——select 拿不到 sessionId，去重只在组件内做，审查 M8 修复）；组件按 `props.sessionId` 精确判定 → speak RPC → 播放
-  - `conversation.input.dock` 条目 id `guide-dog-voice-mode` order 30：徽章（点击切换会话 override）+ 失败提示（8s 过期，经 `timerSvc.interval` 每秒 tick，timer 不可用时仅在下一次渲染过期）+ 隐藏 `<audio autoPlay>`
+  - `conversation.input.dock` 条目 id `guide_dog_voice_mode` order 30：徽章（点击切换会话 override）+ 失败提示（8s 过期，经 `timerSvc.interval` 每秒 tick，timer 不可用时仅在下一次渲染过期）+ 隐藏 `<audio autoPlay>`
 
 - [ ] **Step 1: 记录探测形状（决策门注释）**
 
@@ -982,7 +982,7 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
     ctx.effect(function () {
       return slots.inject('conversation.input.dock', function () {
         return slots.register(
-          { name: 'conversation.input.dock', id: 'guide-dog-voice-mode', order: 30, label: function () { return 'Voice mode' } },
+          { name: 'conversation.input.dock', id: 'guide_dog_voice_mode', order: 30, label: function () { return 'Voice mode' } },
           function (props) {
             const sid = props.sessionId
             const effective = voiceEffective(sid)
@@ -1371,7 +1371,7 @@ Expected: `starting`；最终 running、currentPackageId=pkg-6。
 ```bash
 # cordis_inspect_query:
 #   client Slots root=conversation.input.right      → occupant id=guide-dog-mic（PROBE 条目已删）
-#   client Slots root=conversation.input.dock       → occupant id=guide-dog-voice-mode (order 30)
+#   client Slots root=conversation.input.dock       → occupant id=guide_dog_voice_mode (order 30)
 #   client Slots root=settings.section              → occupant id=guide-dog
 #   client Slots root=conversation.chat.turnTail    → 我们的 chain 条目（select 注册）
 #   host Tool.listTools                             → 仍为 9 个 guide_dog_* 工具
