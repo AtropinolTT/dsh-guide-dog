@@ -13,7 +13,7 @@ return {
         MediaRecorder: typeof MediaRecorder, AudioContext: typeof AudioContext,
         WebSocket: typeof WebSocket, fetch: typeof fetch, document: typeof document,
         Blob: typeof Blob,
-        BlobArrayBuffer: typeof Blob !== 'undefined' && typeof Blob !== 'function' ? 'n/a' : typeof Blob.prototype.arrayBuffer,
+        BlobArrayBuffer: (typeof Blob === 'function') ? typeof Blob.prototype.arrayBuffer : 'n/a',
         btoa: typeof btoa, URL: typeof URL, setInterval: typeof setInterval, clearInterval: typeof clearInterval,
         Date: typeof Date, JSON: typeof JSON, Promise: typeof Promise, Object: typeof Object, String: typeof String,
       }
@@ -21,7 +21,24 @@ return {
     function probeTimer() {
       var t = null
       try { t = ctx.get('timer') } catch (e) { t = null }
-      return { exists: !!t, keys: probeKeys(t) }
+      var timeoutType = 'n/a'
+      var intervalType = 'n/a'
+      if (t) {
+        try { timeoutType = typeof t.timeout } catch (e) { timeoutType = 'n/a' }
+        try { intervalType = typeof t.interval } catch (e) { intervalType = 'n/a' }
+      }
+      return { exists: !!t, keys: probeKeys(t), timeoutType: timeoutType, intervalType: intervalType }
+    }
+    function scalarText(v) {
+      if (v === undefined || v === null) return ''
+      if (typeof v === 'string') return v.slice(0, 80)
+      if (typeof v === 'object') {
+        try {
+          if (typeof v.text === 'string') return v.text.slice(0, 80)
+          if (typeof v.content === 'string') return v.content.slice(0, 80)
+        } catch (e) { /* ignore */ }
+      }
+      return ''
     }
     // (a) 常驻探测：input.right 挂载即上报 globals/inputActions/timer（空会话可用）
     ctx.effect(function () {
@@ -51,29 +68,48 @@ return {
         return slots.register(
           { name: 'conversation.chat.turnTail', select: function (owner) {
               if (!owner || !owner.turn) return null
-              return { turnKeys: probeKeys(owner.turn), seq: owner.seq }
+              const turn = owner.turn
+              const steps = Array.isArray(turn.steps) ? turn.steps : []
+              const s0 = steps[0] || {}
+              return {
+                turnKeys: probeKeys(turn), seq: owner.seq,
+                turnStepsIsArray: Array.isArray(turn.steps),
+                steps0Keys: probeKeys(s0),
+                steps0HasMessage: s0.message !== undefined,
+                steps0HasContent: s0.content !== undefined,
+                steps0HasText: s0.text !== undefined,
+                textSample: scalarText(s0.message) || scalarText(turn.data) || '',
+              }
             } },
           function (props) {
+            // 渲染期调用 useSession()（审查：useEffect 内调用导致 snapshotKeys 为空）
+            let snap = null
+            try { snap = props.useSession() } catch (e) { snap = null }
             React.useEffect(function () {
-              let snap = null
-              try { snap = props.useSession() } catch (e) { snap = null }
+              const m = props.matched || {}
               const list = snap ? (snap.messages || snap.turns || snap.nodes || []) : []
               const first = list[0] || {}
               const firstMsgKeys = probeKeys(first)
               let contentKeys = []
-              let textSample = ''
+              let snapshotText = ''
               if (Array.isArray(first.content)) {
                 const b0 = first.content[0] || {}
                 contentKeys = probeKeys(b0)
-                textSample = String(b0.text !== undefined ? b0.text : (b0.content !== undefined ? b0.content : '')).slice(0, 80)
+                snapshotText = String(b0.text !== undefined ? b0.text : (b0.content !== undefined ? b0.content : '')).slice(0, 80)
               }
               host.call('guide-dog/probe', {
                 report: {
                   turnTail: {
-                    turnKeys: (props.matched && props.matched.turnKeys) || [],
-                    seq: props.matched ? props.matched.seq : null,
+                    turnKeys: m.turnKeys || [],
+                    seq: m.seq !== undefined ? m.seq : null,
                     snapshotKeys: probeKeys(snap), messagesKeys: probeKeys(list),
-                    firstMessageKeys: firstMsgKeys, contentKeys: contentKeys, textSample: textSample,
+                    firstMessageKeys: firstMsgKeys, contentKeys: contentKeys,
+                    textSample: m.textSample || snapshotText,
+                    turnStepsIsArray: m.turnStepsIsArray === true,
+                    steps0Keys: m.steps0Keys || [],
+                    steps0HasMessage: m.steps0HasMessage === true,
+                    steps0HasContent: m.steps0HasContent === true,
+                    steps0HasText: m.steps0HasText === true,
                   },
                 },
               }).catch(function () {})
