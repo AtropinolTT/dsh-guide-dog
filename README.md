@@ -131,10 +131,104 @@ Settings → **Guide Dog** (id `guide-dog`):
 
 - **Auth** — `mmx auth status` result with the key masked (`sk-c…xxxx`); never
   logged in full.
+- **语音模式（Voice mode）** — global default on/off radios (per-session
+  override lives on the input-dock badge).
+- **语音输入（Voice input）** — STT engine select (whisper / sherpa / minimax),
+  recognition language (auto/zh/en), and auto-send-after-recognition checkbox.
+- **STT** — faster-whisper availability + version/python, and the whisper model
+  select (base/small).
 - **Speak tester** — text + voice selector (from `guide-dog/voices`), plays the
   mp3 in the browser.
 - **Recent media** — last 30 items from the index: image thumbnails (click to
   open full size), video tiles, audio players.
+
+## Phase 1 — voice mode & voice input
+
+### Feature list
+
+- **Voice mode (host event-driven)** — a host `session/event` listener watches
+  `assistant/message` events, extracts the reply text
+  (`event.data.content` blocks with `type === 'text'`), checks whether voice
+  mode is effective for that session (session override else global default),
+  and enqueues the TTS result (`{url, key}`) or error into a per-session
+  `voiceQueue`. The client polls the queue every second and plays a hidden
+  `<audio autoPlay>` element, or shows a failed badge + beep for 8s.
+- **Voice-mode badge** — `conversation.input.dock` entry `guide-dog-voice-mode`
+  (order 30) shows 🔊/🔇 and toggles the per-session override
+  (`guide-dog/set-config` with `voiceMode.sessions`).
+- **Mic voice input** — `conversation.input.right` entry `guide-dog-mic`
+  (order 30): MediaRecorder with 1s timeslices, live second counter, maxSeconds
+  auto-stop, language cycle auto/zh/en, and transcribe via
+  `guide-dog/transcribe`. Recognized text is inserted into the input box with
+  `inputActions.setDraft(text)` (auto-send via `inputActions.submit()` when
+  configured). Error states: `mic_denied`, `empty_speech`, `stt_failed`,
+  `stt_timeout`, `engine_unavailable`, `insert_failed` (never silent).
+- **Recorder page** — sandboxed clients that cannot record in-page get a
+  `🎙 打开录音页` link to the standalone `/guide-dog/recorder` page
+  (GET serves a self-contained HTML recorder; POST
+  `/guide-dog/transcribe-upload` accepts raw `audio/webm`, 20 MB cap, and runs
+  the same `transcribeImpl`).
+- **Settings controls** — the Phase 1 config blocks above, backed by
+  `guide-dog/get-config` / `guide-dog/set-config` / `guide-dog/status`.
+
+### config.json schema
+
+Lives at `<workspaceRoot>/.guide-dog/config.json` (auto-created from defaults;
+all keys optional, deep-merged over the defaults):
+
+```json
+{
+  "voiceMode": { "default": false, "sessions": { "<sessionId>": true } },
+  "voiceInput": {
+    "autoSend": false,
+    "engine": "whisper",
+    "language": "auto",
+    "maxSeconds": 60,
+    "whisper": { "python": "python3", "model": "small" }
+  },
+  "tts": {
+    "voiceEn": "English_expressive_narrator",
+    "voiceZh": "Chinese (Mandarin)_Gentle_Youth",
+    "speed": 0.95,
+    "format": "mp3"
+  }
+}
+```
+
+- `voiceMode.sessions` maps a session id to a boolean override; `default` is
+  the fallback. The input-dock badge toggles the current session's override.
+- `voiceInput.engine`: `whisper` (only engine implemented; `sherpa`/`minimax`
+  are reserved — selecting them returns `engine_unavailable`).
+- `voiceInput.maxSeconds` forces the mic recording to stop.
+
+### STT engine (faster-whisper)
+
+The `whisper` engine shells out to a bundled Python script
+(`.guide-dog/scripts/whisper_transcribe.py`) using `faster-whisper`:
+
+```
+pip install faster-whisper        # needs Python 3.8+; installs torch cpu wheels
+python3 -c "import faster_whisper; print(faster_whisper.__version__)"
+```
+
+The host probes availability at startup and writes the result to
+`.guide-dog/status.json` (`whisperAvailable`, `whisperVersion`, `whisperPython`),
+shown in the Settings → STT row. Model choices: `base` (fast) / `small`
+(accurate); first run downloads the model weights.
+
+### Verification
+
+```
+node --check plugin-host.js && node --check plugin-client.js          # syntax
+curl -s http://127.0.0.1:3080/guide-dog/recorder | head -5             # recorder page serves HTML
+curl -s http://127.0.0.1:3080/guide-dog/status | head -5               # status RPC
+cat <workspaceRoot>/.guide-dog/status.json                             # whisper probe result
+```
+
+Manual checks (after deploy): toggle the voice-mode badge → send a message →
+the assistant reply is spoken automatically (badge turns 🔊, audio plays);
+use the 🎙 mic button → recognized text appears in the input box; Settings →
+Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
 
 ## RPC surface (Client → Host)
 
@@ -144,6 +238,12 @@ Settings → **Guide Dog** (id `guide-dog`):
 | `guide-dog/list-media` | `{limit?}` | `[{name, kind, prompt, voice, ts, bytes, url}]` |
 | `guide-dog/auth-status` | — | `{ok, method, source, keyMasked}` |
 | `guide-dog/voices` | `{language?}` | `{ok, voices[]}` |
+| `guide-dog/get-config` | — | `{ok, config}` (merged defaults) |
+| `guide-dog/set-config` | `{patch}` | `{ok}` / `{ok:false, error}` |
+| `guide-dog/status` | — | `{ok, status}` (whisper probe + probeAt) |
+| `guide-dog/transcribe` | `{audioB64, mime, sessionId?, language?}` | `{ok, text, language, durationMs}` / `{ok:false, error}` |
+| `guide-dog/beep` | — | `{ok, dataUri}` (WAV beep data URI) |
+| `guide-dog/voice-queue` | `{sessionId}` | `{ok, entry}` — pops one entry (play/error) or `null` |
 
 ## Security notes
 

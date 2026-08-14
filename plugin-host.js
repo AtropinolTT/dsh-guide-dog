@@ -40,7 +40,6 @@ return {
       for (const k of Object.keys(over)) if (!(k in base)) out[k] = over[k]
       return out
     }
-    function probeKeys(o) { try { return o ? Object.keys(o).slice(0, 40) : [] } catch (e) { return [] } }
     let guideRoot = ''
     async function guideDogRoot() {
       if (guideRoot) return guideRoot
@@ -653,6 +652,77 @@ if __name__ == '__main__':
       }
     })
 
+    // ============ RECORDER 页（Phase 1，Task 6b） ============
+    const RECORDER_HTML = `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Guide Dog 录音转写</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 16px;text-align:center}
+button{font-size:18px;padding:14px 28px;border-radius:10px;border:none;background:#4a7dff;color:#fff;cursor:pointer;margin:8px}
+#status{color:#888;margin:12px 0}#out{white-space:pre-wrap;background:#f4f4f4;border-radius:8px;padding:14px;min-height:60px;text-align:left;display:none}
+.err{color:#c0392b}</style></head><body>
+<h2>🎙 Guide Dog 录音转写</h2>
+<p>点击录音，说完后停止，文字会自动转写。</p>
+<button id="rec">开始录音</button><button id="cp" style="display:none">复制文本</button>
+<div id="status">空闲</div><div id="out"></div>
+<script>
+const b=document.getElementById('rec'),st=document.getElementById('status'),out=document.getElementById('out'),cp=document.getElementById('cp');
+let mr=null,chunks=[];
+b.onclick=async()=>{
+  if(mr){mr.stop();return}
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:true});
+    mr=new MediaRecorder(s);chunks=[];
+    mr.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+    mr.onstop=async()=>{
+      const blob=new Blob(chunks,{type:'audio/webm'});
+      st.textContent='转写中…';
+      try{
+        const r=await fetch('/guide-dog/transcribe-upload',{method:'POST',body:blob});
+        const j=await r.json();
+        if(j.ok&&j.text){out.style.display='block';out.textContent=j.text;cp.style.display='inline-block';st.textContent='完成（'+(j.language||'')+'）'}
+        else{st.className='err';st.textContent=(j.message||j.error||'转写失败')}
+      }catch(e){st.className='err';st.textContent='网络错误：'+e}
+      s.getTracks().forEach(t=>t.stop());mr=null;b.textContent='开始录音';
+    };
+    mr.start(1000);b.textContent='停止';st.textContent='录音中…';st.className='';
+  }catch(e){st.className='err';st.textContent='无法访问麦克风：'+e}
+};
+cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp.textContent='已复制'}catch(e){out.select();document.execCommand('copy');cp.textContent='已复制'}};
+</script></body></html>`
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'prefix',
+          path: '/guide-dog/recorder',
+          handler: async function (req, res) {
+            const raw = String(req.url || '/').split('?')[0]
+            if (raw === '/guide-dog/recorder' && (req.method === 'GET' || req.method === 'HEAD')) {
+              res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+              res.end(RECORDER_HTML)
+              return
+            }
+            if (raw === '/guide-dog/transcribe-upload' && req.method === 'POST') {
+              const chunks = []
+              let total = 0
+              for await (const c of req) {
+                chunks.push(c)
+                total += c.length
+                if (total > 20 * 1024 * 1024) { res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
+              }
+              const all = new Uint8Array(total)
+              let off = 0
+              for (const c of chunks) { all.set(c, off); off += c.length }
+              const bin = new TextDecoder('latin1').decode(all)
+              const r = await transcribeImpl({ audioB64: btoa(bin), mime: 'audio/webm', sessionId: '', language: 'auto' })
+              res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify(r))
+              return
+            }
+            res.writeHead(404); res.end(); return
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+
     // ---------- prompt section: automatic invocation ----------
     ctx.effect(function () {
       if (!systemPrompt) return function () {}
@@ -1076,92 +1146,56 @@ if __name__ == '__main__':
             if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
             await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
             const next = Object.assign({}, cur, (args && args.report) || {})
-            // pkg-4: host-side session log shape probe (client probe reports sessionId)
-            const sid = (args && args.report && args.report.sessionId) ? String(args.report.sessionId) : ''
-            if (sid && !cur.sessionEvents) {
-              const sq = ctx.get('sessionQuery')
-              if (!sq || typeof sq.readSession !== 'function') {
-                next.sessionEvents = { error: 'no sessionQuery' }
-              } else {
-                try {
-                  const snap = await sq.readSession(sid)
-                  const events = (snap && Array.isArray(snap.events)) ? snap.events : []
-                  const sample = events.slice(-3).map(function (e) {
-                    return {
-                      keys: probeKeys(e),
-                      type: (typeof e.type === 'string') ? e.type : (typeof e.kind === 'string' ? e.kind : String(typeof e.type)),
-                      hasMessage: !!e.message,
-                      messageKeys: probeKeys(e.message),
-                      hasContent: !!e.content,
-                      contentKeys: Array.isArray(e.content) ? probeKeys(e.content[0] || {}) : probeKeys(e.content),
-                      textSample: (function () {
-                        if (e.message && typeof e.message.content === 'string') return e.message.content.slice(0, 80)
-                        if (e.message && Array.isArray(e.message.content) && e.message.content[0] && typeof e.message.content[0].text === 'string') return e.message.content[0].text.slice(0, 80)
-                        if (typeof e.content === 'string') return e.content.slice(0, 80)
-                        return ''
-                      })(),
-                    }
-                  })
-                  next.sessionEvents = { snapshotKeys: probeKeys(snap), eventCount: events.length, sample: sample }
-                } catch (e) { next.sessionEvents = { error: String(e).slice(0, 200) } }
-              }
-            }
             await writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(next, null, 2))
             return { ok: true }
           } catch (e) { return { ok: false, error: 'config_write_failed', message: String(e).slice(0, 200) } }
         })
       } catch (e) { return function () {} }
     })
-    // pkg-4: live session/event scalar dump (once) — registers directly via ctx.effect
-    let liveEventDumped = false
-    ctx.effect(function () {
-      return ctx.on('session/event', async function (session, event) {
-        if (liveEventDumped) return
-        try {
-          liveEventDumped = true
-          const root = await guideDogRoot()
-          if (!root) return
-          const ev = event || {}
-          const content = Array.isArray(ev.content) ? ev.content : []
-          const b0 = content[0] || {}
-          const dump = {
-            eventKeys: probeKeys(ev),
-            eventType: (typeof ev.type === 'string') ? ev.type : String(typeof ev.type),
-            eventKind: (typeof ev.kind === 'string') ? ev.kind : undefined,
-            hasMessage: !!ev.message,
-            messageKeys: probeKeys(ev.message),
-            hasText: typeof ev.text === 'string',
-            contentKeys: probeKeys(b0),
-            b0Type: b0.type,
-            textSample: String(b0.text !== undefined ? b0.text : (b0.content !== undefined ? b0.content : '')).slice(0, 80),
-            sessionIdSample: (typeof session === 'string' ? session : (session && session.id)) || null,
-          }
-          readTextFile(root + '/.guide-dog/probe2.json').then(function (raw) {
-            let cur = {}
-            if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-            cur.liveEvent = dump
-            return writeTextFile(root + '/.guide-dog/probe2.json', JSON.stringify(cur, null, 2))
-          }).catch(function () {})
-        } catch (e) { /* best effort */ }
-      })
+    // ============ VOICE MODE 节（Phase 1，host） ============
+    // 事件形状（决策门 probe2.json 回填）：
+    //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
+    //   - 文本提取: const data = event.data || {}；content 取 data.content（或 data.message.content）blocks；
+    //     text = content 中 type==='text' 的 b.text 拼接
+    //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
+    const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'assistant/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const vm = cfg.voiceMode || {}
+        const effective = vm.sessions && vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
+        if (!effective) return
+        const seq = (typeof event.seq === 'number') ? event.seq : 0
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
+        if (!text) return
+        // 异步串行 TTS，不阻塞事件循环
+        serialSpeak(function () {
+          return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
+            const q = voiceQueue.get(sid) || []
+            if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
+            else if (r && !r.ok) q.push({ error: (r.message || r.error || 'tts_failed') })
+            voiceQueue.set(sid, q)
+          })
+        })
+      } catch (e) { /* listener is best effort */ }
     })
-    // variable context 形状探测：下次提示词组装时把 context 键列表并入 probe.json（审查 M7）
-    if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide_dog_probe_context', function (context) {
-        const root = guideRoot || ''
-        if (root) {
-          try {
-            readTextFile(root + '/.guide-dog/probe.json').then(function (raw) {
-              let cur = {}
-              if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-              cur.variableContextKeys = probeKeys(context)
-              return writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(cur, null, 2))
-            }).catch(function () {})
-          } catch (e) { /* ignore */ }
-        }
-        return undefined
-      })
-    }
+    ctx.effect(function () {
+      try {
+        return harness.handle('guide-dog/voice-queue', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: true, entry: null }
+          const q = voiceQueue.get(sid) || []
+          const entry = q.length ? q.shift() : null
+          if (!q.length) voiceQueue.delete(sid)
+          return { ok: true, entry: entry }
+        })
+      } catch (e) { return function () {} }
+    })
 
     // ---------- RPC handlers (client -> host) ----------
     ctx.effect(function () {
@@ -1217,38 +1251,5 @@ if __name__ == '__main__':
     ensureMediaDir().catch(function (e) {
       console.error('[guide-dog] media dir init failed: ' + String(e))
     })
-
-    // pkg-4: eager session-log shape probe (best effort; client-triggered probe covers it if this fails)
-    ;(async function () {
-      try {
-        const ssvc = ctx.get('sessions')
-        const list = ssvc && typeof ssvc.list === 'function' ? await ssvc.list() : []
-        if (list && list.length) {
-          const sid = list[0].id || String(list[0])
-          const sq = ctx.get('sessionQuery')
-          if (sq && typeof sq.readSession === 'function') {
-            const snap = await sq.readSession(sid)
-            const events = (snap && Array.isArray(snap.events)) ? snap.events : []
-            const sample = events.slice(-3).map(function (e) {
-              return {
-                keys: probeKeys(e),
-                type: (typeof e.type === 'string') ? e.type : String(typeof e.type),
-                hasMessage: !!e.message,
-                messageKeys: probeKeys(e.message),
-                contentKeys: Array.isArray(e.content) ? probeKeys(e.content[0] || {}) : probeKeys(e.content),
-                textSample: (e.message && typeof e.message.content === 'string') ? e.message.content.slice(0, 80) : '',
-              }
-            })
-            const root = await guideDogRoot()
-            await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
-            const cur = {}
-            const raw = await readTextFile(root + '/.guide-dog/probe2.json')
-            if (raw) { try { cur.sessionEvents = JSON.parse(raw).sessionEvents } catch (e) { /* ignore */ } }
-            if (!cur.sessionEvents) cur.sessionEvents = { snapshotKeys: probeKeys(snap), eventCount: events.length, sample: sample }
-            await writeTextFile(root + '/.guide-dog/probe2.json', JSON.stringify(cur, null, 2))
-          }
-        }
-      } catch (e) { /* best effort */ }
-    })()
   },
 }
