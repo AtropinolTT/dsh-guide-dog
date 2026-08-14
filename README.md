@@ -132,7 +132,7 @@ Settings → **Guide Dog** (id `guide-dog`):
 - **Auth** — `mmx auth status` result with the key masked (`sk-c…xxxx`); never
   logged in full.
 - **语音模式（Voice mode）** — global default on/off radios (per-session
-  override lives on the input-dock badge).
+  override lives on the small speaker button at the input's bottom-left).
 - **语音输入（Voice input）** — STT engine select (whisper / sherpa / minimax),
   recognition language (auto/zh/en), and auto-send-after-recognition checkbox.
 - **STT** — faster-whisper availability + version/python, and the whisper model
@@ -151,18 +151,28 @@ Settings → **Guide Dog** (id `guide-dog`):
   (`event.data.content` blocks with `type === 'text'`), checks whether voice
   mode is effective for that session (session override else global default),
   and enqueues the TTS result (`{url, key}`) or error into a per-session
-  `voiceQueue`. The client polls the queue every second and plays a hidden
-  `<audio autoPlay>` element, or shows a failed badge + beep for 8s.
-- **Voice-mode badge** — `conversation.input.dock` entry `guide-dog-voice-mode`
-  (order 30) shows 🔊/🔇 and toggles the per-session override
-  (`guide-dog/set-config` with `voiceMode.sessions`).
-- **Mic voice input** — `conversation.input.right` entry `guide-dog-mic`
-  (order 30): MediaRecorder with 1s timeslices, live second counter, maxSeconds
-  auto-stop, language cycle auto/zh/en, and transcribe via
-  `guide-dog/transcribe`. Recognized text is inserted into the input box with
-  `inputActions.setDraft(text)` (auto-send via `inputActions.submit()` when
-  configured). Error states: `mic_denied`, `empty_speech`, `stt_failed`,
-  `stt_timeout`, `engine_unavailable`, `insert_failed` (never silent).
+  `voiceQueue`. The client polls the queue every second and plays it with a
+  module-level `Audio` object, or shows a failed badge + beep for 8s.
+- **Voice cluster** — `conversation.input.left` entry `guide-dog-voice`
+  (order 30) at the input box's bottom-left, themed with DSH tokens
+  (`--dsw-alias-*`), inheriting the app font:
+  - small **speaker** icon — click toggles the per-session voice-mode override
+    (`guide-dog/set-config` with `voiceMode.sessions`); hover tooltip shows
+    "语音模式提示：开/关 · 全局默认：开/关".
+  - **language dropdown** — recognition language detection (auto/zh/en).
+  - **mic** icon — record → transcribe → insert (feather-style SVG; recording
+    state pulses red with a second counter).
+- **Session-scoped playback** — playback runs on a module-level `Audio`
+  object, so switching sessions never replays or interrupts it: the current
+  clip plays to the end unless a new playback task (a fresh queue entry from
+  any session) overrides it.
+- **Mic voice input** — the mic in the cluster: MediaRecorder with 1s
+  timeslices, live second counter, maxSeconds auto-stop, language from the
+  dropdown, and transcribe via `guide-dog/transcribe`. Recognized text is
+  inserted into the input box with `inputActions.setDraft(text)` (auto-send
+  via `inputActions.submit()` when configured). Error states: `mic_denied`,
+  `no_device`, `empty_speech`, `stt_failed`, `stt_timeout`,
+  `engine_unavailable`, `insert_failed` (never silent).
 - **Recorder page** — sandboxed clients that cannot record in-page get a
   `🎙 打开录音页` link to the standalone `/guide-dog/recorder` page
   (GET serves a self-contained HTML recorder; POST
@@ -196,7 +206,8 @@ all keys optional, deep-merged over the defaults):
 ```
 
 - `voiceMode.sessions` maps a session id to a boolean override; `default` is
-  the fallback. The input-dock badge toggles the current session's override.
+  the fallback. The speaker button at the input's bottom-left toggles the
+  current session's override.
 - `voiceInput.engine`: `whisper` (only engine implemented; `sherpa`/`minimax`
   are reserved — selecting them returns `engine_unavailable`).
 - `voiceInput.maxSeconds` forces the mic recording to stop.
@@ -225,9 +236,10 @@ curl -s http://127.0.0.1:3080/guide-dog/status | head -5               # status 
 cat <workspaceRoot>/.guide-dog/status.json                             # whisper probe result
 ```
 
-Manual checks (after deploy): toggle the voice-mode badge → send a message →
-the assistant reply is spoken automatically (badge turns 🔊, audio plays);
-use the 🎙 mic button → recognized text appears in the input box; Settings →
+Manual checks (after deploy): click the speaker button (voice mode on, turns
+green) → send a message → the assistant reply is spoken automatically; switch
+sessions mid-playback → the clip continues to the end and is NOT replayed;
+use the mic button → recognized text appears in the input box; Settings →
 Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
 
 ## RPC surface (Client → Host)
