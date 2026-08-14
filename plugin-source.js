@@ -1077,11 +1077,74 @@ if __name__ == '__main__':
             if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
             await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
             const next = Object.assign({}, cur, (args && args.report) || {})
+            // pkg-4: host-side session log shape probe (client probe reports sessionId)
+            const sid = (args && args.report && args.report.sessionId) ? String(args.report.sessionId) : ''
+            if (sid && !cur.sessionEvents) {
+              const sq = ctx.get('sessionQuery')
+              if (!sq || typeof sq.readSession !== 'function') {
+                next.sessionEvents = { error: 'no sessionQuery' }
+              } else {
+                try {
+                  const snap = await sq.readSession(sid)
+                  const events = (snap && Array.isArray(snap.events)) ? snap.events : []
+                  const sample = events.slice(-3).map(function (e) {
+                    return {
+                      keys: probeKeys(e),
+                      type: (typeof e.type === 'string') ? e.type : (typeof e.kind === 'string' ? e.kind : String(typeof e.type)),
+                      hasMessage: !!e.message,
+                      messageKeys: probeKeys(e.message),
+                      hasContent: !!e.content,
+                      contentKeys: Array.isArray(e.content) ? probeKeys(e.content[0] || {}) : probeKeys(e.content),
+                      textSample: (function () {
+                        if (e.message && typeof e.message.content === 'string') return e.message.content.slice(0, 80)
+                        if (e.message && Array.isArray(e.message.content) && e.message.content[0] && typeof e.message.content[0].text === 'string') return e.message.content[0].text.slice(0, 80)
+                        if (typeof e.content === 'string') return e.content.slice(0, 80)
+                        return ''
+                      })(),
+                    }
+                  })
+                  next.sessionEvents = { snapshotKeys: probeKeys(snap), eventCount: events.length, sample: sample }
+                } catch (e) { next.sessionEvents = { error: String(e).slice(0, 200) } }
+              }
+            }
             await writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(next, null, 2))
             return { ok: true }
           } catch (e) { return { ok: false, error: 'config_write_failed', message: String(e).slice(0, 200) } }
         })
       } catch (e) { return function () {} }
+    })
+    // pkg-4: live session/event scalar dump (once) — registers directly via ctx.effect
+    let liveEventDumped = false
+    ctx.effect(function () {
+      return ctx.on('session/event', async function (session, event) {
+        if (liveEventDumped) return
+        try {
+          liveEventDumped = true
+          const root = await guideDogRoot()
+          if (!root) return
+          const ev = event || {}
+          const content = Array.isArray(ev.content) ? ev.content : []
+          const b0 = content[0] || {}
+          const dump = {
+            eventKeys: probeKeys(ev),
+            eventType: (typeof ev.type === 'string') ? ev.type : String(typeof ev.type),
+            eventKind: (typeof ev.kind === 'string') ? ev.kind : undefined,
+            hasMessage: !!ev.message,
+            messageKeys: probeKeys(ev.message),
+            hasText: typeof ev.text === 'string',
+            contentKeys: probeKeys(b0),
+            b0Type: b0.type,
+            textSample: String(b0.text !== undefined ? b0.text : (b0.content !== undefined ? b0.content : '')).slice(0, 80),
+            sessionIdSample: (typeof session === 'string' ? session : (session && session.id)) || null,
+          }
+          readTextFile(root + '/.guide-dog/probe2.json').then(function (raw) {
+            let cur = {}
+            if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
+            cur.liveEvent = dump
+            return writeTextFile(root + '/.guide-dog/probe2.json', JSON.stringify(cur, null, 2))
+          }).catch(function () {})
+        } catch (e) { /* best effort */ }
+      })
     })
     // variable context 形状探测：下次提示词组装时把 context 键列表并入 probe.json（审查 M7）
     if (systemPrompt && systemPrompt.variable) {
@@ -1155,6 +1218,39 @@ if __name__ == '__main__':
     ensureMediaDir().catch(function (e) {
       console.error('[guide-dog] media dir init failed: ' + String(e))
     })
+
+    // pkg-4: eager session-log shape probe (best effort; client-triggered probe covers it if this fails)
+    (async function () {
+      try {
+        const ssvc = ctx.get('sessions')
+        const list = ssvc && typeof ssvc.list === 'function' ? await ssvc.list() : []
+        if (list && list.length) {
+          const sid = list[0].id || String(list[0])
+          const sq = ctx.get('sessionQuery')
+          if (sq && typeof sq.readSession === 'function') {
+            const snap = await sq.readSession(sid)
+            const events = (snap && Array.isArray(snap.events)) ? snap.events : []
+            const sample = events.slice(-3).map(function (e) {
+              return {
+                keys: probeKeys(e),
+                type: (typeof e.type === 'string') ? e.type : String(typeof e.type),
+                hasMessage: !!e.message,
+                messageKeys: probeKeys(e.message),
+                contentKeys: Array.isArray(e.content) ? probeKeys(e.content[0] || {}) : probeKeys(e.content),
+                textSample: (e.message && typeof e.message.content === 'string') ? e.message.content.slice(0, 80) : '',
+              }
+            })
+            const root = await guideDogRoot()
+            await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
+            const cur = {}
+            const raw = await readTextFile(root + '/.guide-dog/probe2.json')
+            if (raw) { try { cur.sessionEvents = JSON.parse(raw).sessionEvents } catch (e) { /* ignore */ } }
+            if (!cur.sessionEvents) cur.sessionEvents = { snapshotKeys: probeKeys(snap), eventCount: events.length, sample: sample }
+            await writeTextFile(root + '/.guide-dog/probe2.json', JSON.stringify(cur, null, 2))
+          }
+        }
+      } catch (e) { /* best effort */ }
+    })()
   },
 }
 
@@ -1212,6 +1308,7 @@ return {
               try { inputState = props.useInput() } catch (e) { inputState = null }
               host.call('guide-dog/probe', {
                 report: {
+                  sessionId: props.sessionId,
                   globals: reportGlobals(),
                   inputActions: { keys: probeKeys(props.inputActions) },
                   inputStateKeys: { keys: probeKeys(inputState) },

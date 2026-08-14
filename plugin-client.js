@@ -51,6 +51,7 @@ return {
               try { inputState = props.useInput() } catch (e) { inputState = null }
               host.call('guide-dog/probe', {
                 report: {
+                  sessionId: props.sessionId,
                   globals: reportGlobals(),
                   inputActions: { keys: probeKeys(props.inputActions) },
                   inputStateKeys: { keys: probeKeys(inputState) },
