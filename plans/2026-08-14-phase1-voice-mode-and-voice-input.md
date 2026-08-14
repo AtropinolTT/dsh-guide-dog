@@ -1371,7 +1371,7 @@ Expected: `starting`；最终 running、currentPackageId=pkg-6。
 ```bash
 # cordis_inspect_query:
 #   client Slots root=conversation.input.right      → occupant id=guide-dog-mic（PROBE 条目已删）
-#   client Slots root=conversation.input.dock       → occupant id=guide_dog_voice_mode (order 30)
+#   client Slots root=conversation.input.dock       → occupant id=guide-dog-voice-mode (order 30)
 #   client Slots root=settings.section              → occupant id=guide-dog
 #   client Slots root=conversation.chat.turnTail    → 我们的 chain 条目（select 注册）
 #   host Tool.listTools                             → 仍为 9 个 guide_dog_* 工具
