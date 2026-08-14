@@ -41,7 +41,6 @@ return {
       for (const k of Object.keys(over)) if (!(k in base)) out[k] = over[k]
       return out
     }
-    function probeKeys(o) { try { return o ? Object.keys(o).slice(0, 40) : [] } catch (e) { return [] } }
     let guideRoot = ''
     async function guideDogRoot() {
       if (guideRoot) return guideRoot
@@ -56,6 +55,7 @@ return {
     }
     let configCache = deepMerge(CONFIG_DEFAULTS, {})
     let configReady = Promise.resolve()
+    let configWriteChain = Promise.resolve() // A4（I3）：并发 set-config 串行化，防后写覆盖先写
     async function readTextFile(abs) {
       if (!fsSvc) return null
       try {
@@ -79,7 +79,7 @@ return {
     }
     function refreshConfig() { configReady = doRefreshConfig(); return configReady }
     function loadConfig() { return configCache }
-    async function saveConfig(patch) {
+    async function doSaveConfig(patch) {
       const root = await guideDogRoot()
       const next = deepMerge(configCache, patch || {})
       const dir = root + '/.guide-dog'
@@ -95,6 +95,12 @@ return {
         console.error('[guide-dog] config write failed', e)
         return { ok: false, error: 'config_write_failed' }
       }
+    }
+    function saveConfig(patch) {
+      // A4（I3）：串行化 —— 同一时刻只允许一个写，后续 patch 从前一结果合并
+      const p = configWriteChain.then(function () { return doSaveConfig(patch) })
+      configWriteChain = p.then(function () {}, function () {})
+      return p
     }
     async function writeStatus(patch) {
       try {
@@ -654,6 +660,79 @@ if __name__ == '__main__':
       }
     })
 
+    // ============ RECORDER 页（Phase 1，Task 6b） ============
+    const RECORDER_HTML = `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Guide Dog 录音转写</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 16px;text-align:center}
+button{font-size:18px;padding:14px 28px;border-radius:10px;border:none;background:#4a7dff;color:#fff;cursor:pointer;margin:8px}
+#status{color:#888;margin:12px 0}#out{white-space:pre-wrap;background:#f4f4f4;border-radius:8px;padding:14px;min-height:60px;text-align:left;display:none}
+.err{color:#c0392b}</style></head><body>
+<h2>🎙 Guide Dog 录音转写</h2>
+<p>点击录音，说完后停止，文字会自动转写。</p>
+<button id="rec">开始录音</button><button id="cp" style="display:none">复制文本</button>
+<div id="status">空闲</div><div id="out"></div>
+<script>
+const b=document.getElementById('rec'),st=document.getElementById('status'),out=document.getElementById('out'),cp=document.getElementById('cp');
+let mr=null,chunks=[],recTimer=null;
+b.onclick=async()=>{
+  if(mr){mr.stop();return}
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:true});
+    mr=new MediaRecorder(s);chunks=[];
+    mr.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+    mr.onstop=async()=>{
+      clearTimeout(recTimer);recTimer=null;
+      const blob=new Blob(chunks,{type:'audio/webm'});
+      st.textContent='转写中…';
+      try{
+        const r=await fetch('/guide-dog/transcribe-upload',{method:'POST',body:blob});
+        const j=await r.json();
+        if(j.ok&&j.text){out.style.display='block';out.textContent=j.text;cp.style.display='inline-block';st.textContent='完成（'+(j.language||'')+'）'}
+        else{st.className='err';st.textContent=(j.message||j.error||'转写失败')}
+      }catch(e){st.className='err';st.textContent='网络错误：'+e}
+      s.getTracks().forEach(t=>t.stop());mr=null;b.textContent='开始录音';
+    };
+    mr.start(1000);b.textContent='停止';st.textContent='录音中…';st.className='';
+    recTimer=setTimeout(function(){if(mr){mr.stop()}},60000);
+  }catch(e){st.className='err';st.textContent='无法访问麦克风：'+e}
+};
+cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp.textContent='已复制'}catch(e){out.select();document.execCommand('copy');cp.textContent='已复制'}};
+</script></body></html>`
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'prefix',
+          path: '/guide-dog/recorder',
+          handler: async function (req, res) {
+            const raw = String(req.url || '/').split('?')[0]
+            if (raw === '/guide-dog/recorder' && (req.method === 'GET' || req.method === 'HEAD')) {
+              res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+              res.end(RECORDER_HTML)
+              return
+            }
+            if (raw === '/guide-dog/transcribe-upload' && req.method === 'POST') {
+              const chunks = []
+              let total = 0
+              for await (const c of req) {
+                chunks.push(c)
+                total += c.length
+                if (total > 20 * 1024 * 1024) { req.resume(); res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
+              }
+              const all = new Uint8Array(total)
+              let off = 0
+              for (const c of chunks) { all.set(c, off); off += c.length }
+              const bin = new TextDecoder('latin1').decode(all)
+              const r = await transcribeImpl({ audioB64: btoa(bin), mime: 'audio/webm', sessionId: '', language: 'auto' })
+              res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify(r))
+              return
+            }
+            res.writeHead(404); res.end(); return
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+
     // ---------- prompt section: automatic invocation ----------
     ctx.effect(function () {
       if (!systemPrompt) return function () {}
@@ -1067,102 +1146,58 @@ if __name__ == '__main__':
         })
       } catch (e) { return function () {} }
     })
+    // ============ VOICE MODE 节（Phase 1，host） ============
+    // 事件形状（决策门 probe2.json 回填）：
+    //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
+    //   - 文本提取: const data = event.data || {}；content 取 data.content（或 data.message.content）blocks；
+    //     text = content 中 type==='text' 的 b.text 拼接
+    //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
+    const VOICE_QUEUE_MAX = 10 // M5：每会话队列上限（防 voiceQueue 无界增长；超限丢最旧）
+    const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'assistant/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const vm = cfg.voiceMode || {}
+        const effective = vm.sessions && vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
+        if (!effective) return
+        const seq = (typeof event.seq === 'number') ? event.seq : null // M11：缺失时不参与去重（speakImpl 对 null 不去重）
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
+        if (!text) return
+        // 异步串行 TTS，不阻塞事件循环
+        serialSpeak(function () {
+          return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
+            const q = voiceQueue.get(sid) || []
+            if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
+            else if (r && !r.ok) q.push({ error: (r.message || r.error || 'tts_failed') })
+            if (q.length > VOICE_QUEUE_MAX) q.shift()
+            voiceQueue.set(sid, q)
+          }).catch(function (e) {
+            // M8：绝不静默 —— speakImpl reject 也入错误项（重新取 map，避免陈旧引用）
+            const q = voiceQueue.get(sid) || []
+            q.push({ error: 'tts_failed', message: String((e && e.message) || e).slice(0, 200) })
+            if (q.length > VOICE_QUEUE_MAX) q.shift()
+            voiceQueue.set(sid, q)
+          })
+        })
+      } catch (e) { /* listener is best effort */ }
+    })
     ctx.effect(function () {
       try {
-        return harness.handle('guide-dog/probe', async function (args) {
-          try {
-            const root = await guideDogRoot()
-            let cur = {}
-            const raw = await readTextFile(root + '/.guide-dog/probe.json')
-            if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-            await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
-            const next = Object.assign({}, cur, (args && args.report) || {})
-            // pkg-4: host-side session log shape probe (client probe reports sessionId)
-            const sid = (args && args.report && args.report.sessionId) ? String(args.report.sessionId) : ''
-            if (sid && !cur.sessionEvents) {
-              const sq = ctx.get('sessionQuery')
-              if (!sq || typeof sq.readSession !== 'function') {
-                next.sessionEvents = { error: 'no sessionQuery' }
-              } else {
-                try {
-                  const snap = await sq.readSession(sid)
-                  const events = (snap && Array.isArray(snap.events)) ? snap.events : []
-                  const sample = events.slice(-3).map(function (e) {
-                    return {
-                      keys: probeKeys(e),
-                      type: (typeof e.type === 'string') ? e.type : (typeof e.kind === 'string' ? e.kind : String(typeof e.type)),
-                      hasMessage: !!e.message,
-                      messageKeys: probeKeys(e.message),
-                      hasContent: !!e.content,
-                      contentKeys: Array.isArray(e.content) ? probeKeys(e.content[0] || {}) : probeKeys(e.content),
-                      textSample: (function () {
-                        if (e.message && typeof e.message.content === 'string') return e.message.content.slice(0, 80)
-                        if (e.message && Array.isArray(e.message.content) && e.message.content[0] && typeof e.message.content[0].text === 'string') return e.message.content[0].text.slice(0, 80)
-                        if (typeof e.content === 'string') return e.content.slice(0, 80)
-                        return ''
-                      })(),
-                    }
-                  })
-                  next.sessionEvents = { snapshotKeys: probeKeys(snap), eventCount: events.length, sample: sample }
-                } catch (e) { next.sessionEvents = { error: String(e).slice(0, 200) } }
-              }
-            }
-            await writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(next, null, 2))
-            return { ok: true }
-          } catch (e) { return { ok: false, error: 'config_write_failed', message: String(e).slice(0, 200) } }
+        return harness.handle('guide-dog/voice-queue', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: true, entry: null }
+          const q = voiceQueue.get(sid) || []
+          const entry = q.length ? q.shift() : null
+          if (!q.length) voiceQueue.delete(sid)
+          return { ok: true, entry: entry }
         })
       } catch (e) { return function () {} }
     })
-    // pkg-4: live session/event scalar dump (once) — registers directly via ctx.effect
-    let liveEventDumped = false
-    ctx.effect(function () {
-      return ctx.on('session/event', async function (session, event) {
-        if (liveEventDumped) return
-        try {
-          liveEventDumped = true
-          const root = await guideDogRoot()
-          if (!root) return
-          const ev = event || {}
-          const content = Array.isArray(ev.content) ? ev.content : []
-          const b0 = content[0] || {}
-          const dump = {
-            eventKeys: probeKeys(ev),
-            eventType: (typeof ev.type === 'string') ? ev.type : String(typeof ev.type),
-            eventKind: (typeof ev.kind === 'string') ? ev.kind : undefined,
-            hasMessage: !!ev.message,
-            messageKeys: probeKeys(ev.message),
-            hasText: typeof ev.text === 'string',
-            contentKeys: probeKeys(b0),
-            b0Type: b0.type,
-            textSample: String(b0.text !== undefined ? b0.text : (b0.content !== undefined ? b0.content : '')).slice(0, 80),
-            sessionIdSample: (typeof session === 'string' ? session : (session && session.id)) || null,
-          }
-          readTextFile(root + '/.guide-dog/probe2.json').then(function (raw) {
-            let cur = {}
-            if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-            cur.liveEvent = dump
-            return writeTextFile(root + '/.guide-dog/probe2.json', JSON.stringify(cur, null, 2))
-          }).catch(function () {})
-        } catch (e) { /* best effort */ }
-      })
-    })
-    // variable context 形状探测：下次提示词组装时把 context 键列表并入 probe.json（审查 M7）
-    if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide_dog_probe_context', function (context) {
-        const root = guideRoot || ''
-        if (root) {
-          try {
-            readTextFile(root + '/.guide-dog/probe.json').then(function (raw) {
-              let cur = {}
-              if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-              cur.variableContextKeys = probeKeys(context)
-              return writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(cur, null, 2))
-            }).catch(function () {})
-          } catch (e) { /* ignore */ }
-        }
-        return undefined
-      })
-    }
 
     // ---------- RPC handlers (client -> host) ----------
     ctx.effect(function () {
@@ -1218,39 +1253,6 @@ if __name__ == '__main__':
     ensureMediaDir().catch(function (e) {
       console.error('[guide-dog] media dir init failed: ' + String(e))
     })
-
-    // pkg-4: eager session-log shape probe (best effort; client-triggered probe covers it if this fails)
-    ;(async function () {
-      try {
-        const ssvc = ctx.get('sessions')
-        const list = ssvc && typeof ssvc.list === 'function' ? await ssvc.list() : []
-        if (list && list.length) {
-          const sid = list[0].id || String(list[0])
-          const sq = ctx.get('sessionQuery')
-          if (sq && typeof sq.readSession === 'function') {
-            const snap = await sq.readSession(sid)
-            const events = (snap && Array.isArray(snap.events)) ? snap.events : []
-            const sample = events.slice(-3).map(function (e) {
-              return {
-                keys: probeKeys(e),
-                type: (typeof e.type === 'string') ? e.type : String(typeof e.type),
-                hasMessage: !!e.message,
-                messageKeys: probeKeys(e.message),
-                contentKeys: Array.isArray(e.content) ? probeKeys(e.content[0] || {}) : probeKeys(e.content),
-                textSample: (e.message && typeof e.message.content === 'string') ? e.message.content.slice(0, 80) : '',
-              }
-            })
-            const root = await guideDogRoot()
-            await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
-            const cur = {}
-            const raw = await readTextFile(root + '/.guide-dog/probe2.json')
-            if (raw) { try { cur.sessionEvents = JSON.parse(raw).sessionEvents } catch (e) { /* ignore */ } }
-            if (!cur.sessionEvents) cur.sessionEvents = { snapshotKeys: probeKeys(snap), eventCount: events.length, sample: sample }
-            await writeTextFile(root + '/.guide-dog/probe2.json', JSON.stringify(cur, null, 2))
-          }
-        }
-      } catch (e) { /* best effort */ }
-    })()
   },
 }
 
@@ -1259,123 +1261,6 @@ return {
   async apply(ctx) {
     const slots = ctx.get('slots')
     if (!slots) return
-
-    // ============ PROBE 节（Task 4，pkg-5 专用；Task 5/6 实现后删除） ============
-    function probeKeys(o) { try { return o ? Object.keys(o).slice(0, 40) : [] } catch (e) { return [] } }
-    function reportGlobals() {
-      // 内联 typeof：对未声明标识符恒安全（审查 I5：不得先求值实参）
-      return {
-        window: typeof window, navigator: typeof navigator,
-        mediaDevices: typeof navigator !== 'undefined' && typeof navigator.mediaDevices,
-        MediaRecorder: typeof MediaRecorder, AudioContext: typeof AudioContext,
-        WebSocket: typeof WebSocket, fetch: typeof fetch, document: typeof document,
-        Blob: typeof Blob,
-        BlobArrayBuffer: (typeof Blob === 'function') ? typeof Blob.prototype.arrayBuffer : 'n/a',
-        btoa: typeof btoa, URL: typeof URL, setInterval: typeof setInterval, clearInterval: typeof clearInterval,
-        Date: typeof Date, JSON: typeof JSON, Promise: typeof Promise, Object: typeof Object, String: typeof String,
-      }
-    }
-    function probeTimer() {
-      var t = null
-      try { t = ctx.get('timer') } catch (e) { t = null }
-      var timeoutType = 'n/a'
-      var intervalType = 'n/a'
-      if (t) {
-        try { timeoutType = typeof t.timeout } catch (e) { timeoutType = 'n/a' }
-        try { intervalType = typeof t.interval } catch (e) { intervalType = 'n/a' }
-      }
-      return { exists: !!t, keys: probeKeys(t), timeoutType: timeoutType, intervalType: intervalType }
-    }
-    function scalarText(v) {
-      if (v === undefined || v === null) return ''
-      if (typeof v === 'string') return v.slice(0, 80)
-      if (typeof v === 'object') {
-        try {
-          if (typeof v.text === 'string') return v.text.slice(0, 80)
-          if (typeof v.content === 'string') return v.content.slice(0, 80)
-        } catch (e) { /* ignore */ }
-      }
-      return ''
-    }
-    // (a) 常驻探测：input.right 挂载即上报 globals/inputActions/timer（空会话可用）
-    ctx.effect(function () {
-      return slots.inject('conversation.input.right', function () {
-        return slots.register(
-          { name: 'conversation.input.right', id: 'guide-dog-probe', order: 99, label: function () { return 'probe' } },
-          function (props) {
-            React.useEffect(function () {
-              let inputState = null
-              try { inputState = props.useInput() } catch (e) { inputState = null }
-              host.call('guide-dog/probe', {
-                report: {
-                  sessionId: props.sessionId,
-                  globals: reportGlobals(),
-                  inputActions: { keys: probeKeys(props.inputActions) },
-                  inputStateKeys: { keys: probeKeys(inputState) },
-                  timerSvc: probeTimer(),
-                },
-              }).catch(function () {})
-            }, [])
-            return null
-          })
-      })
-    })
-    // (b) 形状探测：turnTail 挂载即上报 turn/快照形状（需会话已有 turn）
-    ctx.effect(function () {
-      return slots.inject('conversation.chat.turnTail', function () {
-        return slots.register(
-          { name: 'conversation.chat.turnTail', select: function (owner) {
-              if (!owner || !owner.turn) return null
-              const turn = owner.turn
-              const steps = Array.isArray(turn.steps) ? turn.steps : []
-              const s0 = steps[0] || {}
-              return {
-                turnKeys: probeKeys(turn), seq: owner.seq,
-                turnStepsIsArray: Array.isArray(turn.steps),
-                steps0Keys: probeKeys(s0),
-                steps0HasMessage: s0.message !== undefined,
-                steps0HasContent: s0.content !== undefined,
-                steps0HasText: s0.text !== undefined,
-                textSample: scalarText(s0.message) || scalarText(turn.data) || '',
-              }
-            } },
-          function (props) {
-            // 渲染期调用 useSession()（审查：useEffect 内调用导致 snapshotKeys 为空）
-            let snap = null
-            try { snap = props.useSession() } catch (e) { snap = null }
-            React.useEffect(function () {
-              const m = props.matched || {}
-              const list = snap ? (snap.messages || snap.turns || snap.nodes || []) : []
-              const first = list[0] || {}
-              const firstMsgKeys = probeKeys(first)
-              let contentKeys = []
-              let snapshotText = ''
-              if (Array.isArray(first.content)) {
-                const b0 = first.content[0] || {}
-                contentKeys = probeKeys(b0)
-                snapshotText = String(b0.text !== undefined ? b0.text : (b0.content !== undefined ? b0.content : '')).slice(0, 80)
-              }
-              host.call('guide-dog/probe', {
-                report: {
-                  turnTail: {
-                    turnKeys: m.turnKeys || [],
-                    seq: m.seq !== undefined ? m.seq : null,
-                    snapshotKeys: probeKeys(snap), messagesKeys: probeKeys(list),
-                    firstMessageKeys: firstMsgKeys, contentKeys: contentKeys,
-                    textSample: m.textSample || snapshotText,
-                    turnStepsIsArray: m.turnStepsIsArray === true,
-                    steps0Keys: m.steps0Keys || [],
-                    steps0HasMessage: m.steps0HasMessage === true,
-                    steps0HasContent: m.steps0HasContent === true,
-                    steps0HasText: m.steps0HasText === true,
-                  },
-                },
-              }).catch(function () {})
-            }, [])
-            return null
-          })
-      })
-    })
 
     const TOOL_KEYS = [
       'guide_dog_speak', 'guide_dog_image', 'guide_dog_video', 'guide_dog_vision',
@@ -1390,6 +1275,222 @@ return {
     }
 
     const h = React.createElement
+
+    // ============ VOICE MODE 节（Phase 1，client） ============
+    const voiceState = { cfg: null, lastError: null, errorAt: 0, beepUri: null }
+    let timerSvc = null
+    try { timerSvc = ctx.get('timer') } catch (e) { timerSvc = null }
+    function voiceEffective(sid) {
+      if (!voiceState.cfg || !voiceState.cfg.voiceMode) return false
+      const vm = voiceState.cfg.voiceMode
+      return sid && vm.sessions && vm.sessions[sid] !== undefined ? !!vm.sessions[sid] : !!vm.default
+    }
+    function loadVoiceCfg() {
+      return host.call('guide-dog/get-config', {}).then(function (r) {
+        if (r && r.ok && r.config) { voiceState.cfg = r.config }
+      }).catch(function () {})
+    }
+    function setVoiceOverride(sid, v) {
+      const cur = (voiceState.cfg && voiceState.cfg.voiceMode && voiceState.cfg.voiceMode.sessions) || {}
+      const sessions = Object.assign({}, cur)
+      // A2（I1）：总是写显式布尔 —— 全局默认开时也能用 false 覆盖关闭该会话
+      sessions[sid] = !!v
+      return host.call('guide-dog/set-config', { patch: { voiceMode: { sessions: sessions } } }).then(function (r) {
+        if (r && r.ok) return loadVoiceCfg()
+      }).catch(function () {})
+    }
+    let pendingPlay = null // {url, key}
+    let pollBusy = false
+    ctx.effect(function () {
+      loadVoiceCfg()
+      host.call('guide-dog/beep', {}).then(function (r) { if (r && r.ok) voiceState.beepUri = r.dataUri }).catch(function () {})
+      return slots.inject('conversation.input.dock', function () {
+        return slots.register(
+          { name: 'conversation.input.dock', id: 'guide-dog-voice-mode', order: 30, label: function () { return 'Voice mode' } },
+          function (props) {
+            const sid = props.sessionId
+            const effective = voiceEffective(sid)
+            const [tick, setTick] = React.useState(0)
+            React.useEffect(function () {
+              if (!timerSvc || typeof timerSvc.interval !== 'function') return
+              let tickCount = 0
+              const stop = timerSvc.interval(function () {
+                tickCount += 1
+                setTick(tickCount)
+                if (tickCount % 10 === 0) loadVoiceCfg() // M10：约每 10s 刷新徽章 cfg（设置页改全局默认后徽章同步）
+              }, 1000)
+              return function () { try { stop() } catch (e) { /* ignore */ } }
+            }, [])
+            React.useEffect(function () {
+              // 语音模式生效时每秒轮询队列（tick 每 1s 变化触发本 effect；timerSvc.interval 不可用时不启动轮询）
+              if (!effective || !sid || pollBusy) return
+              pollBusy = true
+              host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
+                if (r && r.ok && r.entry) {
+                  if (r.entry.url) pendingPlay = { url: r.entry.url, key: r.entry.key }
+                  else if (r.entry.error) { voiceState.lastError = r.entry.error; voiceState.errorAt = typeof Date === 'function' ? Date.now() : 1 }
+                }
+              }).catch(function () {}).then(function () { pollBusy = false })
+            }, [effective, sid, tick])
+            const now = typeof Date === 'function' ? Date.now() : 0
+            const err = (voiceState.errorAt && (now - voiceState.errorAt < 8000)) ? voiceState.lastError : null
+            const badge = {
+              display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', userSelect: 'none',
+              borderRadius: 6, padding: '2px 10px', fontSize: 12, fontWeight: 600,
+              background: effective ? 'rgba(46,204,113,.15)' : 'rgba(128,128,128,.12)',
+              color: effective ? '#27ae60' : '#888',
+            }
+            const tone = (err && voiceState.beepUri) ? h('audio', { autoPlay: true, src: voiceState.beepUri, key: 'tone-' + voiceState.errorAt, style: { display: 'none' } }) : null
+            // M6：播放结束/失败后清除 pendingPlay，避免同一条音频反复重挂
+            const clearPlay = function () { pendingPlay = null; setTick(Date.now() % 100000) }
+            const player = pendingPlay ? h('audio', { autoPlay: true, src: pendingPlay.url, key: pendingPlay.key, onEnded: clearPlay, onError: clearPlay, style: { display: 'none' } }) : null
+            return h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '2px 0' } },
+              h('span', { style: badge, onClick: function () { setVoiceOverride(sid, !effective) } },
+                effective ? '🔊 语音模式开' : '🔇 语音模式关'),
+              err ? h('span', { style: { color: '#c0392b', fontSize: 12 } }, '朗读失败：' + err) : null,
+              tone, player)
+          })
+      })
+    })
+
+    // ============ MIC INPUT 节（Phase 1） ============
+    // 探测结论（Task 4 Step 7）：
+    // - 录音路径 = Path A（navigator.mediaDevices / MediaRecorder / Blob / btoa / Blob.prototype.arrayBuffer 全部可用）
+    // - CLIENT_BASE64 = ok（btoa 为 function）
+    // - inputActions 实际方法 = ["setDraft","addImages","removeImage","pruneImages","submit"]；插入主选 = setDraft，提交主选 = submit
+    //   （下方候选链是兜底；若链全部未命中必须显示 insert_failed，不得静默）
+    let micRec = null // {rec, stream}
+    let micChunks = []
+    let micSeconds = 0
+    let micLang = 'auto' // M4：模块级语言选择 —— 录音中切换语言立即生效（transcribe 不再依赖渲染闭包 s.lang）
+    function insertText(inputActions, text) {
+      const primary = inputActions && inputActions.setDraft
+      if (typeof primary === 'function') { primary(text); return true }
+      const set = inputActions.setValue || inputActions.setText || inputActions.replaceText || inputActions.append
+      if (typeof set === 'function') { set(text); return true }
+      const app = inputActions.appendText || inputActions.insert
+      if (typeof app === 'function') { app(text); return true }
+      return false
+    }
+    function submitInput(inputActions) {
+      const sub = inputActions.submit || inputActions.send
+      if (typeof sub === 'function') sub()
+    }
+    function windowCannotRecord() {
+      var nav = null; try { nav = navigator } catch (e) { nav = null }
+      var mr = null; try { mr = MediaRecorder } catch (e) { mr = null }
+      var b64 = null; try { b64 = btoa } catch (e) { b64 = null }
+      var bl = null; try { bl = Blob } catch (e) { bl = null }
+      var ab = false
+      try { ab = bl !== null && typeof bl.prototype.arrayBuffer === 'function' } catch (e) { ab = false }
+      return !nav || !nav.mediaDevices || typeof mr !== 'function' || typeof b64 !== 'function' || typeof bl !== 'function' || !ab
+    }
+    ctx.effect(function () {
+      return slots.inject('conversation.input.right', function () {
+        return slots.register(
+          { name: 'conversation.input.right', id: 'guide-dog-mic', order: 30, label: function () { return 'Voice input' } },
+          function (props) {
+            const sid = props.sessionId
+            const state = React.useState({ phase: 0, seconds: 0, lang: 'auto', error: null }) // 0 idle / 1 recording / 2 transcribing
+            const s = state[0]; const set = state[1]
+            React.useEffect(function () {
+              // A3（I2）：组件卸载/插件停止时停止录音器与麦克风流，防隐私泄漏
+              return function () {
+                if (micRec) {
+                  try { micRec.rec.stop() } catch (e) { /* ignore */ }
+                  try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                  micRec = null
+                }
+              }
+            }, [])
+            if (windowCannotRecord()) {
+              return h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                h('a', { href: '/guide-dog/recorder', target: '_blank', style: { fontSize: 12, color: '#4a7dff', whiteSpace: 'nowrap' } }, '🎙 打开录音页'),
+                h('span', { style: { color: '#888', fontSize: 11 } }, '浏览器沙箱限制，录音需在独立页面进行'))
+            }
+            const startRec = function () {
+              try {
+                navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+                  let rec = null
+                  try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+                  micChunks = []; micSeconds = 0
+                  rec.ondataavailable = function (ev) {
+                    if (ev.data && ev.data.size > 0) micChunks.push(ev.data)
+                    micSeconds += 1
+                    // 秒数进 state 触发重渲染（审查 M9）；maxSeconds 强制停止
+                    set(function (prev) { return Object.assign({}, prev, { seconds: micSeconds }) })
+                    const max = (voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.maxSeconds) || 60
+                    if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
+                  }
+                  rec.onstop = function () { transcribe(set, s, sid, props.inputActions) }
+                  rec.start(1000)
+                  micRec = { rec: rec, stream: stream }
+                  set(Object.assign({}, s, { phase: 1, seconds: 0, error: null }))
+                }).catch(function (err) {
+                  // M4：区分"无设备"与"权限拒绝"
+                  const name = err && err.name
+                  set(Object.assign({}, s, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }))
+                })
+              } catch (e) { set(Object.assign({}, s, { error: 'mic_denied' })) }
+            }
+            const toggle = function () {
+              if (s.phase === 1) {
+                const r = micRec
+                micRec = null
+                if (r) { try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ } }
+                return
+              }
+              if (s.phase === 2) return
+              startRec()
+            }
+            const cycLang = function () {
+              const order = ['auto', 'zh', 'en']
+              const i = order.indexOf(micLang)
+              micLang = order[(i + 1) % order.length] // M4：同步写模块级，录音中切换也生效
+              set(Object.assign({}, s, { lang: micLang }))
+            }
+            const micStyle = {
+              border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 16, lineHeight: 1,
+              color: s.phase === 1 ? '#e74c3c' : '#888', borderRadius: 6, padding: 4,
+            }
+            const errText = {
+              mic_denied: '麦克风权限被拒绝', no_device: '未检测到麦克风设备', empty_speech: '没听清，请再说一次',
+              stt_failed: '转写失败', stt_timeout: '转写超时', engine_unavailable: 'STT 引擎不可用（见设置页）',
+              insert_failed: '无法插入输入框（输入框接口不可用）',
+            }[s.error] || (s.error ? '转写失败（' + s.error + '）' : null) // M9：未知错误码不静默
+            return h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap' } },
+              h('button', { onClick: toggle, title: s.phase === 1 ? '停止录音' : '语音输入', style: micStyle },
+                s.phase === 1 ? '⏺' : (s.phase === 2 ? '⏳' : '🎙')),
+              s.phase === 1 ? h('span', { style: { fontSize: 11, color: '#e74c3c' } }, s.seconds + 's') : null,
+              h('button', { onClick: cycLang, title: '识别语言：' + s.lang, style: { border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 10, color: '#888', padding: 2 } },
+                { auto: 'AUTO', zh: '中', en: 'EN' }[s.lang]),
+              errText ? h('span', { style: { fontSize: 11, color: '#c0392b' } }, errText) : null)
+          })
+      })
+    })
+    function transcribe(set, s, sid, inputActions) {
+      const parts = micChunks
+      micChunks = []
+      if (!parts.length) { set(Object.assign({}, s, { phase: 0, error: 'empty_speech' })); return }
+      try {
+        const blob = new Blob(parts, { type: 'audio/webm' })
+        blob.arrayBuffer().then(function (buf) {
+          const bytes = new Uint8Array(buf)
+          let bin = ''
+          for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+          set(Object.assign({}, s, { phase: 2, error: null }))
+          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang })
+        }).then(function (r) {
+          if (r && r.ok && r.text) {
+            const inserted = insertText(inputActions, r.text)
+            set(Object.assign({}, s, { phase: 0, error: inserted ? null : 'insert_failed' }))
+            if (inserted && voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.autoSend) submitInput(inputActions)
+          } else {
+            set(Object.assign({}, s, { phase: 0, error: (r && r.error) || 'stt_failed' }))
+          }
+        }).catch(function () { set(Object.assign({}, s, { phase: 0, error: 'stt_failed' })) })
+      } catch (e) { set(Object.assign({}, s, { phase: 0, error: 'stt_failed' })) }
+    }
     const cardStyle = { border: '1px solid rgba(128,128,128,.35)', borderRadius: 10, padding: 10, marginTop: 6, maxWidth: 640 }
     const rowStyle = { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }
     const badgeStyle = { background: 'rgba(90,140,255,.15)', color: '#4a7dff', borderRadius: 6, padding: '2px 8px', fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap' }
@@ -1505,14 +1606,17 @@ return {
     }
 
     function SettingsPage(props) {
-      const state = React.useState({ auth: null, voices: [], media: [], text: '', voice: 'auto', busy: false, playUrl: null, error: null })
+      const state = React.useState({ auth: null, voices: [], media: [], text: '', voice: 'auto', busy: false, playUrl: null, error: null, cfg: null, status: null })
       const s = state[0]
       const set = state[1]
       React.useEffect(function () {
         let alive = true
-        host.call('guide-dog/auth-status', {}).then(function (r) { if (alive) set(Object.assign({}, s, { auth: r })) }).catch(function () {})
-        host.call('guide-dog/voices', {}).then(function (r) { if (alive && r && r.ok && Array.isArray(r.voices)) set(Object.assign({}, s, { voices: r.voices })) }).catch(function () {})
-        host.call('guide-dog/list-media', { limit: 30 }).then(function (r) { if (alive && Array.isArray(r)) set(Object.assign({}, s, { media: r })) }).catch(function () {})
+        // A1：函数式 updater —— 5 个异步结果各自合并，避免基于初始闭包 s 的 last-wins 全量覆盖
+        host.call('guide-dog/auth-status', {}).then(function (r) { if (alive) set(function (prev) { return Object.assign({}, prev, { auth: r }) }) }).catch(function () {})
+        host.call('guide-dog/voices', {}).then(function (r) { if (alive && r && r.ok && Array.isArray(r.voices)) set(function (prev) { return Object.assign({}, prev, { voices: r.voices }) }) }).catch(function () {})
+        host.call('guide-dog/list-media', { limit: 30 }).then(function (r) { if (alive && Array.isArray(r)) set(function (prev) { return Object.assign({}, prev, { media: r }) }) }).catch(function () {})
+        host.call('guide-dog/get-config', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { cfg: r.config }) }) }).catch(function () {})
+        host.call('guide-dog/status', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { status: r.status }) }) }).catch(function () {})
         return function () { alive = false }
       }, [])
       const speak = function () {
@@ -1528,6 +1632,31 @@ return {
       const voiceOptions = [h('option', { key: 'auto', value: 'auto' }, 'auto (per-language)')].concat(s.voices.map(function (v, i) {
         return h('option', { key: i, value: v.voice_id }, String(v.voice_name || v.voice_id) + ' (' + v.voice_id + ')')
       }))
+      const reloadCfg = function () {
+        host.call('guide-dog/get-config', {}).then(function (r) { if (r && r.ok) set(Object.assign({}, s, { cfg: r.config })) }).catch(function () {})
+      }
+      const setCfg = function (patch) {
+        host.call('guide-dog/set-config', { patch: patch }).then(function (r) { if (r && r.ok) reloadCfg() }).catch(function () {})
+      }
+      const cfgBlock = s.cfg ? h('div', { style: preStyle }, [
+        h('div', { style: rowStyle },
+          h('span', { style: badgeStyle }, '语音模式'),
+          h('label', null, h('input', { type: 'radio', name: 'vm-global', checked: !!s.cfg.voiceMode.default, onChange: function () { setCfg({ voiceMode: { default: true } }) } }), ' 全局默认开'),
+          h('label', null, h('input', { type: 'radio', name: 'vm-global', checked: !s.cfg.voiceMode.default, onChange: function () { setCfg({ voiceMode: { default: false } }) } }), ' 全局默认关')),
+        h('div', { style: mutedStyle }, '会话 override：输入框上方徽章点击切换（当前会话生效值以徽章为准）。'),
+        h('div', { style: rowStyle },
+          h('span', { style: badgeStyle }, '语音输入'),
+          h('label', null, '引擎：', h('select', { value: s.cfg.voiceInput.engine, onChange: function (e) { setCfg({ voiceInput: { engine: e.target.value } }) } },
+            h('option', { value: 'whisper' }, 'whisper（本地）'), h('option', { value: 'sherpa' }, 'sherpa（增强，待装）'), h('option', { value: 'minimax' }, 'minimax（保留位）'))),
+          h('label', null, ' 语言：', h('select', { value: s.cfg.voiceInput.language, onChange: function (e) { setCfg({ voiceInput: { language: e.target.value } }) } },
+            h('option', { value: 'auto' }, '自动'), h('option', { value: 'zh' }, '中文'), h('option', { value: 'en' }, '英文'))),
+          h('label', null, h('input', { type: 'checkbox', checked: !!s.cfg.voiceInput.autoSend, onChange: function (e) { setCfg({ voiceInput: { autoSend: e.target.checked } }) } }), ' 识别后自动发送')),
+        h('div', { style: rowStyle },
+          h('span', { style: badgeStyle }, 'STT'),
+          s.status ? h('span', { style: mutedStyle }, 'faster-whisper: ' + (s.status.whisperAvailable ? '可用 ' + ((s.status.whisperVersion || '') + ' / ' + (s.status.whisperPython || '')) : '不可用 — 需 pip install faster-whisper')) : null,
+          h('label', null, ' 模型：', h('select', { value: s.cfg.voiceInput.whisper.model, onChange: function (e) { setCfg({ voiceInput: { whisper: { model: e.target.value } } }) } },
+            h('option', { value: 'base' }, 'base（快）'), h('option', { value: 'small' }, 'small（准）')))),
+      ]) : null
       const mediaCells = s.media.map(function (m, i) {
         if (m.kind === 'image') {
           return h('a', { key: i, href: m.url, target: '_blank', rel: 'noreferrer', title: m.name },
@@ -1543,6 +1672,7 @@ return {
       })
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '0 4px', maxWidth: 720 } },
         h('h2', null, 'Guide Dog for DSH — MiniMax multimodal'),
+        cfgBlock,
         AuthCard(s.auth),
         h('div', { style: { border: '1px solid rgba(128,128,128,.3)', borderRadius: 10, padding: 12 } },
           h('div', { style: { fontWeight: 600, marginBottom: 8 } }, 'Speak tester'),
