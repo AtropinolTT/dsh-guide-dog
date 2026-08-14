@@ -300,3 +300,30 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   `speech synthesize --out`, `video download --out`) may print nothing
   parseable; the plugin treats exit 0 as success and verifies the file via
   `fs.stat`.
+
+## Restart recovery (dynamic plugin)
+
+Guide Dog runs as a **dynamic Cordis plugin** — it lives only in the running
+DSH process and is **lost when DSH restarts**. Runtime state persists
+(`<workspaceRoot>/.guide-dog/`: `config.json`, `media/`, `scripts/`,
+`status.json`), but the plugin code must be redeployed from the source of
+record:
+
+1. `cordis_define` (kind: `new`, idPrefix e.g. `gdog`) with
+   `code.host` = `plugin-host.js` and `code.client` = `plugin-client.js`
+   (both halves are also concatenated in `plugin-source.js`).
+2. `cordis_run` the returned package and approve/refresh the page.
+3. Verify: the voice cluster (speaker / language dropdown / mic) appears at
+   the input box's bottom-left, and Settings → Guide Dog shows the config
+   blocks.
+
+## Phase 2 backlog (deferred from the V4-Pro final review)
+
+- **M9** — mic `onstop` closure holds a stale `inputActions` when switching
+  sessions mid-recording; re-check recorder ownership before transcribing.
+- **M10** — the media route buffers the entire file in memory to satisfy
+  range requests; stream only the requested byte range (matters once Phase 2
+  streaming TTS/playback lands).
+- **M11** — `setVoiceOverride` rebuilds the whole `voiceMode.sessions` map
+  from possibly-stale config, so concurrent session toggles can clobber each
+  other; move to per-key merge (host-side patch) or refresh cfg before write.
