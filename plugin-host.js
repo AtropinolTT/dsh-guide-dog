@@ -119,8 +119,19 @@ return {
 用法:
   python3 whisper_transcribe.py --audio <path> [--model base|small] [--language auto|zh|en] [--out-file <path>] --output json
   python3 whisper_transcribe.py --audio-b64-file <path> [--delete-b64] [--model base|small] [--language auto|zh|en] [--out-file <path>] --output json
-stdout 恒为单行 JSON; exit 恒 0（调用方以 ok 字段判断）。--out-file 可选：同时把同一 JSON 写入文件（host 端读取用）。"""
+  python3 whisper_transcribe.py --prewarm <dir> [--model base|small] [--out-file <path>] --output json   # 仅下载模型到 <dir>
+stdout 恒为单行 JSON; exit 恒 0（调用方以 ok 字段判断）。--out-file 可选：同时把同一 JSON 写入文件（host 端读取用）。
+
+模型来源（2026-08-14 修复：huggingface.co 网络不可达）：
+  - 优先加载本地目录 ~/.guide-dog/models/faster-whisper-<model>（零网络，插件预热/预下载）
+  - 缺失时回退按模型名从 HF 下载；HF_ENDPOINT 默认指向 hf-mirror.com 镜像
+"""
 import argparse, base64, json, os, sys, tempfile, time
+
+# 必须在 import huggingface_hub / faster_whisper 之前设置：
+# huggingface.co 在国内网络不可达（Errno 101），官方镜像 hf-mirror.com 可达（实测 ~2.2MB/s）
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+
 
 def emit(obj, out_file):
     text = json.dumps(obj, ensure_ascii=False)
@@ -133,6 +144,18 @@ def emit(obj, out_file):
             pass
     sys.exit(0)
 
+
+def resolve_model_ref(model):
+    """优先插件本地模型目录（~/.guide-dog/models/faster-whisper-<model>），回退模型名（镜像下载）。"""
+    try:
+        local = os.path.join(os.path.expanduser('~'), '.guide-dog', 'models', 'faster-whisper-' + model)
+        if os.path.isfile(os.path.join(local, 'model.bin')):
+            return local
+    except Exception:  # noqa: BLE001
+        pass
+    return model
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--audio', default=None)
@@ -142,7 +165,17 @@ def main():
     ap.add_argument('--language', default='auto')
     ap.add_argument('--out-file', default=None)
     ap.add_argument('--output', default='json')
+    ap.add_argument('--prewarm', default=None)  # 仅下载模型到 <dir> 后退出（host 启动预热用）
     args = ap.parse_args()
+    # 预热模式：只下载模型，不转写
+    if args.prewarm:
+        try:
+            from huggingface_hub import snapshot_download
+            os.makedirs(args.prewarm, exist_ok=True)
+            snapshot_download('Systran/faster-whisper-' + args.model, local_dir=args.prewarm)
+            emit({'ok': True, 'prewarm': args.prewarm}, args.out_file)
+        except Exception as e:  # noqa: BLE001
+            emit({'ok': False, 'error': 'stt_failed', 'message': ('prewarm failed: ' + str(e))[:300]}, args.out_file)
     audio_path = args.audio
     cleanup = []
     try:
@@ -159,7 +192,7 @@ def main():
             emit({'ok': False, 'error': 'stt_failed', 'message': 'audio file missing'}, args.out_file)
         from faster_whisper import WhisperModel
         t0 = time.time()
-        model = WhisperModel(args.model, device='cpu', compute_type='int8')
+        model = WhisperModel(resolve_model_ref(args.model), device='cpu', compute_type='int8')
         lang = None if args.language == 'auto' else args.language
         segments, info = model.transcribe(audio_path, language=lang, vad_filter=True)
         text = ''.join(s.text for s in segments).strip()
@@ -193,13 +226,34 @@ if __name__ == '__main__':
       sttProbeDone = true
       const cfg = loadConfig()
       const py = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.python) || 'python3'
+      const model = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.model) || 'small'
       const res = await runRaw(quote(py) + " -c 'import faster_whisper; print(faster_whisper.__version__)'", { timeoutMs: 15000 })
+      // 模型缓存检查（2026-08-14 修复：hf.co 不可达 → 本地模型目录 + 镜像预热）
+      const localDir = (await guideDogRoot()) + '/.guide-dog/models/faster-whisper-' + model
+      const cached = !!(await statFile(localDir + '/model.bin'))
       await writeStatus({
         whisperAvailable: res.exitCode === 0 && !res.denied,
         whisperVersion: (res.stdout || '').trim(),
         whisperPython: py,
+        whisperModelCached: cached,
         probeAt: Date.now(),
       })
+      // 模型缺失 → 后台预热（hf-mirror.com 镜像，subprocess 非沙箱可写 ~/.guide-dog/models；不阻塞插件激活）
+      if (res.exitCode === 0 && !cached && subprocess) {
+        try {
+          await ensureWhisperScript()
+          const script = (await guideDogRoot()) + '/.guide-dog/scripts/whisper_transcribe.py'
+          const handle = subprocess.spawn({
+            argv: [py, script, '--prewarm', localDir, '--model', model, '--output', 'json'],
+            cwd: (await guideDogRoot()) + '/.guide-dog',
+            stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 * 1024 }, stderr: { maxBytes: 1024 * 1024 } },
+            graceMs: 3000,
+          })
+          handle.done.then(function (r) {
+            writeStatus({ whisperModelCached: true, whisperPrewarmAt: Date.now() }).catch(function () {})
+          }).catch(function () { /* prewarm failed; whisper 转写时脚本回退镜像下载 */ })
+        } catch (e) { /* best effort */ }
+      }
     }
     async function transcribeImpl(args) {
       const cfg = loadConfig()
