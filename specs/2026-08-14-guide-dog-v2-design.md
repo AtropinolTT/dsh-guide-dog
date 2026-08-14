@@ -132,7 +132,7 @@ gdog-1 (pluginId)
 
 1. **机制保证**：语音模式开启时，每次 assistant 回复落地**必然**触发 TTS 发声，与模型是否调用工具完全无关。
 2. **文字与语音逐字一致**：TTS 输入文本 = 该回复在对话中渲染的同一份 text blocks（唯一来源）；仅按 audio-conversation 规则做朗读性变换（剥离代码块/URL/符号），语义与文字不变。
-3. **失败必反馈**：TTS 失败时播放失败提示音 + 口头短句（"语音生成失败：原因"）+ dock 徽章显示失败状态，绝不静默。
+3. **失败必反馈**：TTS 失败时播放失败提示音 + 右下角即时通知（toast，显示失败原因，约 6 秒自动消失），绝不静默。
 
 **机制实现（自动发声钩子，v2 裁决：host 事件驱动）**：
 
@@ -142,12 +142,12 @@ gdog-1 (pluginId)
 - client 在输入框左下角 VOICE 群组内以 `timerSvc.interval`（1s）轮询 RPC `guide-dog/voice-queue`（带 sessionId，host 弹出即交付一次）→ 模块级 `Audio` 播放 / 错误项显示失败 + 提示音。
 - **去重**：host 级 `Map<sessionId, Set<seq>>` 双保险（speakImpl 内已有）；队列弹出即消费，不重复播放。
 - **播放（会话级语义，v2.1 用户裁决）**：client 以模块级 `Audio` 对象播放（轮询在会话组件内，播放本身脱离会话组件生命周期）——**切换会话不重播、不中断**：正在播放的音频自然播到结束；仅当出现新的播放任务（任一会话的新队列条目）时才覆盖当前播放。播放结束/失败/被浏览器阻止均清理并显示错误（绝不静默）。
-- **失败反馈**：speakImpl 失败 → 队列错误项（error code）→ client 播放失败提示音（beep RPC data-URI）+ 群组内显示"朗读失败：<原因>" 8 秒；尝试次数 ≤2，不重试循环。
+- **失败反馈**：speakImpl 失败 → 队列错误项（error code + message）→ client 播放失败提示音（beep RPC data-URI）+ 右下角 toast 显示"朗读失败：<原因>"（约 6 秒自动消失）；尝试次数 ≤2，不重试循环。
 - **两层设置**：
   - 全局默认：`config.json → voiceMode.default`（默认 `false`），设置页（settings.section `guide-dog`）管理。
   - 会话 override：`voiceMode.sessions[sessionId]`，由输入框左下角小喇叭按钮点击切换。
   - UI（v2.1 用户裁决）：`conversation.input.left`（order 30，id `guide-dog-voice`）常驻群组 = **[小喇叭] [语言检测下拉] [麦克风]**；小喇叭单击切换会话 override（开=成功绿/关=次级色），悬浮提示"语音模式提示：开/关 · 全局默认：开/关（点击切换）"；语言下拉（auto/zh/en）替代原三档循环按钮；麦克风用简洁 SVG 图标（feather 风格细线，录制态红色脉冲+秒数）。样式使用 DSH 主题令牌（`--dsw-alias-*`），字体继承输入行，与 DSH 设计语言一致。
-- **模型感知**：`systemPrompt.variable('guide-dog-voice-mode', provider)` 按会话注入"语音模式：开。本条回复会被自动朗读，不要在回复中描述音频状态，保持文字与朗读内容一致。"（variable provider 在 host 侧读配置，随会话切换）。
+- **模型感知**：`systemPrompt.variable('guide_dog_voice_mode', provider)` 按会话注入"语音模式：开。本条回复会被自动朗读，不要在回复中描述音频状态，保持文字与朗读内容一致。"（variable provider 在 host 侧读配置，随会话切换；变量名须匹配 `/^[a-z][a-z0-9_]*$/`）。
 - **与 v1 工具的关系**：`guide_dog_speak` 工具保留（模型主动朗读场景，如无障碍模式主动播报），与语音模式共用 TTS 管线与去重；`source` 字段区分。
 
 ### 5.2 语音输入

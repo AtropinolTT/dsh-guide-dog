@@ -255,7 +255,7 @@ return {
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
                   if (r.entry.url) playEntry(r.entry.url)
-                  else if (r.entry.error) { showToast('朗读失败：' + r.entry.error); playBeep() }
+                  else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
                 }
               }).catch(function () {}).then(function () { pollBusy = false })
             }, [effective, sid, tick])
@@ -464,19 +464,20 @@ return {
       }, [])
       const speak = function () {
         if (!s.text.trim() || s.busy) return
-        set(Object.assign({}, s, { busy: true, error: null, playUrl: null }))
+        // M8：函数式 updater，避免陈旧闭包覆盖异步加载结果
+        set(function (prev) { return Object.assign({}, prev, { busy: true, error: null, playUrl: null }) })
         host.call('guide-dog/speak', { text: s.text, voice: s.voice, speed: 0.95 })
           .then(function (r) {
-            if (r && r.ok) set(Object.assign({}, s, { busy: false, playUrl: r.url }))
-            else set(Object.assign({}, s, { busy: false, error: (r && r.error) || 'speak failed' }))
+            if (r && r.ok) set(function (prev) { return Object.assign({}, prev, { busy: false, playUrl: r.url }) })
+            else set(function (prev) { return Object.assign({}, prev, { busy: false, error: (r && r.error) || 'speak failed' }) })
           })
-          .catch(function (e) { set(Object.assign({}, s, { busy: false, error: String(e) })) })
+          .catch(function (e) { set(function (prev) { return Object.assign({}, prev, { busy: false, error: String(e) }) }) })
       }
       const voiceOptions = [h('option', { key: 'auto', value: 'auto' }, 'auto (per-language)')].concat(s.voices.map(function (v, i) {
         return h('option', { key: i, value: v.voice_id }, String(v.voice_name || v.voice_id) + ' (' + v.voice_id + ')')
       }))
       const reloadCfg = function () {
-        host.call('guide-dog/get-config', {}).then(function (r) { if (r && r.ok) set(Object.assign({}, s, { cfg: r.config })) }).catch(function () {})
+        host.call('guide-dog/get-config', {}).then(function (r) { if (r && r.ok) set(function (prev) { return Object.assign({}, prev, { cfg: r.config }) }) }).catch(function () {})
       }
       const setCfg = function (patch) {
         host.call('guide-dog/set-config', { patch: patch }).then(function (r) { if (r && r.ok) reloadCfg() }).catch(function () {})

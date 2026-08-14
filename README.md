@@ -152,7 +152,7 @@ Settings → **Guide Dog** (id `guide-dog`):
   mode is effective for that session (session override else global default),
   and enqueues the TTS result (`{url, key}`) or error into a per-session
   `voiceQueue`. The client polls the queue every second and plays it with a
-  module-level `Audio` object, or shows a failed badge + beep for 8s.
+  module-level `Audio` object, or shows a bottom-right toast + beep for 6s.
 - **Voice cluster** — `conversation.input.left` entry `guide-dog-voice`
   (order 30) at the input box's bottom-left, themed with DSH tokens
   (`--dsw-alias-*`), inheriting the app font:

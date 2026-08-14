@@ -88,7 +88,8 @@ return {
         // 原子写：tmp → mv → chmod 600；写前保留 .bak 供解析失败回退
         const okTmp = await writeTextFile(dir + '/config.json.tmp', JSON.stringify(next, null, 2))
         if (!okTmp) return { ok: false, error: 'config_write_failed' }
-        await runRaw('cp -f ' + quote(dir + '/config.json') + ' ' + quote(dir + '/config.json.bak') + ' 2>/dev/null; mv -f ' + quote(dir + '/config.json.tmp') + ' ' + quote(dir + '/config.json') + '; ' + 'chmod 600 ' + quote(dir + '/config.json'), { timeoutMs: 10000 })
+        const mv = await runRaw('cp -f ' + quote(dir + '/config.json') + ' ' + quote(dir + '/config.json.bak') + ' 2>/dev/null; mv -f ' + quote(dir + '/config.json.tmp') + ' ' + quote(dir + '/config.json') + '; ' + 'chmod 600 ' + quote(dir + '/config.json'), { timeoutMs: 10000 })
+        if (mv.exitCode !== 0) return { ok: false, error: 'config_write_failed' } // M2：shell 链失败不得假成功
         configCache = next
         return { ok: true }
       } catch (e) {
@@ -193,7 +194,7 @@ if __name__ == '__main__':
       sttProbeDone = true
       const cfg = loadConfig()
       const py = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.python) || 'python3'
-      const res = await runRaw(py + " -c 'import faster_whisper; print(faster_whisper.__version__)'", { timeoutMs: 15000 })
+      const res = await runRaw(quote(py) + " -c 'import faster_whisper; print(faster_whisper.__version__)'", { timeoutMs: 15000 })
       await writeStatus({
         whisperAvailable: res.exitCode === 0 && !res.denied,
         whisperVersion: (res.stdout || '').trim(),
@@ -222,7 +223,7 @@ if __name__ == '__main__':
       const lang = (args.language || (cfg.voiceInput && cfg.voiceInput.language) || 'auto')
       await runRaw('mkdir -p ' + quote(root + '/.guide-dog/tmp'), { timeoutMs: 10000 })
       const wrote = await writeTextFile(b64Path, args.audioB64)
-      if (!wrote) return { ok: false, error: 'config_write_failed', message: 'cannot write temp audio' }
+      if (!wrote) return { ok: false, error: 'stt_failed', message: 'cannot write temp audio' }
       let handle = null
       try {
         await ensureWhisperScript()
@@ -504,14 +505,15 @@ if __name__ == '__main__':
       const source = args.source === 'voice-mode' ? 'voice-mode' : 'tool'
       const sid = typeof args.sessionId === 'string' ? args.sessionId : ''
       const seq = typeof args.turnSeq === 'number' ? args.turnSeq : null
-      if (sid && seq !== null) {
-        const spoken = spokenTurns.get(sid) || new Set()
+      const spoken = (sid && seq !== null) ? (spokenTurns.get(sid) || new Set()) : null
+      if (spoken) {
         if (spoken.has(seq)) return { ok: true, skipped: true }
-        spoken.add(seq)
+        spoken.add(seq) // 预占去重（防同 turn 并发双 TTS）；任何失败路径释放（M1）
         spokenTurns.set(sid, spoken)
       }
+      const release = function () { if (spoken) spoken.delete(seq) }
       const text = String(args.text || '').trim()
-      if (!text) return { ok: false, error: 'bad_args', message: 'text is required' }
+      if (!text) { release(); return { ok: false, error: 'bad_args', message: 'text is required' } }
       await ensureMediaDir()
       const transformed = await transformText(text)
       const ttsCfg = (loadConfig().tts) || {}
@@ -524,11 +526,12 @@ if __name__ == '__main__':
       const abs = mediaDir + '/' + name
       const tts = await generateTts(transformed, voice, speed, lang, abs)
       if (!tts.ok) {
+        release()
         const msg = String(tts.error || '')
         return { ok: false, error: /timeout/i.test(msg) ? 'tts_timeout' : 'tts_failed', message: msg.slice(0, 300) }
       }
       const st = await statFile(abs)
-      if (!st) return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' }
+      if (!st) { release(); return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' } }
       await pushIndex({ name: name, kind: 'audio', prompt: text.slice(0, 200), voice: voice, ts: Date.now(), bytes: st.size || 0, source: source, turnSeq: seq, spoken: transformed.slice(0, 160) })
       if (args.playOnHost) await playOnHost(abs)
       return { ok: true, kind: 'audio', url: MEDIA_ROUTE + '/' + name, file: abs, voice: voice, bytes: st.size || 0 }
@@ -704,30 +707,38 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           kind: 'prefix',
           path: '/guide-dog/recorder',
           handler: async function (req, res) {
-            const raw = String(req.url || '/').split('?')[0]
-            if (raw === '/guide-dog/recorder' && (req.method === 'GET' || req.method === 'HEAD')) {
-              res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-              res.end(RECORDER_HTML)
-              return
-            }
-            if (raw === '/guide-dog/transcribe-upload' && req.method === 'POST') {
-              const chunks = []
-              let total = 0
-              for await (const c of req) {
-                chunks.push(c)
-                total += c.length
-                if (total > 20 * 1024 * 1024) { req.resume(); res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
+            try {
+              const raw = String(req.url || '/').split('?')[0]
+              if (raw === '/guide-dog/recorder' && (req.method === 'GET' || req.method === 'HEAD')) {
+                res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+                res.end(RECORDER_HTML)
+                return
               }
-              const all = new Uint8Array(total)
-              let off = 0
-              for (const c of chunks) { all.set(c, off); off += c.length }
-              const bin = new TextDecoder('latin1').decode(all)
-              const r = await transcribeImpl({ audioB64: btoa(bin), mime: 'audio/webm', sessionId: '', language: 'auto' })
-              res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
-              res.end(JSON.stringify(r))
-              return
+              if (raw === '/guide-dog/transcribe-upload' && req.method === 'POST') {
+                const chunks = []
+                let total = 0
+                for await (const c of req) {
+                  chunks.push(c)
+                  total += c.length
+                  if (total > 20 * 1024 * 1024) { req.resume(); res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
+                }
+                const all = new Uint8Array(total)
+                let off = 0
+                for (const c of chunks) { all.set(c, off); off += c.length }
+                const bin = new TextDecoder('latin1').decode(all)
+                const r = await transcribeImpl({ audioB64: btoa(bin), mime: 'audio/webm', sessionId: '', language: 'auto' })
+                res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+                res.end(JSON.stringify(r))
+                return
+              }
+              res.writeHead(404); res.end(); return
+            } catch (e) {
+              // M12：上传路径异常保护，绝不悬挂响应
+              try {
+                res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+                res.end(JSON.stringify({ ok: false, error: 'stt_failed', message: String((e && e.message) || e).slice(0, 200) }))
+              } catch (e2) { /* ignore */ }
             }
-            res.writeHead(404); res.end(); return
           },
         })
       } catch (e) { return function () {} }
@@ -755,14 +766,19 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       }
     })
     if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide_dog_voice_mode', function (context) {
-        const cfg = loadConfig()
-        const sid = (context && (context.sessionId || (context.session && context.session.id))) || ''
-        const vm = cfg.voiceMode || {}
-        const effective = sid ? (vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default) : vm.default
-        if (!effective) return undefined
-        return '语音模式：开。本条回复会被自动朗读。保持回复文字与朗读内容一致，不要在回复中描述音频状态，不要重复播报。'
-      })
+      try {
+        const disp = systemPrompt.variable('guide_dog_voice_mode', function (context) {
+          const cfg = loadConfig()
+          const sid = (context && (context.sessionId || (context.session && context.session.id))) || ''
+          const vm = cfg.voiceMode || {}
+          const effective = sid ? (vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default) : vm.default
+          if (!effective) return undefined
+          return '语音模式：开。本条回复会被自动朗读。保持回复文字与朗读内容一致，不要在回复中描述音频状态，不要重复播报。'
+        })
+        if (typeof disp === 'function') ctx.effect(function () { return disp }) // M3：纳入生命周期
+      } catch (e) {
+        console.error('[guide-dog] voice mode variable failed: ' + String(e))
+      }
     }
 
     // ---------- tools ----------
@@ -1173,7 +1189,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
             const q = voiceQueue.get(sid) || []
             if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
-            else if (r && !r.ok) q.push({ error: (r.message || r.error || 'tts_failed') })
+            // M6：错误项统一 { error: <码>, message: <人读文本> }，client 优先显示 message
+            else if (r && !r.ok) q.push({ error: (r.error || 'tts_failed'), message: (r.message || '') })
             if (q.length > VOICE_QUEUE_MAX) q.shift()
             voiceQueue.set(sid, q)
           }).catch(function (e) {
@@ -1514,7 +1531,7 @@ return {
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
                   if (r.entry.url) playEntry(r.entry.url)
-                  else if (r.entry.error) { showToast('朗读失败：' + r.entry.error); playBeep() }
+                  else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
                 }
               }).catch(function () {}).then(function () { pollBusy = false })
             }, [effective, sid, tick])
@@ -1723,19 +1740,20 @@ return {
       }, [])
       const speak = function () {
         if (!s.text.trim() || s.busy) return
-        set(Object.assign({}, s, { busy: true, error: null, playUrl: null }))
+        // M8：函数式 updater，避免陈旧闭包覆盖异步加载结果
+        set(function (prev) { return Object.assign({}, prev, { busy: true, error: null, playUrl: null }) })
         host.call('guide-dog/speak', { text: s.text, voice: s.voice, speed: 0.95 })
           .then(function (r) {
-            if (r && r.ok) set(Object.assign({}, s, { busy: false, playUrl: r.url }))
-            else set(Object.assign({}, s, { busy: false, error: (r && r.error) || 'speak failed' }))
+            if (r && r.ok) set(function (prev) { return Object.assign({}, prev, { busy: false, playUrl: r.url }) })
+            else set(function (prev) { return Object.assign({}, prev, { busy: false, error: (r && r.error) || 'speak failed' }) })
           })
-          .catch(function (e) { set(Object.assign({}, s, { busy: false, error: String(e) })) })
+          .catch(function (e) { set(function (prev) { return Object.assign({}, prev, { busy: false, error: String(e) }) }) })
       }
       const voiceOptions = [h('option', { key: 'auto', value: 'auto' }, 'auto (per-language)')].concat(s.voices.map(function (v, i) {
         return h('option', { key: i, value: v.voice_id }, String(v.voice_name || v.voice_id) + ' (' + v.voice_id + ')')
       }))
       const reloadCfg = function () {
-        host.call('guide-dog/get-config', {}).then(function (r) { if (r && r.ok) set(Object.assign({}, s, { cfg: r.config })) }).catch(function () {})
+        host.call('guide-dog/get-config', {}).then(function (r) { if (r && r.ok) set(function (prev) { return Object.assign({}, prev, { cfg: r.config }) }) }).catch(function () {})
       }
       const setCfg = function (patch) {
         host.call('guide-dog/set-config', { patch: patch }).then(function (r) { if (r && r.ok) reloadCfg() }).catch(function () {})
