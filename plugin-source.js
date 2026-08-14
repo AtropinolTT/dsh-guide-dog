@@ -1281,7 +1281,13 @@ return {
     // 新播放任务（任一会话的新队列条目）覆盖当前播放。语音模式开关/语言检测/麦克风整合在
     // conversation.input.left（输入框工具行左端），样式使用 DSH 主题令牌（--dsw-alias-*），
     // 字体继承输入行，不做自定义 font-family。
-    const voiceState = { cfg: null, lastError: null, errorAt: 0, beepUri: null }
+    const voiceState = { cfg: null, beepUri: null }
+    // 右下角即时通知（toast）：语音模式失败/播放失败在此显示，6 秒自动消失
+    const toastState = { text: null, at: 0 }
+    function showToast(text) {
+      toastState.text = String(text).slice(0, 120)
+      toastState.at = Date.now()
+    }
     let timerSvc = null
     try { timerSvc = ctx.get('timer') } catch (e) { timerSvc = null }
     function voiceEffective(sid) {
@@ -1313,22 +1319,22 @@ return {
     function playEntry(url) {
       stopCurrent()
       if (typeof Audio !== 'function') {
-        voiceState.lastError = '播放器不可用'; voiceState.errorAt = Date.now(); return
+        showToast('播放器不可用'); return
       }
       try {
         const a = new Audio(String(url))
         curAudio = a
         a.onended = function () { if (curAudio === a) curAudio = null }
         a.onerror = function () {
-          if (curAudio === a) { curAudio = null; voiceState.lastError = '播放失败'; voiceState.errorAt = Date.now() }
+          if (curAudio === a) { curAudio = null; showToast('播放失败') }
         }
         const p = a.play()
         if (p && typeof p.catch === 'function') p.catch(function () {
-          if (curAudio === a) { curAudio = null; voiceState.lastError = '浏览器阻止了自动播放，请先点击页面'; voiceState.errorAt = Date.now() }
+          if (curAudio === a) { curAudio = null; showToast('浏览器阻止了自动播放，请先点击页面') }
         })
       } catch (e) {
         curAudio = null
-        voiceState.lastError = '播放失败'; voiceState.errorAt = Date.now()
+        showToast('播放失败')
       }
     }
     function beepFallback() {
@@ -1461,7 +1467,11 @@ return {
           '.gd-select{border:none;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;padding:3px 2px;cursor:pointer;border-radius:6px}' +
           '.gd-select:hover{background:var(--dsw-alias-bg-layer-2)}' +
           '.gd-sec{font-size:11px;color:var(--dsw-alias-state-error-primary);font-variant-numeric:tabular-nums}' +
-          '.gd-err{font-size:11px;color:var(--dsw-alias-state-error-primary);white-space:nowrap}'
+          '.gd-err{font-size:11px;color:var(--dsw-alias-state-error-primary);white-space:nowrap}' +
+          '.gd-toast{position:fixed;right:16px;bottom:16px;max-width:380px;display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-primary);font-size:12px;line-height:1.5;box-shadow:0 4px 16px rgba(0,0,0,.18);pointer-events:auto;animation:gd-toast-in .18s ease-out}' +
+          '.gd-toast-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-error-primary);flex:none}' +
+          '.gd-toast-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+          '@keyframes gd-toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}'
         )
       } catch (e) { return function () {} }
     })
@@ -1504,7 +1514,7 @@ return {
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
                   if (r.entry.url) playEntry(r.entry.url)
-                  else if (r.entry.error) { voiceState.lastError = r.entry.error; voiceState.errorAt = Date.now(); playBeep() }
+                  else if (r.entry.error) { showToast('朗读失败：' + r.entry.error); playBeep() }
                 }
               }).catch(function () {}).then(function () { pollBusy = false })
             }, [effective, sid, tick])
@@ -1546,14 +1556,9 @@ return {
               stt_failed: '转写失败', stt_timeout: '转写超时', engine_unavailable: 'STT 引擎不可用（见设置页）',
               insert_failed: '无法插入输入框',
             }[s.error] || (s.error ? '转写失败（' + s.error + '）' : null)
-            const now = Date.now()
-            const err = (voiceState.errorAt && (now - voiceState.errorAt < 8000)) ? voiceState.lastError : null
             const vm = (voiceState.cfg && voiceState.cfg.voiceMode) || {}
             const voiceTip = '语音模式提示：' + (effective ? '开' : '关') + ' · 全局默认：' + (vm.default ? '开' : '关') + '（点击切换）'
             const micTip = s.phase === 1 ? '停止录音' : (s.phase === 2 ? '转写中…' : '语音输入')
-            // 错误文本截断为短标签，完整原因放 tooltip —— 避免长文本撑破输入框工具行布局
-            const errShort = err ? (String(err).length > 24 ? String(err).slice(0, 24) + '…' : String(err)) : null
-            const micShort = micErrText ? (micErrText.length > 28 ? micErrText.slice(0, 28) + '…' : micErrText) : null
             return h('div', { className: 'gd-voice' },
               h('button', { className: 'gd-btn' + (effective ? ' gd-on' : ''), title: voiceTip, onClick: function () { setVoiceOverride(sid, !effective) } }, speakerIcon(effective)),
               h('select', { className: 'gd-select', value: s.lang, title: '识别语言检测', onChange: function (e) { micLang = e.target.value; set(function (prev) { return Object.assign({}, prev, { lang: e.target.value }) }) } },
@@ -1562,8 +1567,28 @@ return {
                 ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', title: '浏览器限制：录音需在独立页面进行' }, micIcon(false))
                 : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
               s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
-              errShort ? h('span', { className: 'gd-err', title: err ? '朗读失败：' + err : undefined }, '朗读失败：' + errShort) : null,
-              micShort ? h('span', { className: 'gd-err', title: micErrText || undefined }, micShort) : null)
+              micErrText ? h('span', { className: 'gd-err', title: micErrText }, micErrText) : null)
+          })
+      })
+    })
+    // ---- 右下角 toast（shell.overlay，root 级：切换会话也可见） ----
+    ctx.effect(function () {
+      return slots.inject('shell.overlay', function () {
+        return slots.register(
+          { name: 'shell.overlay', id: 'guide-dog-toast', order: 99, label: function () { return 'Guide Dog toast' } },
+          function () {
+            const [tick, setTick] = React.useState(0)
+            React.useEffect(function () {
+              if (!timerSvc || typeof timerSvc.interval !== 'function') return
+              const stop = timerSvc.interval(function () { setTick(Date.now() % 100000) }, 500)
+              return function () { try { stop() } catch (e) { /* ignore */ } }
+            }, [])
+            const now = Date.now()
+            const fresh = toastState.text && toastState.at && (now - toastState.at < 6000)
+            if (!fresh) return null
+            return h('div', { className: 'gd-toast', title: toastState.text },
+              h('span', { className: 'gd-toast-dot' }),
+              h('span', { className: 'gd-toast-text' }, toastState.text))
           })
       })
     })
