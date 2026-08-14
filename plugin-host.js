@@ -1219,7 +1219,7 @@ if __name__ == '__main__':
     })
 
     // pkg-4: eager session-log shape probe (best effort; client-triggered probe covers it if this fails)
-    (async function () {
+    ;(async function () {
       try {
         const ssvc = ctx.get('sessions')
         const list = ssvc && typeof ssvc.list === 'function' ? await ssvc.list() : []
