@@ -18,7 +18,7 @@ return {
     const h = React.createElement
 
     // ============ VOICE MODE 节（Phase 1，client） ============
-    const voiceState = { cfg: null, loaded: false, lastError: null, errorAt: 0, beepUri: null }
+    const voiceState = { cfg: null, lastError: null, errorAt: 0, beepUri: null }
     let timerSvc = null
     try { timerSvc = ctx.get('timer') } catch (e) { timerSvc = null }
     function voiceEffective(sid) {
@@ -28,13 +28,14 @@ return {
     }
     function loadVoiceCfg() {
       return host.call('guide-dog/get-config', {}).then(function (r) {
-        if (r && r.ok && r.config) { voiceState.cfg = r.config; voiceState.loaded = true }
+        if (r && r.ok && r.config) { voiceState.cfg = r.config }
       }).catch(function () {})
     }
     function setVoiceOverride(sid, v) {
       const cur = (voiceState.cfg && voiceState.cfg.voiceMode && voiceState.cfg.voiceMode.sessions) || {}
       const sessions = Object.assign({}, cur)
-      if (v) sessions[sid] = true; else delete sessions[sid]
+      // A2（I1）：总是写显式布尔 —— 全局默认开时也能用 false 覆盖关闭该会话
+      sessions[sid] = !!v
       return host.call('guide-dog/set-config', { patch: { voiceMode: { sessions: sessions } } }).then(function (r) {
         if (r && r.ok) return loadVoiceCfg()
       }).catch(function () {})
@@ -53,11 +54,16 @@ return {
             const [tick, setTick] = React.useState(0)
             React.useEffect(function () {
               if (!timerSvc || typeof timerSvc.interval !== 'function') return
-              const stop = timerSvc.interval(function () { setTick(Date.now() % 100000) }, 1000)
+              let tickCount = 0
+              const stop = timerSvc.interval(function () {
+                tickCount += 1
+                setTick(tickCount)
+                if (tickCount % 10 === 0) loadVoiceCfg() // M10：约每 10s 刷新徽章 cfg（设置页改全局默认后徽章同步）
+              }, 1000)
               return function () { try { stop() } catch (e) { /* ignore */ } }
             }, [])
             React.useEffect(function () {
-              // 语音模式生效时每秒轮询队列（timerSvc.interval 不可用时退化为每次渲染轮询）
+              // 语音模式生效时每秒轮询队列（tick 每 1s 变化触发本 effect；timerSvc.interval 不可用时不启动轮询）
               if (!effective || !sid || pollBusy) return
               pollBusy = true
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
@@ -76,7 +82,9 @@ return {
               color: effective ? '#27ae60' : '#888',
             }
             const tone = (err && voiceState.beepUri) ? h('audio', { autoPlay: true, src: voiceState.beepUri, key: 'tone-' + voiceState.errorAt, style: { display: 'none' } }) : null
-            const player = pendingPlay ? h('audio', { autoPlay: true, src: pendingPlay.url, key: pendingPlay.key, style: { display: 'none' } }) : null
+            // M6：播放结束/失败后清除 pendingPlay，避免同一条音频反复重挂
+            const clearPlay = function () { pendingPlay = null; setTick(Date.now() % 100000) }
+            const player = pendingPlay ? h('audio', { autoPlay: true, src: pendingPlay.url, key: pendingPlay.key, onEnded: clearPlay, onError: clearPlay, style: { display: 'none' } }) : null
             return h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '2px 0' } },
               h('span', { style: badge, onClick: function () { setVoiceOverride(sid, !effective) } },
                 effective ? '🔊 语音模式开' : '🔇 语音模式关'),
@@ -95,6 +103,7 @@ return {
     let micRec = null // {rec, stream}
     let micChunks = []
     let micSeconds = 0
+    let micLang = 'auto' // M4：模块级语言选择 —— 录音中切换语言立即生效（transcribe 不再依赖渲染闭包 s.lang）
     function insertText(inputActions, text) {
       const primary = inputActions && inputActions.setDraft
       if (typeof primary === 'function') { primary(text); return true }
@@ -125,6 +134,16 @@ return {
             const sid = props.sessionId
             const state = React.useState({ phase: 0, seconds: 0, lang: 'auto', error: null }) // 0 idle / 1 recording / 2 transcribing
             const s = state[0]; const set = state[1]
+            React.useEffect(function () {
+              // A3（I2）：组件卸载/插件停止时停止录音器与麦克风流，防隐私泄漏
+              return function () {
+                if (micRec) {
+                  try { micRec.rec.stop() } catch (e) { /* ignore */ }
+                  try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                  micRec = null
+                }
+              }
+            }, [])
             if (windowCannotRecord()) {
               return h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
                 h('a', { href: '/guide-dog/recorder', target: '_blank', style: { fontSize: 12, color: '#4a7dff', whiteSpace: 'nowrap' } }, '🎙 打开录音页'),
@@ -148,7 +167,11 @@ return {
                   rec.start(1000)
                   micRec = { rec: rec, stream: stream }
                   set(Object.assign({}, s, { phase: 1, seconds: 0, error: null }))
-                }).catch(function () { set(Object.assign({}, s, { error: 'mic_denied' })) })
+                }).catch(function (err) {
+                  // M4：区分"无设备"与"权限拒绝"
+                  const name = err && err.name
+                  set(Object.assign({}, s, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }))
+                })
               } catch (e) { set(Object.assign({}, s, { error: 'mic_denied' })) }
             }
             const toggle = function () {
@@ -163,18 +186,19 @@ return {
             }
             const cycLang = function () {
               const order = ['auto', 'zh', 'en']
-              const i = order.indexOf(s.lang)
-              set(Object.assign({}, s, { lang: order[(i + 1) % order.length] }))
+              const i = order.indexOf(micLang)
+              micLang = order[(i + 1) % order.length] // M4：同步写模块级，录音中切换也生效
+              set(Object.assign({}, s, { lang: micLang }))
             }
             const micStyle = {
               border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 16, lineHeight: 1,
               color: s.phase === 1 ? '#e74c3c' : '#888', borderRadius: 6, padding: 4,
             }
             const errText = {
-              mic_denied: '麦克风权限被拒绝', empty_speech: '没听清，请再说一次',
+              mic_denied: '麦克风权限被拒绝', no_device: '未检测到麦克风设备', empty_speech: '没听清，请再说一次',
               stt_failed: '转写失败', stt_timeout: '转写超时', engine_unavailable: 'STT 引擎不可用（见设置页）',
               insert_failed: '无法插入输入框（输入框接口不可用）',
-            }[s.error] || null
+            }[s.error] || (s.error ? '转写失败（' + s.error + '）' : null) // M9：未知错误码不静默
             return h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap' } },
               h('button', { onClick: toggle, title: s.phase === 1 ? '停止录音' : '语音输入', style: micStyle },
                 s.phase === 1 ? '⏺' : (s.phase === 2 ? '⏳' : '🎙')),
@@ -196,7 +220,7 @@ return {
           let bin = ''
           for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
           set(Object.assign({}, s, { phase: 2, error: null }))
-          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: s.lang })
+          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang })
         }).then(function (r) {
           if (r && r.ok && r.text) {
             const inserted = insertText(inputActions, r.text)
@@ -328,11 +352,12 @@ return {
       const set = state[1]
       React.useEffect(function () {
         let alive = true
-        host.call('guide-dog/auth-status', {}).then(function (r) { if (alive) set(Object.assign({}, s, { auth: r })) }).catch(function () {})
-        host.call('guide-dog/voices', {}).then(function (r) { if (alive && r && r.ok && Array.isArray(r.voices)) set(Object.assign({}, s, { voices: r.voices })) }).catch(function () {})
-        host.call('guide-dog/list-media', { limit: 30 }).then(function (r) { if (alive && Array.isArray(r)) set(Object.assign({}, s, { media: r })) }).catch(function () {})
-        host.call('guide-dog/get-config', {}).then(function (r) { if (alive && r && r.ok) set(Object.assign({}, s, { cfg: r.config })) }).catch(function () {})
-        host.call('guide-dog/status', {}).then(function (r) { if (alive && r && r.ok) set(Object.assign({}, s, { status: r.status })) }).catch(function () {})
+        // A1：函数式 updater —— 5 个异步结果各自合并，避免基于初始闭包 s 的 last-wins 全量覆盖
+        host.call('guide-dog/auth-status', {}).then(function (r) { if (alive) set(function (prev) { return Object.assign({}, prev, { auth: r }) }) }).catch(function () {})
+        host.call('guide-dog/voices', {}).then(function (r) { if (alive && r && r.ok && Array.isArray(r.voices)) set(function (prev) { return Object.assign({}, prev, { voices: r.voices }) }) }).catch(function () {})
+        host.call('guide-dog/list-media', { limit: 30 }).then(function (r) { if (alive && Array.isArray(r)) set(function (prev) { return Object.assign({}, prev, { media: r }) }) }).catch(function () {})
+        host.call('guide-dog/get-config', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { cfg: r.config }) }) }).catch(function () {})
+        host.call('guide-dog/status', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { status: r.status }) }) }).catch(function () {})
         return function () { alive = false }
       }, [])
       const speak = function () {

@@ -54,6 +54,7 @@ return {
     }
     let configCache = deepMerge(CONFIG_DEFAULTS, {})
     let configReady = Promise.resolve()
+    let configWriteChain = Promise.resolve() // A4（I3）：并发 set-config 串行化，防后写覆盖先写
     async function readTextFile(abs) {
       if (!fsSvc) return null
       try {
@@ -77,7 +78,7 @@ return {
     }
     function refreshConfig() { configReady = doRefreshConfig(); return configReady }
     function loadConfig() { return configCache }
-    async function saveConfig(patch) {
+    async function doSaveConfig(patch) {
       const root = await guideDogRoot()
       const next = deepMerge(configCache, patch || {})
       const dir = root + '/.guide-dog'
@@ -93,6 +94,12 @@ return {
         console.error('[guide-dog] config write failed', e)
         return { ok: false, error: 'config_write_failed' }
       }
+    }
+    function saveConfig(patch) {
+      // A4（I3）：串行化 —— 同一时刻只允许一个写，后续 patch 从前一结果合并
+      const p = configWriteChain.then(function () { return doSaveConfig(patch) })
+      configWriteChain = p.then(function () {}, function () {})
+      return p
     }
     async function writeStatus(patch) {
       try {
@@ -664,7 +671,7 @@ button{font-size:18px;padding:14px 28px;border-radius:10px;border:none;backgroun
 <div id="status">空闲</div><div id="out"></div>
 <script>
 const b=document.getElementById('rec'),st=document.getElementById('status'),out=document.getElementById('out'),cp=document.getElementById('cp');
-let mr=null,chunks=[];
+let mr=null,chunks=[],recTimer=null;
 b.onclick=async()=>{
   if(mr){mr.stop();return}
   try{
@@ -672,6 +679,7 @@ b.onclick=async()=>{
     mr=new MediaRecorder(s);chunks=[];
     mr.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
     mr.onstop=async()=>{
+      clearTimeout(recTimer);recTimer=null;
       const blob=new Blob(chunks,{type:'audio/webm'});
       st.textContent='转写中…';
       try{
@@ -683,6 +691,7 @@ b.onclick=async()=>{
       s.getTracks().forEach(t=>t.stop());mr=null;b.textContent='开始录音';
     };
     mr.start(1000);b.textContent='停止';st.textContent='录音中…';st.className='';
+    recTimer=setTimeout(function(){if(mr){mr.stop()}},60000);
   }catch(e){st.className='err';st.textContent='无法访问麦克风：'+e}
 };
 cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp.textContent='已复制'}catch(e){out.select();document.execCommand('copy');cp.textContent='已复制'}};
@@ -706,7 +715,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
               for await (const c of req) {
                 chunks.push(c)
                 total += c.length
-                if (total > 20 * 1024 * 1024) { res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
+                if (total > 20 * 1024 * 1024) { req.resume(); res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
               }
               const all = new Uint8Array(total)
               let off = 0
@@ -1136,28 +1145,13 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         })
       } catch (e) { return function () {} }
     })
-    ctx.effect(function () {
-      try {
-        return harness.handle('guide-dog/probe', async function (args) {
-          try {
-            const root = await guideDogRoot()
-            let cur = {}
-            const raw = await readTextFile(root + '/.guide-dog/probe.json')
-            if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-            await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
-            const next = Object.assign({}, cur, (args && args.report) || {})
-            await writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(next, null, 2))
-            return { ok: true }
-          } catch (e) { return { ok: false, error: 'config_write_failed', message: String(e).slice(0, 200) } }
-        })
-      } catch (e) { return function () {} }
-    })
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
     //   - 文本提取: const data = event.data || {}；content 取 data.content（或 data.message.content）blocks；
     //     text = content 中 type==='text' 的 b.text 拼接
     //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
+    const VOICE_QUEUE_MAX = 10 // M5：每会话队列上限（防 voiceQueue 无界增长；超限丢最旧）
     const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
     ctx.on('session/event', function (session, event) {
       try {
@@ -1168,7 +1162,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const vm = cfg.voiceMode || {}
         const effective = vm.sessions && vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
         if (!effective) return
-        const seq = (typeof event.seq === 'number') ? event.seq : 0
+        const seq = (typeof event.seq === 'number') ? event.seq : null // M11：缺失时不参与去重（speakImpl 对 null 不去重）
         const data = event.data || {}
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
         const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
@@ -1179,6 +1173,13 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
             const q = voiceQueue.get(sid) || []
             if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
             else if (r && !r.ok) q.push({ error: (r.message || r.error || 'tts_failed') })
+            if (q.length > VOICE_QUEUE_MAX) q.shift()
+            voiceQueue.set(sid, q)
+          }).catch(function (e) {
+            // M8：绝不静默 —— speakImpl reject 也入错误项（重新取 map，避免陈旧引用）
+            const q = voiceQueue.get(sid) || []
+            q.push({ error: 'tts_failed', message: String((e && e.message) || e).slice(0, 200) })
+            if (q.length > VOICE_QUEUE_MAX) q.shift()
             voiceQueue.set(sid, q)
           })
         })
