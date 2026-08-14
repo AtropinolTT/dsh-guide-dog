@@ -864,37 +864,86 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
 
 ---
 
-### Task 5: Client 语音模式（turnTail 自动发声 + dock 徽章 + 失败反馈）
+### Task 5: 语音模式（host 事件驱动自动发声 + client 轮询徽章）——机制转向版（裁决 2026-08-14）
+
+> 探测证实 client 快照不可枚举、turn 无消息文本字段 → 文本提取移至 host `session/event` 监听；client 仅轮询队列播放。三条硬指标不变。
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-client.js`（删除 PROBE 节；新增 VOICE MODE 节；**不声明 inject**，timer 经 `ctx.get('timer')` 可选使用——审查 C2 修复）
+- Modify: `guide-dog-dsh/plugin-host.js`（VOICE MODE 节：session/event 监听 + voiceQueue + RPC）
+- Modify: `guide-dog-dsh/plugin-client.js`（删除 PROBE 节；新增 VOICE MODE 节；**不声明 inject**，timer 经 `ctx.get('timer')` 可选使用）
 
 **Interfaces:**
-- Consumes: Task 4 探测形状；Task 3 speak RPC（`{text, sessionId, turnSeq, source:'voice-mode'}`）；Task 1 get/set-config；Task 3 beep RPC；`h = React.createElement`（行 18 已有）
+- Consumes: Task 3 speak RPC 内部实现 `speakImpl`（含去重与错误码）；Task 1 get/set-config；Task 3 beep RPC；`h = React.createElement`（client 行 134 已有）；`session/event` host 事件（`(this: Scoped<Session>, session, event)`）；`sessions` host 服务（可选）
 - Produces:
-  - 模块级 `voiceState = { cfg, loaded, spoken: Set, lastError, errorAt, beepUri }`；`voiceEffective(sid)`；`loadVoiceCfg()`；`setVoiceOverride(sid, v)`
-  - `conversation.chat.turnTail` 条目：select 粗筛（**无 spoken 检查**——select 拿不到 sessionId，去重只在组件内做，审查 M8 修复）；组件按 `props.sessionId` 精确判定 → speak RPC → 播放
-  - `conversation.input.dock` 条目 id `guide-dog-voice-mode` order 30：徽章（点击切换会话 override）+ 失败提示（8s 过期，经 `timerSvc.interval` 每秒 tick，timer 不可用时仅在下一次渲染过期）+ 隐藏 `<audio autoPlay>`
+  - host：`voiceQueue = new Map()`（sessionId → entries 数组）；`session/event` 监听器（assistant 消息 → 提取文本 → `speakImpl({text, sessionId, turnSeq: event.seq, source:'voice-mode'})` → 成功入队 `{url, key}` / 失败入队 `{error, message}`）；RPC `guide-dog/voice-queue`（带 `{sessionId}`，**弹出即消费**，返回 `{ok, entry|null}`）
+  - client：模块级 `voiceState = { cfg, loaded, lastError, errorAt, beepUri }`；`voiceEffective(sid)`；`loadVoiceCfg()`；`setVoiceOverride(sid, v)`
+  - `conversation.input.dock` 条目 id `guide-dog-voice-mode` order 30：徽章（点击切换会话 override）+ `timerSvc.interval` 1s 轮询 `guide-dog/voice-queue`（语音模式生效时）→ `<audio autoPlay>` 播放 / 错误项显示失败（8s 过期）+ beep 提示音
 
-- [ ] **Step 1: 记录探测形状（决策门注释）**
+- [ ] **Step 1: 决策门——读取 pkg-4 的 probe2.json 确认事件形状**
+
+```bash
+cat /home/tt-wsl-ubuntu/.guide-dog/probe2.json 2>/dev/null
+```
+Expected: 含 `sessionEvents`（readSession 事件采样：type/keys/messageKeys/contentKeys/textSample）与 `liveEvent`（session/event 监听器捕获的下一跳 assistant 消息事件标量形状）。**把实际字段名回填到 Step 2 代码注释**（消息事件判定字段、文本字段）。
+
+- [ ] **Step 2: host VOICE MODE 节**
+
+在 `guide-dog/probe` RPC 之后插入（事件形状以 probe2.json 为准；下方为预期形状，实施时按探测回填）：
 
 ```js
-    // 探测结论（Task 4 Step 7 输出）：
-    // - 快照消息列表字段: <messagesKeys 实际值>
-    // - content block 文本字段: <contentKeys 实际值>
-    // - inputActions 方法: <实际 keys>（Task 6 依此显式选择；候选链为兜底）
-    // - 录音路径: <Path A / Path B>
-    // - timerSvc: <exists/keys>
-    // - variableContextKeys: <实际值>
+    // ============ VOICE MODE 节（Phase 1，host） ============
+    const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
+    ctx.on('session/event', function (session, event) {
+      try {
+        // 事件形状以 probe2.json 的 liveEvent 为准（预期：event.type === 'message' 且为 assistant 角色）
+        const isAssistant = /* 探测回填：判定字段 */ true
+        if (!isAssistant) return
+        const sid = /* 探测回填：session.id 或 event 内 sessionId */ ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const vm = cfg.voiceMode || {}
+        const effective = vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
+        if (!effective) return
+        const seq = /* 探测回填：event 序号字段 */ 0
+        const text = /* 探测回填：消息文本提取（content blocks 中 type==='text' 拼接） */ ''
+        if (!text) return
+        // 异步串行 TTS，不阻塞事件循环
+        serialSpeak(function () {
+          return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
+            const q = voiceQueue.get(sid) || []
+            if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
+            else if (r && !r.ok) q.push({ error: (r.message || r.error || 'tts_failed') })
+            voiceQueue.set(sid, q)
+          })
+        })
+      } catch (e) { /* listener is best effort */ }
+    })
 ```
 
-- [ ] **Step 2: 状态模块 + 自动发声钩子**
-
-在 `const h = React.createElement`（行 18）之后插入：
+在 RPC 区插入：
 
 ```js
-    // ============ VOICE MODE 节（Phase 1） ============
-    const voiceState = { cfg: null, loaded: false, spoken: new Set(), lastError: null, errorAt: 0, beepUri: null }
+    ctx.effect(function () {
+      try {
+        return harness.handle('guide-dog/voice-queue', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: true, entry: null }
+          const q = voiceQueue.get(sid) || []
+          const entry = q.length ? q.shift() : null
+          if (!q.length) voiceQueue.delete(sid)
+          return { ok: true, entry: entry }
+        })
+      } catch (e) { return function () {} }
+    })
+```
+
+- [ ] **Step 3: client VOICE MODE 节（删除 PROBE 节后）**
+
+在 `const h = React.createElement`（行 134）之后插入（删除原 PROBE 节全部代码）：
+
+```js
+    // ============ VOICE MODE 节（Phase 1，client） ============
+    const voiceState = { cfg: null, loaded: false, lastError: null, errorAt: 0, beepUri: null }
     let timerSvc = null
     try { timerSvc = ctx.get('timer') } catch (e) { timerSvc = null }
     function voiceEffective(sid) {
@@ -915,71 +964,11 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
         if (r && r.ok) return loadVoiceCfg()
       }).catch(function () {})
     }
-    function voiceTextOf(message) {
-      const blocks = message && message.content
-      if (!Array.isArray(blocks)) return ''
-      const parts = []
-      for (const b of blocks) {
-        if (b && typeof b.text === 'string') parts.push(b.text)
-      }
-      return parts.join('\n').trim()
-    }
+    let pendingPlay = null // {url, key}
+    let pollBusy = false
     ctx.effect(function () {
       loadVoiceCfg()
       host.call('guide-dog/beep', {}).then(function (r) { if (r && r.ok) voiceState.beepUri = r.dataUri }).catch(function () {})
-      return slots.inject('conversation.chat.turnTail', function () {
-        return slots.register(
-          { name: 'conversation.chat.turnTail', select: function (owner) {
-              // select 只收到 owner（{turn, seq, openFile}），无 sessionId：
-              // 粗筛 = 配置已加载 且 任一会话语音模式可能开启；不做 spoken 去重（组件内做，审查 M8）
-              if (!voiceState.loaded) return null
-              if (!owner || !owner.turn || typeof owner.seq !== 'number') return null
-              const vm = (voiceState.cfg && voiceState.cfg.voiceMode) || {}
-              const anyOn = !!vm.default || Object.keys(vm.sessions || {}).some(function (k) { return !!vm.sessions[k] })
-              if (!anyOn) return null
-              return { seq: owner.seq }
-            } },
-          function (props) {
-            const matched = props.matched || {}
-            React.useEffect(function () {
-              const sid = props.sessionId
-              if (!sid || typeof matched.seq !== 'number') return
-              if (!voiceEffective(sid)) return
-              const key = sid + ':' + matched.seq
-              if (voiceState.spoken.has(key)) return
-              let snap = null
-              try { snap = props.useSession() } catch (e) { snap = null }
-              const list = snap ? (snap.messages || snap.turns || snap.nodes || []) : []
-              let msg = null
-              for (const m of list) { if (m && (m.seq === matched.seq || m.id === matched.seq)) { msg = m; break } }
-              const text = voiceTextOf(msg)
-              if (!text) return
-              voiceState.spoken.add(key)
-              host.call('guide-dog/speak', { text: text, sessionId: sid, turnSeq: matched.seq, source: 'voice-mode' }).then(function (r) {
-                if (r && r.ok && r.url && !r.skipped) {
-                  pendingPlay = { url: r.url, key: key }
-                } else if (r && !r.ok) {
-                  voiceState.lastError = (r.message || r.error || 'tts_failed')
-                  voiceState.errorAt = typeof Date === 'function' ? Date.now() : 1
-                }
-              }).catch(function (e) {
-                voiceState.lastError = String(e)
-                voiceState.errorAt = typeof Date === 'function' ? Date.now() : 1
-              })
-            }, [matched.seq])
-            return null
-          })
-      })
-    })
-    let pendingPlay = null // {url, key} —— 由 dock 徽章组件渲染为隐藏 <audio>
-```
-
-- [ ] **Step 3: dock 徽章 + 播放 + 失败提示**
-
-在 VOICE MODE 节继续追加：
-
-```js
-    ctx.effect(function () {
       return slots.inject('conversation.input.dock', function () {
         return slots.register(
           { name: 'conversation.input.dock', id: 'guide-dog-voice-mode', order: 30, label: function () { return 'Voice mode' } },
@@ -988,11 +977,21 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
             const effective = voiceEffective(sid)
             const [tick, setTick] = React.useState(0)
             React.useEffect(function () {
-              // timer 服务可选（探测确认）；不可用时不做每秒 tick，8s 过期退化为下次渲染
               if (!timerSvc || typeof timerSvc.interval !== 'function') return
               const stop = timerSvc.interval(function () { setTick(Date.now() % 100000) }, 1000)
               return function () { try { stop() } catch (e) { /* ignore */ } }
             }, [])
+            React.useEffect(function () {
+              // 语音模式生效时每秒轮询队列（timerSvc.interval 不可用时退化为每次渲染轮询）
+              if (!effective || !sid || pollBusy) return
+              pollBusy = true
+              host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
+                if (r && r.ok && r.entry) {
+                  if (r.entry.url) pendingPlay = { url: r.entry.url, key: r.entry.key }
+                  else if (r.entry.error) { voiceState.lastError = r.entry.error; voiceState.errorAt = typeof Date === 'function' ? Date.now() : 1 }
+                }
+              }).catch(function () {}).then(function () { pollBusy = false })
+            }, [effective, sid, tick])
             const now = typeof Date === 'function' ? Date.now() : 0
             const err = (voiceState.errorAt && (now - voiceState.errorAt < 8000)) ? voiceState.lastError : null
             const badge = {
@@ -1016,12 +1015,10 @@ cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/ && git commit -m "f
 - [ ] **Step 4: 语法校验 + Commit**
 
 ```bash
-node --check /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh/plugin-client.js
-cd /home/tt-wsl-ubuntu/skills-repo && git add guide-dog-dsh/plugin-client.js && git commit -m "feat(phase1): client voice mode (turnTail auto-speak, dock badge, failure tone, optional timer)"
+node --check /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh/plugin-host.js && node --check /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh/plugin-client.js
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && git add plugin-host.js plugin-client.js && git commit -m "feat(phase1): voice mode host-event mechanism (session/event listener, voice-queue RPC, polling badge)"
 ```
 Expected: exit 0，commit 成功。
-
----
 
 ### Task 6: Client 语音输入（麦克风按钮 + 转写 + 插入输入框）
 
@@ -1373,7 +1370,7 @@ Expected: `starting`；最终 running、currentPackageId=pkg-6。
 #   client Slots root=conversation.input.right      → occupant id=guide-dog-mic（PROBE 条目已删）
 #   client Slots root=conversation.input.dock       → occupant id=guide-dog-voice-mode (order 30)
 #   client Slots root=settings.section              → occupant id=guide-dog
-#   client Slots root=conversation.chat.turnTail    → 我们的 chain 条目（select 注册）
+#   client Slots root=conversation.input.dock       → occupant id=guide-dog-voice-mode（轮询徽章）
 #   host Tool.listTools                             → 仍为 9 个 guide_dog_* 工具
 cat /home/tt-wsl-ubuntu/.guide-dog/status.json 2>/dev/null
 ls -l /home/tt-wsl-ubuntu/.guide-dog/config.json 2>/dev/null   # 权限应为 600
