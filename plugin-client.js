@@ -72,14 +72,44 @@ return {
         voiceState.lastError = '播放失败'; voiceState.errorAt = Date.now()
       }
     }
-    function playBeep() {
-      if (!voiceState.beepUri || typeof Audio !== 'function') return
+    function beepFallback() {
+      // WebAudio 振荡器兜底：Audio 元素被自动播放策略拦截时使用
+      var AC = null
+      try { AC = AudioContext } catch (e) { AC = null }
+      if (!AC) { try { AC = window.webkitAudioContext } catch (e2) { AC = null } }
+      if (!AC) return
       try {
-        const a = new Audio(voiceState.beepUri)
-        a.volume = 0.4
-        const p = a.play()
-        if (p && typeof p.catch === 'function') p.catch(function () { /* ignore */ })
+        const ctx = new AC()
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.frequency.value = 880
+        osc.connect(gain); gain.connect(ctx.destination)
+        gain.gain.setValueAtTime(0.25, ctx.currentTime)
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22)
+        osc.start()
+        osc.stop(ctx.currentTime + 0.22)
+        osc.onended = function () { try { ctx.close() } catch (e3) { /* ignore */ } }
       } catch (e) { /* ignore */ }
+    }
+    function playBeep() {
+      const doPlay = function (uri) {
+        if (typeof Audio !== 'function') { beepFallback(); return }
+        try {
+          const a = new Audio(uri)
+          a.volume = 0.8
+          const p = a.play()
+          if (p && typeof p.catch === 'function') p.catch(function (err) {
+            console.log('[guide-dog] beep play blocked: ' + String((err && err.message) || err))
+            beepFallback()
+          })
+        } catch (e) { beepFallback() }
+      }
+      if (voiceState.beepUri) { doPlay(voiceState.beepUri); return }
+      // 惰性获取：apply 时的 beep 请求若未完成/失败，错误到来时补拉
+      host.call('guide-dog/beep', {}).then(function (r) {
+        if (r && r.ok && r.dataUri) { voiceState.beepUri = r.dataUri; doPlay(r.dataUri) }
+        else beepFallback()
+      }).catch(function () { beepFallback() })
     }
     let pollBusy = false
     // ---- 麦克风（模块级状态；组件只持有 phase/seconds/lang/error） ----
@@ -262,6 +292,9 @@ return {
             const vm = (voiceState.cfg && voiceState.cfg.voiceMode) || {}
             const voiceTip = '语音模式提示：' + (effective ? '开' : '关') + ' · 全局默认：' + (vm.default ? '开' : '关') + '（点击切换）'
             const micTip = s.phase === 1 ? '停止录音' : (s.phase === 2 ? '转写中…' : '语音输入')
+            // 错误文本截断为短标签，完整原因放 tooltip —— 避免长文本撑破输入框工具行布局
+            const errShort = err ? (String(err).length > 24 ? String(err).slice(0, 24) + '…' : String(err)) : null
+            const micShort = micErrText ? (micErrText.length > 28 ? micErrText.slice(0, 28) + '…' : micErrText) : null
             return h('div', { className: 'gd-voice' },
               h('button', { className: 'gd-btn' + (effective ? ' gd-on' : ''), title: voiceTip, onClick: function () { setVoiceOverride(sid, !effective) } }, speakerIcon(effective)),
               h('select', { className: 'gd-select', value: s.lang, title: '识别语言检测', onChange: function (e) { micLang = e.target.value; set(function (prev) { return Object.assign({}, prev, { lang: e.target.value }) }) } },
@@ -270,8 +303,8 @@ return {
                 ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', title: '浏览器限制：录音需在独立页面进行' }, micIcon(false))
                 : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
               s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
-              err ? h('span', { className: 'gd-err' }, '朗读失败：' + err) : null,
-              micErrText ? h('span', { className: 'gd-err' }, micErrText) : null)
+              errShort ? h('span', { className: 'gd-err', title: err ? '朗读失败：' + err : undefined }, '朗读失败：' + errShort) : null,
+              micShort ? h('span', { className: 'gd-err', title: micErrText || undefined }, micShort) : null)
           })
       })
     })
