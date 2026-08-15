@@ -317,6 +317,36 @@ record:
    the input box's bottom-left, and Settings → Guide Dog shows the config
    blocks.
 
+### Auto-reload after restart (`dsh-guide-dog-autoload`)
+
+Manual redeploy does not survive a restart either, so a **host bundle**
+(`autoload/`) watches `agent/created` and re-deploys the dynamic plugin for
+every agent session:
+
+1. `python3 deploy/publish.py` — verifies template/bundle consistency, copies
+   the sources to `~/.dsh/guide-dog-deploy/` (outside any workspace) with a
+   SHA-256 `manifest.json`, copies the autoload package to
+   `~/.dsh/guide-dog-autoload/`, and **idempotently registers the bundle in
+   the web profile** (`~/.dsh/profiles/web`: dependency link + `bundles`
+   entry + `node_modules` symlink).
+2. Restart DSH (`dsh web`) — bundles are parsed at startup, so a restart is
+   required after any change.
+3. On session creation the autoloader hash-checks the deployed sources
+   (tamper → refuse to deploy), then `define`s + `run`s a fresh `gdog-*`
+   plugin. The **first client activation per DSH process needs one human
+   approval** in the UI (the browser runs the client half); afterwards the
+   grant covers future versions until the next restart.
+
+Profile pitfall (observed 2026-08-15): `dsh web` is an alias for
+`--profile web` — the GUI runs the **web** profile. Registering the autoload
+bundle only in another profile (e.g. `cc-tui`) silently does nothing for the
+GUI; `deploy/publish.py` always targets `~/.dsh/profiles/web`.
+
+The bundle shape mirrors the published `dsh-better-sidebar` precedent:
+`dsh.bundle.patch` → `cordis.patch.yml` with a single `insert` row, named
+exports (`export const name` + `export function apply(ctx)`), no default
+export, host-only (no `dsh.client` block needed).
+
 ## Phase 2 backlog (deferred from the V4-Pro final review)
 
 - **M9** — mic `onstop` closure holds a stale `inputActions` when switching

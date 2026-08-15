@@ -27,6 +27,11 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOME_DEPLOY = os.path.expanduser('~/.dsh/guide-dog-deploy')
 HOME_AUTOLOAD = os.path.expanduser('~/.dsh/guide-dog-autoload')
+# `dsh web` is an alias for `--profile web` (see DSH README); the GUI runs the
+# web profile, so the autoload bundle must be registered there. Registering it
+# only in another profile (e.g. cc-tui) silently does nothing for the GUI.
+PROFILE_DIR = os.path.expanduser('~/.dsh/profiles/web')
+BUNDLE_NAME = 'dsh-guide-dog-autoload'
 
 SOURCES = ['plugin-host.js', 'plugin-client.js']
 
@@ -68,6 +73,56 @@ def sha256(path):
     return h.hexdigest()
 
 
+def register_profile():
+    """Idempotently register the autoload bundle in the active web profile.
+
+    DSH reads `dsh.profile.bundles` from <profile>/package.json at startup and
+    resolves each bundle name from the profile's own node_modules. Without this
+    registration the autoloader never loads and the dynamic plugin is not
+    restored after a restart (observed 2026-08-15: registered in cc-tui only,
+    while `dsh web` runs the web profile).
+
+    Returns a list of human-readable actions taken (empty when already in
+    place, so re-runs are no-ops).
+    """
+    actions = []
+    pkg_path = os.path.join(PROFILE_DIR, 'package.json')
+    if not os.path.isfile(pkg_path):
+        fail('profile package.json not found: ' + pkg_path)
+    pkg = json.load(open(pkg_path, encoding='utf-8'))
+    dep_key = 'link:' + HOME_AUTOLOAD
+    deps = pkg.setdefault('dependencies', {})
+    if deps.get(BUNDLE_NAME) != dep_key:
+        deps[BUNDLE_NAME] = dep_key
+        actions.append('added dependency %s -> %s' % (BUNDLE_NAME, dep_key))
+    bundles = pkg.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
+    if BUNDLE_NAME not in bundles:
+        bundles.append(BUNDLE_NAME)
+        actions.append('added %s to dsh.profile.bundles' % BUNDLE_NAME)
+    if actions:
+        tmp = pkg_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(pkg, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        os.replace(tmp, pkg_path)
+    # node_modules symlink (pnpm link: layout; matches the dsh-auto-review
+    # precedent of a manual symlink without running pnpm install).
+    nm = os.path.join(PROFILE_DIR, 'node_modules')
+    os.makedirs(nm, exist_ok=True)
+    link = os.path.join(nm, BUNDLE_NAME)
+    target = os.path.relpath(HOME_AUTOLOAD, os.path.dirname(link))
+    if not os.path.islink(link) or os.readlink(link) != target:
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(target, link)
+        actions.append('symlinked node_modules/%s -> %s' % (BUNDLE_NAME, target))
+    for a in actions:
+        print('profile: ' + a)
+    if not actions:
+        print('profile: ' + BUNDLE_NAME + ' already registered in ' + PROFILE_DIR)
+    return actions
+
+
 def main():
     verify_sources()
 
@@ -98,6 +153,8 @@ def main():
         print('copied autoload/' + rel)
 
     print('published to ' + HOME_DEPLOY + ' and ' + HOME_AUTOLOAD)
+    register_profile()
+    print('publish complete — restart DSH (`dsh web`) for the bundle change to load')
 
 
 if __name__ == '__main__':
