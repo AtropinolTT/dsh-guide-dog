@@ -181,6 +181,26 @@ return {
       const sub = inputActions.submit || inputActions.send
       if (typeof sub === 'function') sub()
     }
+    // 安全审查（2026-08-15）：外部工具结果 URL 仅允许 http/https/mailto/#/相对路径；其余视为不安全
+    function safeHref(u) {
+      return typeof u === 'string' && /^(https?:\/\/|mailto:|#|\/|\.\/|\.\.\/)/i.test(u) ? u : '#'
+    }
+    function safeMedia(u) {
+      return typeof u === 'string' && /^(https?:\/\/|\/|\.\/|\.\.\/)/i.test(u) ? u : null
+    }
+    // 安全审查（2026-08-15）：工具结果 JSON 展示前脱敏（key/token/secret/auth 等字段打码）
+    function maskSensitive(v) {
+      if (Array.isArray(v)) return v.map(maskSensitive)
+      if (v && typeof v === 'object') {
+        const out = {}
+        for (const k of Object.keys(v)) {
+          const val = v[k]
+          out[k] = /(key|token|secret|auth|password|apikey|api_key)/i.test(k) && typeof val === 'string' ? '***' : maskSensitive(val)
+        }
+        return out
+      }
+      return v
+    }
     function windowCannotRecord() {
       var nav = null; try { nav = navigator } catch (e) { nav = null }
       var mr = null; try { mr = MediaRecorder } catch (e) { mr = null }
@@ -282,7 +302,7 @@ return {
             React.useEffect(function () {
               // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
               return function () {
-                if (partialTimer) { clearInterval(partialTimer); partialTimer = null }
+                if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
                 if (micRec) {
                   try { micRec.rec.stop() } catch (e) { /* ignore */ }
                   try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
@@ -332,30 +352,32 @@ return {
                       analyser.fftSize = 1024
                       src.connect(analyser)
                       if (typeof actx.resume === 'function') { try { actx.resume() } catch (e) { /* ignore */ } }
-                      // 每 500ms 读 RMS：UI 显示"检测到声音/未检测到"；持续静音 2.5s 提示
+                      // 每 500ms 读 RMS：UI 显示"检测到声音/未检测到"；持续静音 2.5s 提示。
+                      // 2026-08-15 修复：client 沙箱无全局 setInterval（Builtin 仅 ctx/React/host/styles/console，
+                      // React 也仅暴露 createElement/useState/useEffect），必须用 timer Service 的 interval
+                      // （返回 disposer）。旧代码 setInterval 抛 ReferenceError：volTimer 的被 try 吞掉 →
+                      // 指示永不显示；partial 的 setInterval 在 try 外 → 误报 mic_denied（录音仍在跑）。
                       const buf = new Uint8Array(analyser.fftSize)
                       let silentMs = 0
-                      volTimer = setInterval(function () {
-                        try {
-                          analyser.getByteTimeDomainData(buf)
-                          let sum = 0
-                          for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
-                          const rms = Math.sqrt(sum / buf.length)
-                          if (rms >= 0.008) {
-                            silentMs = 0
-                            set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
-                          } else {
-                            silentMs += 500
-                            set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
-                          }
-                        } catch (e) { /* ignore */ }
-                      }, 500)
+                      if (timerSvc && typeof timerSvc.interval === 'function') {
+                        volTimer = timerSvc.interval(function () {
+                          try {
+                            analyser.getByteTimeDomainData(buf)
+                            let sum = 0
+                            for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
+                            const rms = Math.sqrt(sum / buf.length)
+                            if (rms >= 0.008) {
+                              silentMs = 0
+                              set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
+                            } else {
+                              silentMs += 500
+                              set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
+                            }
+                          } catch (e) { /* ignore */ }
+                        }, 500)
+                      }
                     }
                   } catch (e) { analyser = null }
-                  // 音量检测不可用（AC 获取失败）：UI 显示"检测不可用"而非完全不显示（诊断可见）
-                  if (!analyser) {
-                    set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
-                  }
                   let rec = null
                   try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
                   micChunks = []; micSeconds = 0
@@ -367,36 +389,46 @@ return {
                     if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
                   }
                   rec.onstop = function () {
-                    if (volTimer) { clearInterval(volTimer); volTimer = null }
-                    if (partialTimer) { clearInterval(partialTimer); partialTimer = null }
+                    if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
+                    if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
                     partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
                     transcribe(sid, props.inputActions, set)
                   }
                   rec.start(1000)
                   micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
                   set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
+                  // 音量检测不可用（AC 获取失败）：phase:1 之后再设 noana（避免被上面的 vol:null 覆盖），
+                  // UI 显示"检测不可用"而非完全不显示（诊断可见）
+                  if (!analyser) {
+                    set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
+                  }
                   // 实时预览：每 5s 把"上次 partial 之后"的新增音频送去转写（base 模型，host 侧 partial 分支），
                   // 结果实时覆盖输入框 draft（预览）。partialBusy 跳过保证不并发堆积；增量机制避免全量越转越长。
+                  // timer Service interval（沙箱无 setInterval）；disposer 存 partialTimer 供清理。
                   partialBusy = false; partialIdx = 0; partialStale = false
-                  partialTimer = setInterval(function () {
-                    if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
-                    partialBusy = true
-                    const parts = micChunks.slice(partialIdx)
-                    partialIdx = micChunks.length
-                    let blob = null
-                    try { blob = new Blob(parts, { type: 'audio/webm' }) } catch (e) { partialBusy = false; return }
-                    blob.arrayBuffer().then(function (buf) {
-                      const bytes = new Uint8Array(buf)
-                      let bin = ''
-                      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
-                      return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang, partial: true })
-                    }).then(function (r) {
-                      partialBusy = false
-                      if (!partialStale && r && r.ok && r.text) insertText(inputActions, r.text)
-                    }).catch(function () { partialBusy = false })
-                  }, 5000)
+                  if (timerSvc && typeof timerSvc.interval === 'function') {
+                    partialTimer = timerSvc.interval(function () {
+                      if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
+                      partialBusy = true
+                      const parts = micChunks.slice(partialIdx)
+                      partialIdx = micChunks.length
+                      let blob = null
+                      try { blob = new Blob(parts, { type: 'audio/webm' }) } catch (e) { partialBusy = false; return }
+                      blob.arrayBuffer().then(function (buf) {
+                        const bytes = new Uint8Array(buf)
+                        let bin = ''
+                        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+                        return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang, partial: true })
+                      }).then(function (r) {
+                        partialBusy = false
+                        if (!partialStale && r && r.ok && r.text) insertText(inputActions, r.text)
+                      }).catch(function () { partialBusy = false })
+                    }, 5000)
+                  }
                   playStartTone() // 录音开始提示音：确认录音通道已真正启动
                 }).catch(function (err) {
+                  // 防御：若 micRec 已建立（录音已在运行），说明异常发生在启动后（不应误报权限错误）
+                  if (micRec) return
                   const name = err && err.name
                   set(function (prev) { return Object.assign({}, prev, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }) })
                 })
@@ -407,7 +439,7 @@ return {
                 const r = micRec
                 micRec = null
                 if (r) {
-                  if (r.volTimer) { clearInterval(r.volTimer) }
+                  if (r.volTimer) { try { r.volTimer() } catch (e) { /* ignore */ } }
                   try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
                 }
                 return
@@ -429,7 +461,7 @@ return {
               h('select', { className: 'gd-select', value: s.lang, title: '识别语言检测', onChange: function (e) { micLang = e.target.value; set(function (prev) { return Object.assign({}, prev, { lang: e.target.value }) }) } },
                 h('option', { value: 'auto' }, '自动'), h('option', { value: 'zh' }, '中文'), h('option', { value: 'en' }, '英文')),
               windowCannotRecord()
-                ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', title: '浏览器限制：录音需在独立页面进行' }, micIcon(false))
+                ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', rel: 'noreferrer', title: '浏览器限制：录音需在独立页面进行' }, micIcon(false))
                 : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
               s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
               s.phase === 1 && s.vol ? h('span', {
@@ -496,23 +528,26 @@ return {
     function MediaValue(toolName, value) {
       const variant = VARIANTS[toolName] || 'text'
       if (variant === 'image') {
-        const urls = (value.urls && value.urls.length) ? value.urls : (value.url ? [value.url] : [])
+        const urls = ((value.urls && value.urls.length) ? value.urls : (value.url ? [value.url] : []))
+          .filter(function (u) { return safeMedia(u) !== null })
         if (!urls.length) return h('div', { style: mutedStyle }, 'no media url')
         return h('div', null, urls.map(function (u, i) {
-          return h('a', { key: i, href: u, target: '_blank', rel: 'noreferrer', style: { display: 'block', marginBottom: 6 } },
-            h('img', { src: u, style: { maxWidth: '100%', maxHeight: 420, borderRadius: 8, border: '1px solid rgba(128,128,128,.35)', display: 'block' } }))
+          return h('a', { key: i, href: safeHref(u), target: '_blank', rel: 'noreferrer', style: { display: 'block', marginBottom: 6 } },
+            h('img', { src: safeMedia(u), style: { maxWidth: '100%', maxHeight: 420, borderRadius: 8, border: '1px solid rgba(128,128,128,.35)', display: 'block' } }))
         }))
       }
       if (variant === 'audio') {
-        if (!value.url) return h('div', { style: mutedStyle }, 'no media url')
+        const src = safeMedia(value.url)
+        if (!src) return h('div', { style: mutedStyle }, 'no media url')
         return h('div', { style: { marginTop: 6 } },
-          h('audio', { src: value.url, controls: true, style: { width: '100%' } }),
-          h('a', { href: value.url, target: '_blank', rel: 'noreferrer', style: linkStyle }, 'open file'))
+          h('audio', { src: src, controls: true, style: { width: '100%' } }),
+          h('a', { href: safeHref(value.url), target: '_blank', rel: 'noreferrer', style: linkStyle }, 'open file'))
       }
       if (variant === 'video') {
-        if (!value.url) return h('div', { style: mutedStyle }, 'no media url')
+        const src = safeMedia(value.url)
+        if (!src) return h('div', { style: mutedStyle }, 'no media url')
         return h('div', { style: { marginTop: 6 } },
-          h('video', { src: value.url, controls: true, preload: 'metadata', style: { maxWidth: '100%', maxHeight: 420, borderRadius: 8 } }))
+          h('video', { src: src, controls: true, preload: 'metadata', style: { maxWidth: '100%', maxHeight: 420, borderRadius: 8 } }))
       }
       if (variant === 'list') {
         const items = value.voices || value.results || []
@@ -523,7 +558,7 @@ return {
         }
         return h('div', { style: { marginTop: 4 } }, items.map(function (r, i) {
           return h('div', { key: i, style: { marginBottom: 4 } },
-            h('a', { href: r.url, target: '_blank', rel: 'noreferrer', style: { color: '#4a7dff', fontSize: 13 } }, r.title || r.url),
+            h('a', { href: safeHref(r.url), target: '_blank', rel: 'noreferrer', style: { color: '#4a7dff', fontSize: 13 } }, r.title || r.url),
             r.snippet ? h('div', { style: { fontSize: 12, color: '#666' } }, String(r.snippet)) : null)
         }))
       }
@@ -556,7 +591,7 @@ return {
         MediaValue(toolName, value),
         h('details', { style: { marginTop: 6 } },
           h('summary', { style: mutedStyle }, 'Result JSON'),
-          h('pre', { style: preStyle }, JSON.stringify(value, null, 2))))
+          h('pre', { style: preStyle }, JSON.stringify(maskSensitive(value), null, 2))))
     }
 
     ctx.effect(function () {
@@ -638,7 +673,7 @@ return {
           }, [h('option', { key: '', value: '' }, '默认')].concat((s.audioInputs || []).map(function (d) {
             return h('option', { key: d.id, value: d.id }, d.label)
           })))),
-          h('label', null, h('input', { type: 'checkbox', checked: !!s.cfg.voiceInput.autoSend, onChange: function (e) { setCfg({ voiceInput: { autoSend: e.target.checked } }) } }), ' 识别后自动发送')),
+          h('label', null, h('input', { type: 'checkbox', checked: !!s.cfg.voiceInput.autoSend, onChange: function (e) { setCfg({ voiceInput: { autoSend: e.target.checked } }) } }), ' 识别后自动发送（误识别内容会直接发出，请谨慎开启）')),
         s.audioInputs && s.audioInputs.length === 0 ? h('div', { style: mutedStyle }, '未枚举到输入设备（远程/无头环境可能需 RDP 音频重定向）') : null,
         h('div', { style: rowStyle },
           h('span', { style: badgeStyle }, 'STT'),
@@ -648,17 +683,20 @@ return {
       ]) : null
       const mediaCells = s.media.map(function (m, i) {
         if (m.kind === 'image') {
-          return h('a', { key: i, href: m.url, target: '_blank', rel: 'noreferrer', title: m.name },
-            h('img', { src: m.url, style: { width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(128,128,128,.3)' } }))
+          const src = safeMedia(m.url)
+          return src ? h('a', { key: i, href: safeHref(m.url), target: '_blank', rel: 'noreferrer', title: m.name },
+            h('img', { src: src, style: { width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(128,128,128,.3)' } })) : null
         }
         if (m.kind === 'video') {
-          return h('video', { key: i, src: m.url, muted: true, preload: 'metadata', style: { width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(128,128,128,.3)' } })
+          const src = safeMedia(m.url)
+          return src ? h('video', { key: i, src: src, muted: true, preload: 'metadata', style: { width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(128,128,128,.3)' } }) : null
         }
         if (m.kind === 'audio') {
-          return h('audio', { key: i, src: m.url, controls: true, preload: 'none', style: { width: 150 } })
+          const src = safeMedia(m.url)
+          return src ? h('audio', { key: i, src: src, controls: true, preload: 'none', style: { width: 150 } }) : null
         }
-        return h('a', { key: i, href: m.url, target: '_blank', rel: 'noreferrer', style: { fontSize: 12 } }, m.name)
-      })
+        return h('a', { key: i, href: safeHref(m.url), target: '_blank', rel: 'noreferrer', style: { fontSize: 12 } }, m.name)
+      }).filter(Boolean)
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '0 4px', maxWidth: 720 } },
         h('h2', null, 'Guide Dog for DSH — MiniMax multimodal'),
         cfgBlock,
@@ -670,7 +708,7 @@ return {
             h('select', { value: s.voice, onChange: function (e) { set(Object.assign({}, s, { voice: e.target.value })) } }, voiceOptions),
             h('button', { onClick: speak, disabled: s.busy }, s.busy ? 'Generating…' : 'Speak & play')),
           s.error ? h('div', { style: { color: '#c0392b', fontSize: 12, marginTop: 8 } }, String(s.error)) : null,
-          s.playUrl ? h('audio', { src: s.playUrl, controls: true, autoPlay: true, style: { width: '100%', marginTop: 8 } }) : null),
+          s.playUrl ? h('audio', { src: safeMedia(s.playUrl), controls: true, autoPlay: true, style: { width: '100%', marginTop: 8 } }) : null),
         h('div', { style: { border: '1px solid rgba(128,128,128,.3)', borderRadius: 10, padding: 12 } },
           h('div', { style: { fontWeight: 600, marginBottom: 8 } }, 'Recent media (' + s.media.length + ')'),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } }, mediaCells)))
