@@ -163,6 +163,11 @@ return {
     let micSeconds = 0
     let micLang = 'auto'
     let micDeviceId = '' // 用户选择的输入设备（设置页下拉）
+    // 实时预览（partial）转写状态（2026-08-15 用户需求：边说边显示识别结果于输入框）
+    let partialBusy = false // 一次只跑一个 partial 转写（防止并发堆积）
+    let partialIdx = 0      // micChunks 中已送入 partial 的索引（增量，避免每次都转写全量）
+    let partialStale = false // 录音已停止：在途 partial 结果丢弃，防覆盖最终转写
+    let partialTimer = null
     function insertText(inputActions, text) {
       const primary = inputActions && inputActions.setDraft
       if (typeof primary === 'function') { primary(text); return true }
@@ -277,6 +282,7 @@ return {
             React.useEffect(function () {
               // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
               return function () {
+                if (partialTimer) { clearInterval(partialTimer); partialTimer = null }
                 if (micRec) {
                   try { micRec.rec.stop() } catch (e) { /* ignore */ }
                   try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
@@ -314,7 +320,11 @@ return {
                   let analyser = null
                   let volTimer = null
                   try {
-                    const AC = window.AudioContext || window.webkitAudioContext
+                    // AC 获取修复（2026-08-15）：沙箱里 AudioContext 以全局暴露，window.AudioContext 可能为
+                    // undefined → 先前写法静默跳过音量检测（●声/○静音 永不显示）。全局优先，window 兜底。
+                    var AC = null
+                    try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
+                    if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
                     if (AC) {
                       const actx = new AC()
                       const src = actx.createMediaStreamSource(stream)
@@ -342,6 +352,10 @@ return {
                       }, 500)
                     }
                   } catch (e) { analyser = null }
+                  // 音量检测不可用（AC 获取失败）：UI 显示"检测不可用"而非完全不显示（诊断可见）
+                  if (!analyser) {
+                    set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
+                  }
                   let rec = null
                   try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
                   micChunks = []; micSeconds = 0
@@ -354,11 +368,33 @@ return {
                   }
                   rec.onstop = function () {
                     if (volTimer) { clearInterval(volTimer); volTimer = null }
+                    if (partialTimer) { clearInterval(partialTimer); partialTimer = null }
+                    partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
                     transcribe(sid, props.inputActions, set)
                   }
                   rec.start(1000)
                   micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
                   set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
+                  // 实时预览：每 5s 把"上次 partial 之后"的新增音频送去转写（base 模型，host 侧 partial 分支），
+                  // 结果实时覆盖输入框 draft（预览）。partialBusy 跳过保证不并发堆积；增量机制避免全量越转越长。
+                  partialBusy = false; partialIdx = 0; partialStale = false
+                  partialTimer = setInterval(function () {
+                    if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
+                    partialBusy = true
+                    const parts = micChunks.slice(partialIdx)
+                    partialIdx = micChunks.length
+                    let blob = null
+                    try { blob = new Blob(parts, { type: 'audio/webm' }) } catch (e) { partialBusy = false; return }
+                    blob.arrayBuffer().then(function (buf) {
+                      const bytes = new Uint8Array(buf)
+                      let bin = ''
+                      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+                      return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang, partial: true })
+                    }).then(function (r) {
+                      partialBusy = false
+                      if (!partialStale && r && r.ok && r.text) insertText(inputActions, r.text)
+                    }).catch(function () { partialBusy = false })
+                  }, 5000)
                   playStartTone() // 录音开始提示音：确认录音通道已真正启动
                 }).catch(function (err) {
                   const name = err && err.name
@@ -397,9 +433,10 @@ return {
                 : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
               s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
               s.phase === 1 && s.vol ? h('span', {
-                className: 'gd-vol', title: s.vol === 'voice' ? '检测到声音输入' : '未检测到声音输入（请检查麦克风/远程音频）',
-                style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'var(--dsw-alias-state-error-primary, #c62828)' },
-              }, s.vol === 'voice' ? '●声' : '○静音') : null,
+                className: 'gd-vol',
+                title: s.vol === 'voice' ? '检测到声音输入' : (s.vol === 'noana' ? '音量检测不可用（AudioContext 受限）' : '未检测到声音输入（请检查麦克风/远程音频）'),
+                style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : (s.vol === 'noana' ? '#888' : 'var(--dsw-alias-state-error-primary, #c62828)') },
+              }, s.vol === 'voice' ? '●声' : (s.vol === 'noana' ? '检测不可用' : '○静音')) : null,
               micErrText ? h('span', { className: 'gd-err', title: micErrText }, micErrText) : null)
           })
       })

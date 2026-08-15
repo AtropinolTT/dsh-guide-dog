@@ -166,6 +166,7 @@ def main():
     ap.add_argument('--out-file', default=None)
     ap.add_argument('--output', default='json')
     ap.add_argument('--prewarm', default=None)  # 仅下载模型到 <dir> 后退出（host 启动预热用）
+    ap.add_argument('--no-keep-empty', action='store_true')  # 空转写结果不保留诊断副本（partial 预览用）
     args = ap.parse_args()
     # 预热模式：只下载模型，不转写
     if args.prewarm:
@@ -196,18 +197,29 @@ def main():
         lang = None if args.language == 'auto' else args.language
         segments, info = model.transcribe(audio_path, language=lang, vad_filter=True)
         text = ''.join(s.text for s in segments).strip()
+        # 简体化（2026-08-15 用户需求：中文输入默认转简体）：显式 zh 或检测为中文时，
+        # 用 zhconv 繁→简；未安装时保持原样（不阻塞转写）。zh-cn 转换表对简体输入幂等。
+        try:
+            detected_zh = (args.language == 'zh') or (getattr(info, 'language', None) or '').startswith('zh')
+            if detected_zh and text:
+                from zhconv import convert as _zh_convert
+                text = _zh_convert(text, 'zh-cn')
+        except Exception:  # noqa: BLE001
+            pass
         if not text:
             # 诊断（2026-08-15）：保留音频副本供分析（~/.guide-dog/tmp/empty-<ts>.webm），
-            # message 带时长信息；副本不随 cleanup 删除（cleanup 只含 b64/原临时文件）
+            # message 带时长信息；副本不随 cleanup 删除（cleanup 只含 b64/原临时文件）。
+            # --no-keep-empty（partial 预览转写）时不保留，避免静音片段不断累积副本。
             keep = None
-            try:
-                import shutil
-                keep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tmp')
-                os.makedirs(keep_dir, exist_ok=True)
-                keep = os.path.join(keep_dir, 'empty-' + str(int(time.time())) + '.webm')
-                shutil.copyfile(audio_path, keep)
-            except Exception:  # noqa: BLE001
-                keep = None
+            if not args.no_keep_empty:
+                try:
+                    import shutil
+                    keep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tmp')
+                    os.makedirs(keep_dir, exist_ok=True)
+                    keep = os.path.join(keep_dir, 'empty-' + str(int(time.time())) + '.webm')
+                    shutil.copyfile(audio_path, keep)
+                except Exception:  # noqa: BLE001
+                    keep = None
             try:
                 dur = round(info.duration, 2) if info and getattr(info, 'duration', None) else -1
             except Exception:  # noqa: BLE001
@@ -225,6 +237,7 @@ def main():
                 if p and os.path.exists(p): os.unlink(p)
             except Exception:  # noqa: BLE001
                 pass
+
 
 if __name__ == '__main__':
     main()
@@ -287,7 +300,9 @@ if __name__ == '__main__':
       const outFile = root + '/.guide-dog/tmp/whisper-' + Date.now() + '.out.json'
       const script = root + '/.guide-dog/scripts/whisper_transcribe.py'
       const py = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.python) || 'python3'
-      const model = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.model) || 'small'
+      // partial（实时预览转写）：用 base 模型加速（约 2-3x 实时，预览用途精度足够），
+      // 且不保留空结果诊断副本（避免静音片段累积 empty-*.webm）
+      const model = args.partial ? 'base' : ((cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.model) || 'small')
       const lang = (args.language || (cfg.voiceInput && cfg.voiceInput.language) || 'auto')
       await runRaw('mkdir -p ' + quote(root + '/.guide-dog/tmp'), { timeoutMs: 10000 })
       const wrote = await writeTextFile(b64Path, args.audioB64)
@@ -295,8 +310,10 @@ if __name__ == '__main__':
       let handle = null
       try {
         await ensureWhisperScript()
+        const argvBase = [py, script, '--audio-b64-file', b64Path, '--delete-b64', '--model', model, '--language', lang, '--out-file', outFile, '--output', 'json']
+        if (args.partial) argvBase.push('--no-keep-empty')
         handle = subprocess.spawn({
-          argv: [py, script, '--audio-b64-file', b64Path, '--delete-b64', '--model', model, '--language', lang, '--out-file', outFile, '--output', 'json'],
+          argv: argvBase,
           cwd: root + '/.guide-dog/tmp',
           stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 * 1024 }, stderr: { maxBytes: 1024 * 1024 } },
           graceMs: 3000,
