@@ -81,7 +81,22 @@ def main():
         segments, info = model.transcribe(audio_path, language=lang, vad_filter=True)
         text = ''.join(s.text for s in segments).strip()
         if not text:
-            emit({'ok': False, 'error': 'empty_speech', 'message': 'no speech recognized'}, args.out_file)
+            # 诊断（2026-08-15）：保留音频副本供分析（~/.guide-dog/tmp/empty-<ts>.webm），
+            # message 带时长信息；副本不随 cleanup 删除（cleanup 只含 b64/原临时文件）
+            keep = None
+            try:
+                import shutil
+                keep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tmp')
+                os.makedirs(keep_dir, exist_ok=True)
+                keep = os.path.join(keep_dir, 'empty-' + str(int(time.time())) + '.webm')
+                shutil.copyfile(audio_path, keep)
+            except Exception:  # noqa: BLE001
+                keep = None
+            try:
+                dur = round(info.duration, 2) if info and getattr(info, 'duration', None) else -1
+            except Exception:  # noqa: BLE001
+                dur = -1
+            emit({'ok': False, 'error': 'empty_speech', 'message': 'no speech recognized (dur=%ss keep=%s)' % (dur, keep or 'none')}, args.out_file)
         emit({'ok': True, 'text': text, 'language': info.language,
               'durationMs': int((time.time() - t0) * 1000)}, args.out_file)
     except ImportError:

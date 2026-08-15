@@ -38,7 +38,10 @@ return {
     }
     function loadVoiceCfg() {
       return host.call('guide-dog/get-config', {}).then(function (r) {
-        if (r && r.ok && r.config) { voiceState.cfg = r.config }
+        if (r && r.ok && r.config) {
+          voiceState.cfg = r.config
+          micDeviceId = (r.config.voiceInput && r.config.voiceInput.deviceId) || ''
+        }
       }).catch(function () {})
     }
     function setVoiceOverride(sid, v) {
@@ -117,32 +120,49 @@ return {
         else beepFallback()
       }).catch(function () { beepFallback() })
     }
-    // 录音开始提示音（用户需求 2026-08-15）：getUserMedia + MediaRecorder.start 成功后播放
-    // 短促高音（1200Hz 120ms），与失败 beep（880Hz）区分；点击手势内创建的 AudioContext 不受自动播放策略拦截
-    function playStartTone() {
-      var AC = null
-      try { AC = AudioContext } catch (e) { AC = null }
-      if (!AC) { try { AC = window.webkitAudioContext } catch (e2) { AC = null } }
-      if (!AC) return
+    // 录音开始提示音（用户需求 2026-08-15，v2 修订）：改用 <audio> data-URI 播放（与 TTS 播放同机制，
+    // 用户环境已验证可出声；WebAudio 振荡器在 RDP/Chrome 环境下不响）。1200Hz 0.3s 与失败 beep(880Hz) 区分。
+    let startToneUri = null
+    function makeStartToneUri() {
       try {
-        const ctx = new AC()
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.frequency.value = 1200
-        osc.connect(gain); gain.connect(ctx.destination)
-        gain.gain.setValueAtTime(0.2, ctx.currentTime)
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12)
-        osc.start()
-        osc.stop(ctx.currentTime + 0.12)
-        osc.onended = function () { try { ctx.close() } catch (e3) { /* ignore */ } }
+        const rate = 8000, ms = 300, freq = 1200
+        const n = Math.floor(rate * ms / 1000)
+        const bytes = new Uint8Array(44 + n)
+        const dv = new DataView(bytes.buffer)
+        const w = function (off, str) { for (let i = 0; i < str.length; i++) bytes[off + i] = str.charCodeAt(i) }
+        w(0, 'RIFF'); dv.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ')
+        dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true)
+        dv.setUint32(24, rate, true); dv.setUint32(28, rate, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true)
+        w(36, 'data'); dv.setUint32(40, n, true)
+        for (let i = 0; i < n; i++) {
+          const t = i / rate
+          const env = 1 - (i / n)
+          // 双音：1200Hz 主音 + 开头 50ms 800Hz 预告音，更易察觉
+          const f = t < 0.05 ? 800 : 1200
+          bytes[44 + i] = Math.max(0, Math.min(255, Math.round(128 + 90 * env * Math.sin(2 * Math.PI * f * t))))
+        }
+        let bin = ''
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+        startToneUri = 'data:audio/wav;base64,' + btoa(bin)
+      } catch (e) { startToneUri = null }
+    }
+    makeStartToneUri()
+    function playStartTone() {
+      if (!startToneUri || typeof Audio !== 'function') return
+      try {
+        const a = new Audio(startToneUri)
+        a.volume = 0.5
+        const p = a.play()
+        if (p && typeof p.catch === 'function') p.catch(function () { /* ignore */ })
       } catch (e) { /* ignore */ }
     }
     let pollBusy = false
     // ---- 麦克风（模块级状态；组件只持有 phase/seconds/lang/error） ----
-    let micRec = null // {rec, stream}
+    let micRec = null // {rec, stream, analyser}
     let micChunks = []
     let micSeconds = 0
     let micLang = 'auto'
+    let micDeviceId = '' // 用户选择的输入设备（设置页下拉）
     function insertText(inputActions, text) {
       const primary = inputActions && inputActions.setDraft
       if (typeof primary === 'function') { primary(text); return true }
@@ -287,7 +307,41 @@ return {
             }, [effective, sid, tick])
             const startRec = function () {
               try {
-                navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+                // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认
+                const audioReq = micDeviceId ? { audio: { deviceId: { exact: micDeviceId } } } : { audio: true }
+                navigator.mediaDevices.getUserMedia(audioReq).then(function (stream) {
+                  // 音量检测：MediaRecorder 之外并行接 AnalyserNode（2026-08-15 诊断：浏览器录 RDP 虚拟麦克风静音）
+                  let analyser = null
+                  let volTimer = null
+                  try {
+                    const AC = window.AudioContext || window.webkitAudioContext
+                    if (AC) {
+                      const actx = new AC()
+                      const src = actx.createMediaStreamSource(stream)
+                      analyser = actx.createAnalyser()
+                      analyser.fftSize = 1024
+                      src.connect(analyser)
+                      if (typeof actx.resume === 'function') { try { actx.resume() } catch (e) { /* ignore */ } }
+                      // 每 500ms 读 RMS：UI 显示"检测到声音/未检测到"；持续静音 2.5s 提示
+                      const buf = new Uint8Array(analyser.fftSize)
+                      let silentMs = 0
+                      volTimer = setInterval(function () {
+                        try {
+                          analyser.getByteTimeDomainData(buf)
+                          let sum = 0
+                          for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
+                          const rms = Math.sqrt(sum / buf.length)
+                          if (rms >= 0.008) {
+                            silentMs = 0
+                            set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
+                          } else {
+                            silentMs += 500
+                            set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
+                          }
+                        } catch (e) { /* ignore */ }
+                      }, 500)
+                    }
+                  } catch (e) { analyser = null }
                   let rec = null
                   try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
                   micChunks = []; micSeconds = 0
@@ -298,10 +352,13 @@ return {
                     const max = (voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.maxSeconds) || 60
                     if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
                   }
-                  rec.onstop = function () { transcribe(sid, props.inputActions, set) }
+                  rec.onstop = function () {
+                    if (volTimer) { clearInterval(volTimer); volTimer = null }
+                    transcribe(sid, props.inputActions, set)
+                  }
                   rec.start(1000)
-                  micRec = { rec: rec, stream: stream }
-                  set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null }) })
+                  micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
+                  set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
                   playStartTone() // 录音开始提示音：确认录音通道已真正启动
                 }).catch(function (err) {
                   const name = err && err.name
@@ -313,7 +370,10 @@ return {
               if (s.phase === 1) {
                 const r = micRec
                 micRec = null
-                if (r) { try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ } }
+                if (r) {
+                  if (r.volTimer) { clearInterval(r.volTimer) }
+                  try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                }
                 return
               }
               if (s.phase === 2) return
@@ -336,6 +396,10 @@ return {
                 ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', title: '浏览器限制：录音需在独立页面进行' }, micIcon(false))
                 : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
               s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
+              s.phase === 1 && s.vol ? h('span', {
+                className: 'gd-vol', title: s.vol === 'voice' ? '检测到声音输入' : '未检测到声音输入（请检查麦克风/远程音频）',
+                style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'var(--dsw-alias-state-error-primary, #c62828)' },
+              }, s.vol === 'voice' ? '●声' : '○静音') : null,
               micErrText ? h('span', { className: 'gd-err', title: micErrText }, micErrText) : null)
           })
       })
@@ -477,7 +541,7 @@ return {
     }
 
     function SettingsPage(props) {
-      const state = React.useState({ auth: null, voices: [], media: [], text: '', voice: 'auto', busy: false, playUrl: null, error: null, cfg: null, status: null })
+      const state = React.useState({ auth: null, voices: [], media: [], text: '', voice: 'auto', busy: false, playUrl: null, error: null, cfg: null, status: null, audioInputs: [] })
       const s = state[0]
       const set = state[1]
       React.useEffect(function () {
@@ -488,6 +552,15 @@ return {
         host.call('guide-dog/list-media', { limit: 30 }).then(function (r) { if (alive && Array.isArray(r)) set(function (prev) { return Object.assign({}, prev, { media: r }) }) }).catch(function () {})
         host.call('guide-dog/get-config', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { cfg: r.config }) }) }).catch(function () {})
         host.call('guide-dog/status', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { status: r.status }) }) }).catch(function () {})
+        // 输入设备枚举（2026-08-15：远程 RDP 场景需显式选择麦克风）
+        try {
+          navigator.mediaDevices.enumerateDevices().then(function (devices) {
+            if (!alive) return
+            const inputs = (devices || []).filter(function (d) { return d.kind === 'audioinput' })
+              .map(function (d) { return { id: d.deviceId, label: d.label || ('输入设备 ' + d.deviceId.slice(0, 8)) } })
+            set(function (prev) { return Object.assign({}, prev, { audioInputs: inputs }) })
+          }).catch(function () {})
+        } catch (e) { /* ignore */ }
         return function () { alive = false }
       }, [])
       const speak = function () {
@@ -522,7 +595,14 @@ return {
             h('option', { value: 'whisper' }, 'whisper（本地）'), h('option', { value: 'sherpa' }, 'sherpa（增强，待装）'), h('option', { value: 'minimax' }, 'minimax（保留位）'))),
           h('label', null, ' 语言：', h('select', { value: s.cfg.voiceInput.language, onChange: function (e) { setCfg({ voiceInput: { language: e.target.value } }) } },
             h('option', { value: 'auto' }, '自动'), h('option', { value: 'zh' }, '中文'), h('option', { value: 'en' }, '英文'))),
+          h('label', null, ' 设备：', h('select', {
+            value: (s.cfg.voiceInput.deviceId) || '',
+            onChange: function (e) { setCfg({ voiceInput: { deviceId: e.target.value } }) },
+          }, [h('option', { key: '', value: '' }, '默认')].concat((s.audioInputs || []).map(function (d) {
+            return h('option', { key: d.id, value: d.id }, d.label)
+          })))),
           h('label', null, h('input', { type: 'checkbox', checked: !!s.cfg.voiceInput.autoSend, onChange: function (e) { setCfg({ voiceInput: { autoSend: e.target.checked } }) } }), ' 识别后自动发送')),
+        s.audioInputs && s.audioInputs.length === 0 ? h('div', { style: mutedStyle }, '未枚举到输入设备（远程/无头环境可能需 RDP 音频重定向）') : null,
         h('div', { style: rowStyle },
           h('span', { style: badgeStyle }, 'STT'),
           s.status ? h('span', { style: mutedStyle }, 'faster-whisper: ' + (s.status.whisperAvailable ? '可用 ' + ((s.status.whisperVersion || '') + ' / ' + (s.status.whisperPython || '')) : '不可用 — 需 pip install faster-whisper')) : null,
