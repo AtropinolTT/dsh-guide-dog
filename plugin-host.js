@@ -306,8 +306,20 @@ if __name__ == '__main__':
       } catch (e) {
         return { ok: false, error: 'stt_failed', message: String((e && e.message) || e).slice(0, 200) }
       } finally {
-        // 精确文件名清理（审查 M13：不用通配符，quote 会阻止 glob 展开）
-        await runRaw('rm -f ' + quote(b64Path) + ' ' + quote(outFile), { timeoutMs: 10000 }).catch(function () {})
+        // 精确文件名清理（M13：不用通配符；2026-08-15 修复：runRaw 的 rm 走沙箱 shell 被拒（home 只读）→ 改 subprocess 非沙箱删除）
+        if (subprocess) {
+          try {
+            const h = subprocess.spawn({
+              argv: ['rm', '-f', b64Path, outFile],
+              cwd: root + '/.guide-dog/tmp',
+              stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } },
+              graceMs: 3000,
+            })
+            h.done.catch(function () { /* ignore */ })
+          } catch (e) { /* ignore */ }
+        } else {
+          await runRaw('rm -f ' + quote(b64Path) + ' ' + quote(outFile), { timeoutMs: 10000 }).catch(function () {})
+        }
       }
     }
 

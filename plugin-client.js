@@ -117,6 +117,26 @@ return {
         else beepFallback()
       }).catch(function () { beepFallback() })
     }
+    // 录音开始提示音（用户需求 2026-08-15）：getUserMedia + MediaRecorder.start 成功后播放
+    // 短促高音（1200Hz 120ms），与失败 beep（880Hz）区分；点击手势内创建的 AudioContext 不受自动播放策略拦截
+    function playStartTone() {
+      var AC = null
+      try { AC = AudioContext } catch (e) { AC = null }
+      if (!AC) { try { AC = window.webkitAudioContext } catch (e2) { AC = null } }
+      if (!AC) return
+      try {
+        const ctx = new AC()
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.frequency.value = 1200
+        osc.connect(gain); gain.connect(ctx.destination)
+        gain.gain.setValueAtTime(0.2, ctx.currentTime)
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12)
+        osc.start()
+        osc.stop(ctx.currentTime + 0.12)
+        osc.onended = function () { try { ctx.close() } catch (e3) { /* ignore */ } }
+      } catch (e) { /* ignore */ }
+    }
     let pollBusy = false
     // ---- 麦克风（模块级状态；组件只持有 phase/seconds/lang/error） ----
     let micRec = null // {rec, stream}
@@ -148,7 +168,13 @@ return {
     function transcribe(sid, inputActions, set) {
       const parts = micChunks
       micChunks = []
-      if (!parts.length) { set(function (prev) { return Object.assign({}, prev, { phase: 0, error: 'empty_speech' }) }); return }
+      const secs = micSeconds
+      if (!parts.length) {
+        // 诊断（2026-08-15）：区分"未收到音频数据"（client 录音未工作）与"转写无内容"（whisper 空）
+        set(function (prev) { return Object.assign({}, prev, { phase: 0, error: 'empty_speech', diag: 'no-data:' + secs + 's' }) })
+        console.log('[guide-dog] mic empty: chunks=0 seconds=' + secs)
+        return
+      }
       try {
         const blob = new Blob(parts, { type: 'audio/webm' })
         blob.arrayBuffer().then(function (buf) {
@@ -276,6 +302,7 @@ return {
                   rec.start(1000)
                   micRec = { rec: rec, stream: stream }
                   set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null }) })
+                  playStartTone() // 录音开始提示音：确认录音通道已真正启动
                 }).catch(function (err) {
                   const name = err && err.name
                   set(function (prev) { return Object.assign({}, prev, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }) })
@@ -293,7 +320,8 @@ return {
               startRec()
             }
             const micErrText = {
-              mic_denied: '麦克风权限被拒绝', no_device: '未检测到麦克风设备', empty_speech: '没听清，请再说一次',
+              mic_denied: '麦克风权限被拒绝', no_device: '未检测到麦克风设备',
+              empty_speech: s.diag && s.diag.indexOf('no-data') === 0 ? '没听清（录音未收到数据，' + s.diag.slice(7) + '）' : '没听清，请再说一次',
               stt_failed: '转写失败', stt_timeout: '转写超时', engine_unavailable: 'STT 引擎不可用（见设置页）',
               insert_failed: '无法插入输入框',
             }[s.error] || (s.error ? '转写失败（' + s.error + '）' : null)
