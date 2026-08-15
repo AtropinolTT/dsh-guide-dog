@@ -163,11 +163,88 @@ return {
     let micSeconds = 0
     let micLang = 'auto'
     let micDeviceId = '' // 用户选择的输入设备（设置页下拉）
+    let micMime = 'audio/webm' // 实际 MediaRecorder mime（wav 优先：增量切片可解码）
+    let partialAcc = '' // 累积预览文本（wav 增量模式：每次只含新音频文本，需累积显示）
     // 实时预览（partial）转写状态（2026-08-15 用户需求：边说边显示识别结果于输入框）
     let partialBusy = false // 一次只跑一个 partial 转写（防止并发堆积）
     let partialIdx = 0      // micChunks 中已送入 partial 的索引（增量，避免每次都转写全量）
     let partialStale = false // 录音已停止：在途 partial 结果丢弃，防覆盖最终转写
     let partialTimer = null
+    // 2026-08-15 根因修复：webm 增量切片（无 EBML/Track 头）无法解码（实测 Invalid data）→
+    // 录音改用 audio/wav（PCM 可从任意偏移切片 + 自建 44B 头即可解码），partial 走增量 WAV。
+    // host 侧同步：常驻 --serve worker（模型只加载一次，单次 ~0.8s），5s→3s 间隔。
+    function u32le(u, o) { return (u[o] | (u[o + 1] << 8) | (u[o + 2] << 16) | (u[o + 3] << 24)) >>> 0 }
+    function u32be(u, o) { return ((u[o] << 24) | (u[o + 1] << 16) | (u[o + 2] << 8) | u[o + 3]) >>> 0 }
+    function u16le(u, o) { return u[o] | (u[o + 1] << 8) }
+    function findWavDataOff(buf) {
+      const u = new Uint8Array(buf)
+      let off = 12
+      while (off + 8 <= u.length) {
+        if (u32be(u, off) === 0x64617461) return off + 8 // 'data'
+        const size = u32le(u, off + 4)
+        off += 8 + size + (size % 2)
+      }
+      return -1
+    }
+    function parseWavInfo(buf) {
+      const u = new Uint8Array(buf)
+      let off = 12
+      while (off + 24 <= u.length) {
+        const id = u32be(u, off)
+        const size = u32le(u, off + 4)
+        if (id === 0x666d7420) { // 'fmt '
+          const channels = u16le(u, off + 10)
+          const sampleRate = u32le(u, off + 12)
+          const bits = u16le(u, off + 22)
+          if (channels > 0 && sampleRate > 0 && bits > 0) return { channels: channels, sampleRate: sampleRate, bits: bits }
+          return null
+        }
+        off += 8 + size + (size % 2)
+      }
+      return null
+    }
+    // 增量 WAV 拼接：提取新 chunks 的 PCM（跳过各自头），自建标准 44B 头 → 可解码增量音频
+    function buildWavBlob(parts) {
+      const bufs = []
+      let chain = Promise.resolve()
+      parts.forEach(function (blob) {
+        chain = chain.then(function () { return blob.arrayBuffer() }).then(function (b) { bufs.push(b) })
+      })
+      return chain.then(function () {
+        let info = null
+        const pcmParts = []
+        for (let i = 0; i < bufs.length; i++) {
+          const u = new Uint8Array(bufs[i])
+          const isRiff = u.length >= 12 && u32be(u, 0) === 0x52494646 && u32be(u, 8) === 0x57415645
+          if (isRiff && !info) info = parseWavInfo(bufs[i])
+          const dataOff = isRiff ? findWavDataOff(bufs[i]) : -1
+          if (dataOff >= 0) pcmParts.push(u.subarray(dataOff))
+          else pcmParts.push(u)
+        }
+        if (!info) return null
+        let pcmLen = 0
+        pcmParts.forEach(function (p) { pcmLen += p.length })
+        const out = new Uint8Array(44 + pcmLen)
+        out[0] = 0x52; out[1] = 0x49; out[2] = 0x46; out[3] = 0x46 // RIFF
+        out[4] = (36 + pcmLen) & 0xFF; out[5] = ((36 + pcmLen) >> 8) & 0xFF; out[6] = ((36 + pcmLen) >> 16) & 0xFF; out[7] = ((36 + pcmLen) >> 24) & 0xFF
+        out[8] = 0x57; out[9] = 0x41; out[10] = 0x56; out[11] = 0x45 // WAVE
+        out[12] = 0x66; out[13] = 0x6D; out[14] = 0x74; out[15] = 0x20 // 'fmt '
+        out[16] = 16; out[17] = 0; out[18] = 0; out[19] = 0 // fmt size = 16
+        out[20] = 1; out[21] = 0 // PCM
+        out[22] = info.channels & 0xFF; out[23] = (info.channels >> 8) & 0xFF
+        out[24] = info.sampleRate & 0xFF; out[25] = (info.sampleRate >> 8) & 0xFF; out[26] = (info.sampleRate >> 16) & 0xFF; out[27] = (info.sampleRate >> 24) & 0xFF
+        const byteRate = info.sampleRate * info.channels * (info.bits / 8)
+        out[28] = byteRate & 0xFF; out[29] = (byteRate >> 8) & 0xFF; out[30] = (byteRate >> 16) & 0xFF; out[31] = (byteRate >> 24) & 0xFF
+        const blockAlign = info.channels * (info.bits / 8)
+        out[32] = blockAlign & 0xFF; out[33] = (blockAlign >> 8) & 0xFF
+        out[34] = info.bits & 0xFF; out[35] = (info.bits >> 8) & 0xFF
+        out[36] = 0x64; out[37] = 0x61; out[38] = 0x74; out[39] = 0x61 // 'data'
+        out[40] = pcmLen & 0xFF; out[41] = (pcmLen >> 8) & 0xFF; out[42] = (pcmLen >> 16) & 0xFF; out[43] = (pcmLen >> 24) & 0xFF
+        let off = 44
+        pcmParts.forEach(function (p) { out.set(p, off); off += p.length })
+        return new Blob([out], { type: 'audio/wav' })
+      })
+    }
     function insertText(inputActions, text) {
       const primary = inputActions && inputActions.setDraft
       if (typeof primary === 'function') { primary(text); return true }
@@ -221,13 +298,13 @@ return {
         return
       }
       try {
-        const blob = new Blob(parts, { type: 'audio/webm' })
+        const blob = new Blob(parts, { type: micMime })
         blob.arrayBuffer().then(function (buf) {
           const bytes = new Uint8Array(buf)
           let bin = ''
           for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
           set(function (prev) { return Object.assign({}, prev, { phase: 2, error: null }) })
-          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang })
+          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: micMime, sessionId: sid, language: micLang })
         }).then(function (r) {
           if (r && r.ok && r.text) {
             const inserted = insertText(inputActions, r.text)
@@ -378,8 +455,19 @@ return {
                       }
                     }
                   } catch (e) { analyser = null }
+                  // 2026-08-15 修复：优先 audio/wav（PCM 增量切片可解码）；webm 增量切片实测无法解码。
+                  // isTypeSupported 检测失败或构造失败 → 回退默认（Chrome 返回 webm/opus）。
+                  micMime = 'audio/wav'
                   let rec = null
-                  try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+                  try {
+                    if (typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/wav')) {
+                      rec = new MediaRecorder(stream, { mimeType: 'audio/wav' })
+                    }
+                  } catch (e) { rec = null }
+                  if (!rec) {
+                    micMime = 'audio/webm'
+                    try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+                  }
                   micChunks = []; micSeconds = 0
                   rec.ondataavailable = function (ev) {
                     if (ev.data && ev.data.size > 0) micChunks.push(ev.data)
@@ -402,28 +490,36 @@ return {
                   if (!analyser) {
                     set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
                   }
-                  // 实时预览：每 5s 把"上次 partial 之后"的新增音频送去转写（base 模型，host 侧 partial 分支），
-                  // 结果实时覆盖输入框 draft（预览）。partialBusy 跳过保证不并发堆积；增量机制避免全量越转越长。
+                  // 实时预览：每 3s 把"上次 partial 之后"的新增音频送去转写（WAV 增量可解码，host 常驻 worker
+                  // 单次 ~0.8s），结果累积进输入框 draft（预览）。webm fallback（不支持 wav 时）退化为
+                  // 全量重传（chunks[0] 起，可解码）+ 覆盖显示。partialBusy 跳过保证不并发堆积。
                   // timer Service interval（沙箱无 setInterval）；disposer 存 partialTimer 供清理。
-                  partialBusy = false; partialIdx = 0; partialStale = false
+                  partialBusy = false; partialIdx = 0; partialStale = false; partialAcc = ''
                   if (timerSvc && typeof timerSvc.interval === 'function') {
                     partialTimer = timerSvc.interval(function () {
                       if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
                       partialBusy = true
-                      const parts = micChunks.slice(partialIdx)
+                      const isWav = micMime.indexOf('wav') >= 0
+                      // wav：增量（新 chunks）；webm fallback：全量（chunks[0] 起，含头可解码）
+                      const parts = isWav ? micChunks.slice(partialIdx) : micChunks.slice(0)
                       partialIdx = micChunks.length
-                      let blob = null
-                      try { blob = new Blob(parts, { type: 'audio/webm' }) } catch (e) { partialBusy = false; return }
-                      blob.arrayBuffer().then(function (buf) {
-                        const bytes = new Uint8Array(buf)
-                        let bin = ''
-                        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
-                        return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: 'audio/webm', sessionId: sid, language: micLang, partial: true })
+                      const build = isWav ? buildWavBlob(parts) : Promise.resolve(new Blob(parts, { type: micMime }))
+                      build.then(function (blob) {
+                        if (!blob) { partialBusy = false; return }
+                        return blob.arrayBuffer().then(function (buf) {
+                          const bytes = new Uint8Array(buf)
+                          let bin = ''
+                          for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+                          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: micMime, sessionId: sid, language: micLang, partial: true })
+                        })
                       }).then(function (r) {
                         partialBusy = false
-                        if (!partialStale && r && r.ok && r.text) insertText(inputActions, r.text)
+                        if (!partialStale && r && r.ok && r.text) {
+                          if (isWav) { partialAcc += (partialAcc ? ' ' : '') + r.text; insertText(inputActions, partialAcc) }
+                          else { insertText(inputActions, r.text) } // webm fallback：全量重传，覆盖显示
+                        }
                       }).catch(function () { partialBusy = false })
-                    }, 5000)
+                    }, 3000)
                   }
                   playStartTone() // 录音开始提示音：确认录音通道已真正启动
                 }).catch(function (err) {

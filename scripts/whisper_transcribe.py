@@ -4,6 +4,9 @@
   python3 whisper_transcribe.py --audio <path> [--model base|small] [--language auto|zh|en] [--out-file <path>] --output json
   python3 whisper_transcribe.py --audio-b64-file <path> [--delete-b64] [--model base|small] [--language auto|zh|en] [--out-file <path>] --output json
   python3 whisper_transcribe.py --prewarm <dir> [--model base|small] [--out-file <path>] --output json   # 仅下载模型到 <dir>
+  python3 whisper_transcribe.py --serve [--model base|small]   # 常驻模式（2026-08-15：实时预览 worker）
+    stdin 每行一个 JSON 任务: {"id":N,"b64Path":"...","model":"base","language":"zh"}
+    stdout 每行一个 JSON 响应: {"id":N,"ok":true,"text":"...","language":"zh"}（模型懒加载并缓存，进程常驻）
 stdout 恒为单行 JSON; exit 恒 0（调用方以 ok 字段判断）。--out-file 可选：同时把同一 JSON 写入文件（host 端读取用）。
 
 模型来源（2026-08-14 修复：huggingface.co 网络不可达）：
@@ -40,6 +43,75 @@ def resolve_model_ref(model):
     return model
 
 
+def _simplify(text, language_arg, info):
+    """简体化（2026-08-15 用户需求：中文输入默认转简体）。"""
+    try:
+        detected_zh = (language_arg == 'zh') or (getattr(info, 'language', None) or '').startswith('zh')
+        if detected_zh and text:
+            from zhconv import convert as _zh_convert
+            text = _zh_convert(text, 'zh-cn')
+    except Exception:  # noqa: BLE001
+        pass
+    return text
+
+
+def _transcribe_one(model, audio_path, language_arg):
+    """单次转写：返回 (ok, obj)。"""
+    from faster_whisper import WhisperModel
+    t0 = time.time()
+    model = WhisperModel(resolve_model_ref(model), device='cpu', compute_type='int8')
+    lang = None if language_arg == 'auto' else language_arg
+    segments, info = model.transcribe(audio_path, language=lang, vad_filter=True)
+    text = ''.join(s.text for s in segments).strip()
+    text = _simplify(text, language_arg, info)
+    if not text:
+        return False, {'error': 'empty_speech', 'message': 'no speech recognized'}
+    return True, {'text': text, 'language': getattr(info, 'language', None),
+                  'durationMs': int((time.time() - t0) * 1000)}
+
+
+def serve_main():
+    """常驻模式：模型懒加载并缓存；stdin 行 JSON 任务 → stdout 行 JSON 响应（2026-08-15）。"""
+    from faster_whisper import WhisperModel
+    models = {}
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+            mid = job.get('id')
+            b64_path = job.get('b64Path')
+            if not b64_path or not os.path.exists(b64_path):
+                print(json.dumps({'id': mid, 'ok': False, 'error': 'bad_args', 'message': 'b64Path missing'}, ensure_ascii=False), flush=True)
+                continue
+            with open(b64_path, 'r', encoding='utf-8') as f:
+                data = base64.b64decode(f.read().strip())
+            fd, audio_path = tempfile.mkstemp(suffix='.webm')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+            try:
+                model_name = job.get('model') or 'base'
+                if model_name not in models:
+                    models[model_name] = WhisperModel(resolve_model_ref(model_name), device='cpu', compute_type='int8')
+                lang = job.get('language') or 'auto'
+                segments, info = models[model_name].transcribe(audio_path, language=None if lang == 'auto' else lang, vad_filter=True)
+                text = ''.join(s.text for s in segments).strip()
+                text = _simplify(text, lang, info)
+                if not text:
+                    print(json.dumps({'id': mid, 'ok': False, 'error': 'empty_speech', 'message': 'no speech recognized'}, ensure_ascii=False), flush=True)
+                else:
+                    print(json.dumps({'id': mid, 'ok': True, 'text': text, 'language': getattr(info, 'language', None)}, ensure_ascii=False), flush=True)
+            finally:
+                try:
+                    if os.path.exists(audio_path): os.unlink(audio_path)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({'id': job.get('id') if 'job' in locals() else None, 'ok': False, 'error': 'stt_failed', 'message': str(e)[:300]}, ensure_ascii=False), flush=True)
+    sys.exit(0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--audio', default=None)
@@ -51,7 +123,11 @@ def main():
     ap.add_argument('--output', default='json')
     ap.add_argument('--prewarm', default=None)  # 仅下载模型到 <dir> 后退出（host 启动预热用）
     ap.add_argument('--no-keep-empty', action='store_true')  # 空转写结果不保留诊断副本（partial 预览用）
+    ap.add_argument('--serve', action='store_true')  # 常驻 worker（2026-08-15）
     args = ap.parse_args()
+    if args.serve:
+        serve_main()
+        return
     # 预热模式：只下载模型，不转写
     if args.prewarm:
         try:
