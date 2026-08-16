@@ -1,4 +1,5 @@
 return {
+  inject: ['slots'],
   async apply(ctx) {
     const slots = ctx.get('slots')
     if (!slots) return
@@ -598,6 +599,130 @@ return {
           })
       })
     })
+
+    // ============ CALL PANEL 节（Phase 2，client） ============
+    const callState = { active: false, mode: 'vad', phase: 'idle', muted: false, speed: 1, recording: false, error: null }
+    const callSubs = []
+    function setCallState(patch) {
+      Object.assign(callState, patch)
+      callSubs.forEach(function (fn) { try { fn(callState) } catch (e) { /* ignore */ } })
+    }
+    function subscribeCall(fn) { callSubs.push(fn); return function () { const i = callSubs.indexOf(fn); if (i >= 0) callSubs.splice(i, 1) } }
+    // 会话切换：通话状态随会话（header action 是会话级）；切会话时 phase 回 idle 但不自动挂断音频
+    let callSessionId = null
+
+    // ---- 会话 header 发起/挂断按钮（conversation.session.header.actions，order 30） ----
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.session.header.actions', function () {
+          return slots.register(
+            { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
+            function (props) {
+              const sid = props.sessionId || callSessionId
+              callSessionId = sid
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              const active = callState.active
+              const style = {
+                display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
+                borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
+                background: active ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
+                color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
+                fontFamily: 'inherit', fontSize: '12px',
+              }
+              return React.createElement('button', {
+                style: style, title: active ? '挂断通话' : '发起语音通话',
+                onClick: function () {
+                  if (!active) {
+                    setCallState({ active: true, phase: 'listening', recording: false })
+                    startCall(sid) // Task 7 定义：初始化采集
+                  } else {
+                    stopCall() // Task 7 定义：停止采集与播放
+                  }
+                },
+              }, active ? '📞 通话中' : '📞 通话')
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ---- 输入框 dock 状态条（conversation.input.dock，order 31） ----
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.input.dock', function () {
+          return slots.register(
+            { name: 'conversation.input.dock', id: 'guide-dog-call-status', order: 31, label: function () { return 'Call status' } },
+            function (props) {
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              if (!callState.active) return null
+              const text = { listening: '收听中…', processing: '处理中…', speaking: '播报中…', idle: '就绪' }[callState.phase] || ''
+              const style = { fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #666)', padding: '0 4px', fontFamily: 'inherit' }
+              return React.createElement('span', { style: style }, text + (callState.muted ? ' · 静音' : ''))
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ---- 通话面板（shell.overlay，order 40：模式切换/录音/静音/语速） ----
+    ctx.effect(function () {
+      try {
+        return slots.inject('shell.overlay', function () {
+          return slots.register(
+            { name: 'shell.overlay', id: 'guide-dog-call-panel', order: 40, label: function () { return 'Call panel' } },
+            function () {
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              if (!callState.active) return null
+              const panelStyle = {
+                position: 'fixed', right: '16px', bottom: '64px', width: '260px', zIndex: 1000,
+                background: 'var(--dsw-alias-bg-layer-2, #fff)', border: '1px solid var(--dsw-alias-border-l1, #ddd)',
+                borderRadius: '10px', padding: '12px', boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
+                fontFamily: 'inherit', fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #333)',
+              }
+              const rowStyle = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '6px 0' }
+              const btnStyle = { padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--dsw-alias-border-l1, #ccc)', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '12px' }
+              const micBtnStyle = Object.assign({}, btnStyle, callState.recording ? { background: '#c62828', color: '#fff' } : {})
+              return React.createElement('div', { style: panelStyle },
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('span', null, '语音通话'),
+                  React.createElement('button', { style: btnStyle, onClick: function () { stopCall() } }, '挂断')),
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('span', null, '模式'),
+                  React.createElement('select', {
+                    style: btnStyle, value: callState.mode,
+                    onChange: function (ev) { setCallState({ mode: ev.target.value }) },
+                  },
+                    React.createElement('option', { value: 'vad' }, 'VAD 自动'),
+                    React.createElement('option', { value: 'ptt' }, '按住说话'))),
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('button', { style: micBtnStyle, title: callState.mode === 'ptt' ? '按住说话' : '点击手动结束/开始一段',
+                    onPointerDown: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); startSegment() } },
+                    onPointerUp: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); stopSegment() } },
+                    onClick: function () { if (callState.mode !== 'ptt' && !callState.recording) startSegment(); else if (callState.mode !== 'ptt' && callState.recording) stopSegment() },
+                  }, callState.recording ? '■ 录音中' : '🎤 说话'),
+                  React.createElement('span', null, callState.mode === 'ptt' ? '按住说话' : 'VAD 自动')),
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('button', { style: btnStyle, onClick: function () { setCallState({ muted: !callState.muted }) } }, callState.muted ? '🔇 取消静音' : '🔊 静音'),
+                  React.createElement('span', null, '语速 '),
+                  React.createElement('select', {
+                    style: btnStyle, value: String(callState.speed),
+                    onChange: function (ev) { setCallState({ speed: parseFloat(ev.target.value) }) },
+                  },
+                    React.createElement('option', { value: '0.8' }, '0.8x'),
+                    React.createElement('option', { value: '1' }, '1x'),
+                    React.createElement('option', { value: '1.2' }, '1.2x'))),
+                callState.error ? React.createElement('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: '6px' } }, callState.error) : null)
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ---- 采集控制接口桩（Task 7 实现真实采集与播放） ----
+    function startCall(sid) { /* Task 7 */ }
+    function stopCall() { /* Task 7 */ }
+    function startSegment() { /* Task 7 */ }
+    function stopSegment() { /* Task 7 */ }
 
     const cardStyle = { border: '1px solid rgba(128,128,128,.35)', borderRadius: 10, padding: 10, marginTop: 6, maxWidth: 640 }
     const rowStyle = { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }
