@@ -403,7 +403,9 @@ return {
             }, [])
             React.useEffect(function () {
               // 语音模式生效时每秒轮询本会话队列；播放本身在模块级，不受会话切换影响
-              if (!effective || !sid || pollBusy) return
+              // I1（2026-08-16 审稿）：通话期间 stream 条目由通话专用轮询（callPoll）独家消费
+              // ——本轮询停用，保证队列单消费者（Phase 1 的 pop 语义会丢弃无 url 的 stream 条目）
+              if (!effective || callState.active || !sid || pollBusy) return
               pollBusy = true
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
@@ -675,6 +677,12 @@ return {
             function () {
               const [, force] = React.useState(0)
               React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              // Task 12：通话专用下行轮询（I1：stream 条目仅由 callPoll 消费；timerSvc 可选）
+              React.useEffect(function () {
+                if (!timerSvc || typeof timerSvc.interval !== 'function') return
+                const stop = timerSvc.interval(function () { callPoll() }, 1000)
+                return function () { try { stop() } catch (e) { /* ignore */ } }
+              }, [])
               if (!callState.active) return null
               const panelStyle = {
                 position: 'fixed', right: '16px', bottom: '64px', width: '260px', zIndex: 1000,
@@ -908,6 +916,139 @@ return {
       const vad = (cfg.call && cfg.call.vad) || {}
       const threshold = vad.threshold !== undefined ? vad.threshold : 0.02
       return callRms >= threshold
+    }
+
+    // ---- 通话轮询（CALL PANEL 节内；I1：不受语音模式门控） ----
+    let callPollBusy = false
+    const callPoll = function () {
+      if (!callState.active || callPollBusy) return
+      callPollBusy = true
+      host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
+        if (r && r.ok && r.entry) {
+          // C5 修复：consensus 摘要条目（mp3 url + consensus 标记）→ 播放前开共识窗口
+          if (r.entry.consensus) { notifyConsensusSpeech(true); playEntryConsensus(r.entry.url) }
+          else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; playStreamEntry(r.entry, callSessionId || '') }
+          else if (r.entry.url) playEntry(r.entry.url)
+          else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
+        }
+      }).catch(function () {}).then(function () { callPollBusy = false })
+    }
+    // C5：共识 mp3 播放（window 关闭由 onended 触发；与 playEntry 同机制，附加回调）
+    function playEntryConsensus(url) {
+      stopCurrent()
+      const a = new Audio(String(url))
+      curAudio = a
+      a.onended = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false) }
+      a.onerror = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false); showToast('播放失败') }
+      const p = a.play()
+      if (p && typeof p.catch === 'function') p.catch(function () { if (curAudio === a) { curAudio = null; notifyConsensusSpeech(false) } })
+    }
+    // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
+
+    // ============ STREAM PLAYER 节（Phase 2，client） ============
+    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null }
+    function getTtsToken(sid) {
+      return host.call('guide-dog/tts-token', { sessionId: sid }).then(function (r) {
+        return (r && r.ok && r.token) ? r.token : ''
+      }).catch(function () { return '' })
+    }
+    function ensureStreamCtx() {
+      if (streamPlayer.audioCtx) return streamPlayer.audioCtx
+      const AC = window.AudioContext || window.webkitAudioContext
+      streamPlayer.audioCtx = new AC()
+      return streamPlayer.audioCtx
+    }
+    function pcmToWav(pcm, sampleRate) {
+      const n = pcm.length
+      const out = new Uint8Array(44 + n)
+      const dv = new DataView(out.buffer)
+      const w = function (off, str) { for (let i = 0; i < str.length; i++) out[off + i] = str.charCodeAt(i) }
+      w(0, 'RIFF'); dv.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ')
+      dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true)
+      dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true)
+      w(36, 'data'); dv.setUint32(40, n, true)
+      out.set(pcm, 44)
+      return out
+    }
+    function scheduleChunk(audioCtx, wavBytes) {
+      return audioCtx.decodeAudioData(wavBytes.buffer.slice(0)).then(function (buf) {
+        if (!streamPlayer.active) return
+        const src = audioCtx.createBufferSource()
+        src.buffer = buf
+        src.connect(audioCtx.destination)
+        const when = Math.max(audioCtx.currentTime + 0.05, streamPlayer.nextTime)
+        src.start(when)
+        streamPlayer.nextTime = when + buf.duration
+        streamPlayer.nodes.push(src)
+        src.onended = function () {
+          const i = streamPlayer.nodes.indexOf(src)
+          if (i >= 0) streamPlayer.nodes.splice(i, 1)
+          if (!streamPlayer.nodes.length && streamPlayer.active) {
+            streamPlayer.active = false
+            setCallState({ phase: 'listening' })
+          }
+        }
+      }).catch(function () { /* 解码失败：跳过该块 */ })
+    }
+    async function playStreamEntry(entry, sid) {
+      if (streamPlayer.active) { stopStreamPlayback() } // 新任务覆盖（v2.1 语义）
+      // C3 修复（2026-08-16 审稿）：token 为**单次消费**（consumeTtsToken 即删）——每句都必须重新签发，
+      // 不得缓存复用（旧代码 `if (!streamPlayer.token)` 只取一次 → 第二句起 403）。
+      streamPlayer.token = await getTtsToken(sid)
+      if (!streamPlayer.token) { showToast('流式播放失败：无 token'); return }
+      const cfg = voiceState.cfg || {}
+      const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
+      streamPlayer.active = true
+      streamPlayer.nextTime = 0
+      const AC = window.AudioContext || window.webkitAudioContext
+      const audioCtx = ensureStreamCtx()
+      try { await audioCtx.resume() } catch (e) { /* ignore */ }
+      setCallState({ phase: 'speaking' })
+      if (entry.consensus) notifyConsensusSpeech(true) // Task 9：共识摘要播报开窗口
+      const controller = new AbortController()
+      streamPlayer.controller = controller
+      const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
+      try {
+        const resp = await fetch(url, { signal: controller.signal })
+        if (!resp.ok || !resp.body) { throw new Error('http ' + resp.status) }
+        const reader = resp.body.getReader()
+        let acc = new Uint8Array(0)
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (!streamPlayer.active) { try { controller.abort() } catch (e) { /* ignore */ } break }
+          if (value && value.length) {
+            const merged = new Uint8Array(acc.length + value.length)
+            merged.set(acc); merged.set(value, acc.length)
+            acc = merged
+            // 每 ~0.5s 音频（24000*2*0.5=24000 字节）解码一帧，保持播放间隙 <400ms
+            if (acc.length >= 24000) {
+              const frame = acc.subarray(0, acc.length)
+              const wav = pcmToWav(frame, sr)
+              scheduleChunk(audioCtx, wav)
+              acc = new Uint8Array(0)
+            }
+          }
+        }
+        if (acc.length > 0) { const wav = pcmToWav(acc, sr); scheduleChunk(audioCtx, wav) }
+      } catch (e) {
+        if (streamPlayer.active) {
+          streamPlayer.active = false
+          setCallState({ phase: 'listening', error: '播放中断' })
+          showToast('播放中断，已尝试重连')
+        }
+      } finally {
+        streamPlayer.controller = null
+        if (entry.consensus) notifyConsensusSpeech(false)
+      }
+    }
+    function stopStreamPlayback() {
+      if (streamPlayer.controller) { try { streamPlayer.controller.abort() } catch (e) { /* ignore */ } streamPlayer.controller = null }
+      streamPlayer.active = false
+      streamPlayer.nodes.forEach(function (src) { try { src.stop() } catch (e) { /* ignore */ } })
+      streamPlayer.nodes = []
+      streamPlayer.nextTime = 0
+      notifyConsensusSpeech(false)
     }
 
     const cardStyle = { border: '1px solid rgba(128,128,128,.35)', borderRadius: 10, padding: 10, marginTop: 6, maxWidth: 640 }
