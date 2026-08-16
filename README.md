@@ -342,6 +342,20 @@ Profile pitfall (observed 2026-08-15): `dsh web` is an alias for
 bundle only in another profile (e.g. `cc-tui`) silently does nothing for the
 GUI; `deploy/publish.py` always targets `~/.dsh/profiles/web`.
 
+Service-scope pitfall (observed 2026-08-16 — root cause #3): the
+`dynamicCordisRunner` and `agents` services are registered on **agent-scoped
+contexts**, not on the global/profile context a bundle's `apply(ctx)` runs in.
+`ctx.get('dynamicCordisRunner')` there returns `undefined`, so an early
+`if (!runner || !agents) return` in `apply` bailed out before the
+`agent/created` listener was even registered — the bundle loaded fine
+(verified via `dsh web --dump-default-config`) yet never deployed. The fix
+resolves both services through the event payload's `agent.ctx`
+(`Agent` exposes `readonly ctx: Context`; probe-verified that both services
+are visible there), with a global-`ctx` fallback for hosts that register them
+globally. Debugging aid: a temporary dynamic probe plugin (`inject:
+['dynamicCordisRunner', 'agents']`) sees both services in its (agent-scoped)
+`apply` ctx — that asymmetry is the signature of this pitfall.
+
 The bundle shape mirrors the published `dsh-better-sidebar` precedent:
 `dsh.bundle.patch` → `cordis.patch.yml` with a single `insert` row, named
 exports (`export const name` + `export function apply(ctx)`), no default

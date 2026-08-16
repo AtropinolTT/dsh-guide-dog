@@ -40,18 +40,36 @@ const SOURCES = ['plugin-host.js', 'plugin-client.js']
 const RETRY_COOLDOWN_MS = 30_000
 
 export function apply(ctx) {
-  const runner = ctx.get('dynamicCordisRunner')
-  const agents = ctx.get('agents')
-  if (!runner || !agents) {
-    console.log('[gd-autoload] runner/agents unavailable, skipping')
-    return
-  }
+  // Root cause #3 (2026-08-16): `dynamicCordisRunner` and `agents` are
+  // registered on AGENT-SCOPED contexts, not on the global/profile context
+  // this bundle applies in. `ctx.get(...)` here returns undefined, so the old
+  // code bailed out at apply time and never registered the listener at all
+  // ("[gd-autoload] runner/agents unavailable, skipping" on every start).
+  // The fix resolves both services through the event payload's `agent.ctx`
+  // (Agent has `readonly ctx: Context`), falling back to the global ctx for
+  // hosts that register them globally.
 
   // sessionId -> last attempt timestamp (success or failure); cooldown gates
   // re-attempts so a persistent failure cannot spam define/run/approval.
   const attempted = new Map()
 
-  async function deploy(agent) {
+  // Resolve {runner, agents} from the agent's own context first, then the
+  // global context. Returns null when neither is available.
+  function resolveServices(agent) {
+    const candidates = []
+    if (agent && agent.ctx && typeof agent.ctx.get === 'function') candidates.push(agent.ctx)
+    candidates.push(ctx)
+    for (const c of candidates) {
+      let runner = null
+      let agents = null
+      try { runner = c.get('dynamicCordisRunner') } catch (e) { runner = null }
+      try { agents = c.get('agents') } catch (e) { agents = null }
+      if (runner && agents) return { runner, agents }
+    }
+    return null
+  }
+
+  async function deploy(agent, services) {
     if (!agent || typeof agent.id !== 'string' || !agent.id) return
     const now = Date.now()
     const last = attempted.get(agent.id)
@@ -62,7 +80,7 @@ export function apply(ctx) {
       // Skip when this session already owns a guide-dog plugin.
       let list = []
       try {
-        if (typeof runner.inventory === 'function') list = runner.inventory()
+        if (typeof services.runner.inventory === 'function') list = services.runner.inventory()
       } catch (e) { list = [] }
       const owns = list.some((p) => p && p.sessionId === agent.id && String(p.pluginId || '').indexOf('gdog') === 0)
       if (owns) return
@@ -86,14 +104,14 @@ export function apply(ctx) {
         else code.client = raw
       }
 
-      const receipt = runner.define({
+      const receipt = services.runner.define({
         sessionId: agent.id,
         plugin: { kind: 'new', idPrefix: 'gdog' },
         name: 'guide-dog (autoloaded)',
         purpose: '自动恢复（DSH 重启）：Guide Dog 多模态插件 — 视觉检查/生成/TTS/语音输入',
         code,
       })
-      const r = await runner.run(agent, receipt.pluginId, receipt.packageId, 'run')
+      const r = await services.runner.run(agent, receipt.pluginId, receipt.packageId, 'run')
       console.log('[gd-autoload] deployed ' + String(receipt.pluginId) + '/' + String(receipt.packageId) + ' status=' + String(r && r.status))
     } catch (e) {
       console.log('[gd-autoload] deploy failed for ' + String(agent && agent.id) + ': ' + String((e && e.message) || e))
@@ -107,31 +125,38 @@ export function apply(ctx) {
   // Contract (verified via Event.listEvents): 'agent/created'(this:
   // Scoped<Agent>, payload: { agent: Agent }) — exactly ONE argument. A
   // (carrier, name, payload) triple signature made `payload` undefined and
-  // silently skipped every deploy (root cause of "not auto-loaded" after
-  // restart, 2026-08-15).
+  // silently skipped every deploy (root cause #2, 2026-08-15).
   ctx.on('agent/created', (payload) => {
     const candidate = payload && payload.agent
     if (!candidate || typeof candidate.id !== 'string') {
       console.log('[gd-autoload] agent/created without a valid payload.agent — payload shape: ' + JSON.stringify(Object.keys(payload || {})))
       return
     }
+    const services = resolveServices(candidate)
+    if (!services) {
+      console.log('[gd-autoload] runner/agents unavailable for ' + candidate.id + ' (agent.ctx and global ctx both lack them), skipping')
+      return
+    }
     let live = null
-    try { live = agents.get(candidate.id) } catch (e) { live = null }
+    try { live = services.agents.get(candidate.id) } catch (e) { live = null }
     if (live !== candidate) {
       console.log('[gd-autoload] ignored agent/created for ' + candidate.id + ': not the live registry instance')
       return
     }
-    deploy(candidate).catch(() => {})
+    deploy(candidate, services).catch(() => {})
   })
 
-  // Sessions already live when this plugin activates (host starts after some
-  // sessions exist, e.g. the web UI reconnects). roots() returns live agents.
-  try {
-    const roots = typeof agents.roots === 'function' ? agents.roots() : []
-    for (const a of roots) {
-      if (!a || typeof a.id !== 'string') continue
-      const live = agents.get(a.id)
-      if (live === a) deploy(a).catch(() => {})
-    }
-  } catch (e) { /* ignore */ }
+  // Sessions already live when this bundle activates — only possible when the
+  // services ARE globally registered; otherwise the event path covers them.
+  const globalServices = resolveServices(null)
+  if (globalServices) {
+    try {
+      const roots = typeof globalServices.agents.roots === 'function' ? globalServices.agents.roots() : []
+      for (const a of roots) {
+        if (!a || typeof a.id !== 'string') continue
+        const live = globalServices.agents.get(a.id)
+        if (live === a) deploy(a, globalServices).catch(() => {})
+      }
+    } catch (e) { /* ignore */ }
+  }
 }
