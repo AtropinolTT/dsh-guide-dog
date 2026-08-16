@@ -104,9 +104,17 @@ export function apply(ctx) {
   // New sessions: agents service announces each agent after registration.
   // MEDIUM fix: trust only the payload's agent and verify it is the exact
   // live registry instance — never fall back to carrier fields.
-  ctx.on('agent/created', (carrier, name, payload) => {
+  // Contract (verified via Event.listEvents): 'agent/created'(this:
+  // Scoped<Agent>, payload: { agent: Agent }) — exactly ONE argument. A
+  // (carrier, name, payload) triple signature made `payload` undefined and
+  // silently skipped every deploy (root cause of "not auto-loaded" after
+  // restart, 2026-08-15).
+  ctx.on('agent/created', (payload) => {
     const candidate = payload && payload.agent
-    if (!candidate || typeof candidate.id !== 'string') return
+    if (!candidate || typeof candidate.id !== 'string') {
+      console.log('[gd-autoload] agent/created without a valid payload.agent — payload shape: ' + JSON.stringify(Object.keys(payload || {})))
+      return
+    }
     let live = null
     try { live = agents.get(candidate.id) } catch (e) { live = null }
     if (live !== candidate) {
