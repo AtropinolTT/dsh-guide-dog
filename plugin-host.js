@@ -32,6 +32,16 @@ return {
       voiceMode: { default: false, sessions: {} },
       voiceInput: { autoSend: false, engine: 'whisper', language: 'auto', maxSeconds: 60, whisper: { python: 'python3', model: 'small' } },
       tts: { voiceEn: 'English_expressive_narrator', voiceZh: 'Chinese (Mandarin)_Gentle_Youth', speed: 0.95, format: 'mp3' },
+      call: {
+        mode: 'vad',
+        vad: { method: 'energy', threshold: 0.02, silenceMs: 700, minSpeechMs: 300, maxSegmentSeconds: 60, interruptMinMs: 300 },
+        stream: { format: 'pcm', sampleRate: 24000, sentenceSplit: '。！？.!?\n', maxSentenceChars: 200 },
+        voice: 'English_expressive_narrator',
+        speed: 1.0,
+        progress: true,
+        consensus: { enabled: true, summaryWindowMs: 3000 },
+      },
+      a11y: { enabled: false, autoNarrate: true, visionCloud: true, summaryFirst: true },
     }
     function deepMerge(base, over) {
       if (over === null || typeof over !== 'object' || Array.isArray(over)) return over === undefined ? base : over
@@ -1392,6 +1402,16 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     })
     ctx.effect(function () {
       try {
+        return harness.handle('guide-dog/tts-token', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: false, error: 'bad_args', message: 'sessionId required' }
+          const token = await issueTtsToken(sid)
+          return { ok: true, token: token }
+        })
+      } catch (e) { return function () {} }
+    })
+    ctx.effect(function () {
+      try {
         return harness.handle('guide-dog/beep', async function () {
           const rate = 8000, ms = 150, freq = 880
           const n = Math.floor(rate * ms / 1000)
@@ -1413,6 +1433,62 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         })
       } catch (e) { return function () {} }
     })
+    // ============ CALL 节（Phase 2，host） ============
+    const ttsTokens = new Map() // token -> { sessionId, exp }
+    const consent = new Map() // sessionId -> turnSeq（本轮已语音确认）
+    // C1 修复（2026-08-16 审稿）：consentPending 记录"用户刚说过确认词"的会话；
+    // 由 user 消息监听器（Task 8 Step 3b）置位，下一次 pre-execute 消费并 grantConsent。
+    const consentPending = new Set() // sessionId（等待写入放行）
+    const callActiveSessions = new Set() // sessionId（持久通话激活，startCall/stopCall 时置位，C4 修复）
+    async function issueTtsToken(sessionId) {
+      const token = 'gd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+      ttsTokens.set(token, { sessionId: String(sessionId), exp: Date.now() + 5 * 60 * 1000 })
+      return token
+    }
+    function consumeTtsToken(token, sessionId) {
+      if (!token || typeof token !== 'string') return false
+      const rec = ttsTokens.get(token)
+      if (!rec) return false
+      ttsTokens.delete(token) // 单次消费
+      if (rec.sessionId !== String(sessionId)) return false
+      if (rec.exp < Date.now()) return false
+      return true
+    }
+    function grantConsent(sid, turnSeq) { consent.set(String(sid), turnSeq) }
+    function hasConsent(sid, turnSeq) {
+      const v = consent.get(String(sid))
+      return typeof turnSeq === 'number' ? v === turnSeq : v !== undefined
+    }
+    // M10 语义说明（2026-08-16 审稿）：一次确认放行"本轮"全部写操作——grantConsent 在首次
+    // pre-execute 时以该 exec 的 turnSeq 授予；同一 assistant turn 内后续写工具共享同一
+    // exec.agent.turn → hasConsent 精确匹配通过。若 exec.agent.turn 为 null（探测未发现 turn），
+    // hasConsent 退化为"已授予即可"（v !== undefined），新用户回合前 clearConsent 兜底。
+    function clearConsent(sid) { consent.delete(String(sid)) }
+    function markConsentPending(sid) { consentPending.add(String(sid)) }
+    function consumeConsentPending(sid) { return consentPending.delete(String(sid)) }
+    function isCallActive(sid) { return callActiveSessions.has(String(sid)) }
+    // 定期清理过期 token（30s 检查，防泄漏）
+    // I3（2026-08-16 审稿）：host 侧 timerSvc.interval（callback 形式）未验证——
+    // 若 Task 4 探测确认 host interval 不可用，则改为 sleep 轮询（见下方注释替代）。
+    const tokenTimer = timerSvc && typeof timerSvc.interval === 'function'
+      ? timerSvc.interval(function () {
+          const now = Date.now()
+          ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+        }, 30000)
+      : null
+    if (tokenTimer) ctx.effect(tokenTimer)
+    // R2（2026-08-16 控制器裁定）：双路径清扫——interval 不可用时启动 sleep 轮询，
+    // 与上方 interval 分支互斥（仅一条路径运行）。
+    if (!tokenTimer) {
+      // 替代：sleep 轮询（Promise 形式，已验证）
+      ;(function tokenSweeper() {
+        sleep(30000).then(function () {
+          const now = Date.now()
+          ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+          tokenSweeper()
+        })
+      })()
+    }
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
