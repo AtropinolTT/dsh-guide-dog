@@ -286,3 +286,24 @@ Phase 1 终审完成: V4-Pro SHIP WITH MINORS（无 Critical/Important；5 UPGRA
 - 验证：重生成 + node --check 双侧 OK + 发布部署 + import 确认（inject 8
   服务）。
 - 待办：用户再次重启 → 预期 9 个工具注册成功、voice 群组出现。
+
+## 2026-08-16 深夜：静态 bundle 全链路验证通过（v11）
+
+- 现象（v10 修复后重启）：日志干净——apply 全 true、media dir 正确、
+  **9 个工具注册全部成功（无 JsonSchemaError）**。
+- 验证（全链路实证）：
+  ①cordis_inspect_self = 空 → gdog-* 动态插件消失，不再每会话一个 ✓
+  ②guide_dog_voices 工具实测 → 26 个中文声音正常返回（静态 bundle 全局
+  工具链路通）✓
+  ③client 半产物 /plugins/dsh-guide-dog/client.js → HTTP 200, 53KB ✓
+  ④RPC 路由实测：POST /guide-dog/api/guide-dog/get-config → 200 +
+  真实配置（voiceMode/voiceInput/tts 默认值）✓
+  ⑤client slot 占用：conversation.input.left = dsh-guide-dog /
+  guide-dog-voice / active:true ✓（client 半经 client-modules 加载、
+  inject:['slots'] 等待成功、slot 注册成功）
+- 备注：RPC 路径为 /guide-dog/api/guide-dog/get-config（name 自带
+  guide-dog/ 前缀 + 兼容层再加 guide-dog/api/ 前缀）——host/client 两端
+  拼同一路径，内部一致即工作；curl /guide-dog/api/get-config 落 fallback
+  （405/HTML）属预期（路径不存在）。保留现状不优化（避免再重启）。
+- 待办：用户 UI 确认 voice 群组（喇叭/语言/麦克风）+ 四项清单复验
+  （边说边看/简体/●声○静音/无 mic_denied 误报）。
