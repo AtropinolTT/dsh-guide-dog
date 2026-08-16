@@ -267,3 +267,22 @@ Phase 1 终审完成: V4-Pro SHIP WITH MINORS（无 Critical/Important；5 UPGRA
   autoload 不在）。
 - 待办：用户再次重启 DSH → 预期：apply 日志全 true、工具注册成功、
   media dir = ~/.dsh/guide-dog/.guide-dog/media；client voice 群组出现。
+
+## 2026-08-16 深夜：静态 bundle 二次修复（v10）——schema DSL 归一化
+
+- 现象（v9 修复后重启）：apply 日志全 true（inject 生效✓）、media dir 正确
+  （GLOBAL_ROOT 生效✓），但 9 个工具注册仍失败：
+  `JsonSchemaError: unsupported JSON schema: schema.properties.ok.required
+  is not supported on type "boolean"`。
+- 根因：OUT_SCHEMA 用 per-property `required: true`（动态 harness 的
+  value-schema DSL——defineTool 负责归一化为标准 JSON Schema 的对象级
+  required 数组）。bundle 里 defineTool 是透传 → 标准 tools.register 的
+  schema 校验器拒绝属性级 required。
+- 修复：convert_bundle.py 的 defineTool 实现 normalizeJsonSchema：
+  递归处理——属性级 `required: true` 从属性中删除并收集到对象级
+  `required` 数组；标准 required 数组原样保留；output.schema 与
+  parameters 都过归一化。独立验证：OUT_SCHEMA →
+  {properties: {ok: {type:'boolean'}}, required: ['ok']} ✓。
+- 验证：重生成 + node --check 双侧 OK + 发布部署 + import 确认（inject 8
+  服务）。
+- 待办：用户再次重启 → 预期 9 个工具注册成功、voice 群组出现。

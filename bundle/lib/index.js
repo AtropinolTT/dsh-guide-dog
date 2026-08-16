@@ -30,8 +30,48 @@ export function apply(ctx) {
   // instances needed), and `handle` RPCs become JSON POST routes on the web
   // server, consumed by the client half via same-origin fetch.
   const GLOBAL_ROOT = homedir() + '/.dsh/guide-dog'
+  // The dynamic harness.defineTool normalized a value-schema DSL (per-property
+  // `required: true` on fields) into standard JSON Schema (object-level
+  // `required` arrays). The static tools registry accepts only the standard
+  // form, so re-implement that normalization here (observed 2026-08-16:
+  // "JsonSchemaError: unsupported JSON schema: schema.properties.ok.required
+  // is not supported on type \"boolean\"").
+  function normalizeJsonSchema(node) {
+    if (Array.isArray(node)) return node.map(normalizeJsonSchema)
+    if (!node || typeof node !== 'object') return node
+    const out = {}
+    for (const k of Object.keys(node)) {
+      if (k === 'required' && typeof node[k] === 'boolean') continue
+      out[k] = normalizeJsonSchema(node[k])
+    }
+    if (out.type === 'object' && out.properties && typeof out.properties === 'object') {
+      const req = Array.isArray(out.required) ? out.required.slice() : []
+      for (const p of Object.keys(out.properties)) {
+        const ps = out.properties[p]
+        if (ps && typeof ps === 'object' && ps.required === true) {
+          req.push(p)
+          delete ps.required
+        }
+      }
+      if (req.length) out.required = req
+    }
+    return out
+  }
   const harness = {
-    defineTool: function (d) { return d },
+    defineTool: function (d) {
+      if (!d) return d
+      const normalized = {}
+      for (const k of Object.keys(d)) {
+        if (k === 'output' && d.output && d.output.schema) {
+          normalized.output = { ...d.output, schema: normalizeJsonSchema(d.output.schema) }
+        } else if (k === 'parameters' && d.parameters) {
+          normalized.parameters = normalizeJsonSchema(d.parameters)
+        } else {
+          normalized[k] = d[k]
+        }
+      }
+      return normalized
+    },
     registerTool: function (c, d) { return c.tools.register(d) },
     handle: function (name, handler) {
       const ws = ctx.get('webServer')
