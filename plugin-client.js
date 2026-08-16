@@ -618,6 +618,8 @@ return {
           return slots.register(
             { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
             function (props) {
+              // R12：header.actions 直接携带 inputActions（Task 4 探测定案）→ 存模块级，stopSegment 提交用
+              if (props.inputActions) gdInputActions = props.inputActions
               const sid = props.sessionId || callSessionId
               callSessionId = sid
               const [, force] = React.useState(0)
@@ -718,11 +720,164 @@ return {
       } catch (e) { return function () {} }
     })
 
-    // ---- 采集控制接口桩（Task 7 实现真实采集与播放） ----
-    function startCall(sid) { /* Task 7 */ }
-    function stopCall() { /* Task 7 */ }
-    function startSegment() { /* Task 7 */ }
-    function stopSegment() { /* Task 7 */ }
+    // ---- 采集控制接口（Task 7：MediaRecorder + AnalyserNode VAD + PTT + 上传提交） ----
+    // 模块级采集状态（Phase 1 惯例：全部状态模块级，不用 useRef）
+    let callMic = null // { stream, rec, analyser, raf, segmentStart, chunks, segmentSeconds, audioCtx }
+    let callSegmentActive = false
+    let callBargeCb = null // Task 12 设置：用户发声回调（bargeIn 钩子）
+    let callRms = 0 // 最新 RMS（isUserSpeaking 供 Task 8/9 共识窗口查询）
+    let gdInputActions = null // R12：header.actions 的 inputActions（CallButton 渲染时捕获）
+
+    function startCall(sid) {
+      if (callMic) return
+      setCallState({ active: true, phase: 'listening', recording: false, error: null })
+      callActiveRpc('session', true) // C4：持久通话激活（Task 10 进度播报 / Task 11 下行流式判据）
+      try {
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+          // AC 获取（Phase 1 已验证模式）：全局优先，window 兜底
+          var AC = null
+          try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
+          if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
+          const audioCtx = new AC()
+          const src = audioCtx.createMediaStreamSource(stream)
+          const analyser = audioCtx.createAnalyser()
+          analyser.fftSize = 2048
+          analyser.smoothingTimeConstant = 0.3
+          src.connect(analyser)
+          if (typeof audioCtx.resume === 'function') { try { audioCtx.resume() } catch (e) { /* ignore */ } }
+          let rec = null
+          try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+          rec.ondataavailable = function (ev) {
+            if (callMic && callSegmentActive && ev.data && ev.data.size > 0) callMic.chunks.push(ev.data)
+          }
+          callMic = { stream: stream, rec: rec, analyser: analyser, raf: 0, segmentStart: 0, chunks: [], segmentSeconds: 0, audioCtx: audioCtx }
+          // 修正（Task 7）：brief 未调 rec.start() → ondataavailable 永不触发、无任何音频数据。
+          // 录音须整通通话持续运行（timeslice 250ms 出片），段采集由 ondataavailable 的 callSegmentActive 门控
+          try { rec.start(250) } catch (e) { /* ignore */ }
+          // VAD 轮询：能量检测（threshold 可配）
+          const cfg = voiceState.cfg || {}
+          const vad = (cfg.call && cfg.call.vad) || {}
+          const threshold = vad.threshold !== undefined ? vad.threshold : 0.02
+          const minSpeechMs = vad.minSpeechMs !== undefined ? vad.minSpeechMs : 300
+          const silenceMs = vad.silenceMs !== undefined ? vad.silenceMs : 700
+          const maxSeg = (cfg.call && cfg.call.vad && cfg.call.vad.maxSegmentSeconds) || 60
+          let voicedSince = 0, silentSince = 0, lastVoiced = false
+          const sampleBuf = new Uint8Array(analyser.fftSize)
+          const tick = function () {
+            // 修正（Task 7）：rAF 循环须整通通话存活——仅 callMic 清空（stopCall）才终止；
+            // 无活动段时保持轮询并重挂（否则首帧即死、VAD 永不工作；段结束分支同样重挂）
+            if (!callMic) return
+            analyser.getByteTimeDomainData(sampleBuf)
+            let sum = 0
+            for (let i = 0; i < sampleBuf.length; i++) { const v = (sampleBuf[i] - 128) / 128; sum += v * v }
+            const rms = Math.sqrt(sum / sampleBuf.length)
+            callRms = rms // isUserSpeaking 查询用
+            if (!callSegmentActive) { callMic.raf = requestAnimationFrame(tick); return }
+            const now = Date.now()
+            const voiced = rms >= threshold
+            if (voiced) { voicedSince = now; lastVoiced = true }
+            else if (lastVoiced) { silentSince = now; lastVoiced = false }
+            const isSpeaking = voiced || (now - voicedSince < silenceMs)
+            // 端点：静音 ≥ silenceMs 且说过话（VAD 模式）→ 结束段
+            if (callState.mode === 'vad' && voicedSince > 0 && !voiced && (now - voicedSince) >= silenceMs) {
+              if (now - callMic.segmentStart >= minSpeechMs) stopSegment()
+              else resetSegment() // brief 的 callMic.segments 引用是残留，去掉
+              callMic.raf = requestAnimationFrame(tick)
+              return
+            }
+            // 上限：段超 maxSeg 自动结束
+            if (callSegmentActive && (now - callMic.segmentStart) >= maxSeg * 1000) {
+              stopSegment()
+              callMic.raf = requestAnimationFrame(tick)
+              return
+            }
+            // 打断检测：播放中用户发声 → bargeIn 钩子
+            if (isSpeaking && callState.phase === 'speaking' && voiced && callBargeCb) callBargeCb()
+            callMic.raf = requestAnimationFrame(tick)
+          }
+          callMic.raf = requestAnimationFrame(tick)
+          setCallState({ phase: 'listening' })
+        }).catch(function (err) {
+          setCallState({ active: false, phase: 'idle', error: '麦克风不可用：' + String((err && err.message) || err) })
+        })
+      } catch (e) {
+        setCallState({ active: false, phase: 'idle', error: '麦克风初始化失败：' + String(e) })
+      }
+    }
+
+    function stopCall() {
+      if (callMic) {
+        try { cancelAnimationFrame(callMic.raf) } catch (e) { /* ignore */ }
+        try { if (callMic.rec.state !== 'inactive') callMic.rec.stop() } catch (e) { /* ignore */ }
+        try { callMic.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+        try { callMic.audioCtx.close() } catch (e) { /* ignore */ }
+        callMic = null
+      }
+      callSegmentActive = false
+      callActiveRpc('session', false) // C4：持久激活关闭
+      setCallState({ active: false, phase: 'idle', recording: false })
+      // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
+      if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
+    }
+
+    function resetSegment() {
+      if (!callMic) return
+      callMic.chunks = []
+      callMic.segmentStart = Date.now()
+      callMic.segmentSeconds = 0
+    }
+
+    function startSegment() {
+      if (!callMic || callSegmentActive) return
+      callSegmentActive = true
+      resetSegment()
+      callActiveRpc('speaking', true) // C4：瞬时发声（共识窗口中止判定用；非持久激活）
+      setCallState({ recording: true })
+    }
+
+    function stopSegment() {
+      if (!callMic || !callSegmentActive) return
+      callSegmentActive = false
+      callActiveRpc('speaking', false)
+      setCallState({ recording: false, phase: 'processing' })
+      const chunks = callMic.chunks
+      callMic.chunks = []
+      if (!chunks.length) { setCallState({ phase: 'listening', error: null }); return }
+      const blob = new Blob(chunks, { type: 'audio/webm' })
+      // 上传 → 转写 → 插入 + 提交（与语音输入同路径）
+      const sid = callSessionId || ''
+      const fd = new FormData()
+      fd.append('audio', blob, 'call-' + Date.now() + '.webm')
+      fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid }, body: fd }).then(function (r) {
+        return r.json()
+      }).then(function (r) {
+        if (r && r.ok && r.text) {
+          const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
+          if (actions) { insertText(actions, r.text); submitInput(actions) }
+          setCallState({ phase: 'listening' })
+        } else {
+          const msg = (r && r.message) || '转写失败'
+          setCallState({ phase: 'listening', error: msg })
+          playBeep()
+          showToast('通话转写失败：' + msg)
+        }
+      }).catch(function (e) {
+        setCallState({ phase: 'listening', error: '上传失败：' + String(e) })
+        showToast('通话上传失败')
+      })
+    }
+
+    function callActiveRpc(kind, active) {
+      host.call('guide-dog/call-active', { sessionId: callSessionId || '', kind: kind, active: active }).catch(function () {})
+    }
+
+    // 供 Task 8/9 共识窗口查询（brief Interfaces 产物）：当前 RMS 是否达到语音阈值
+    function isUserSpeaking() {
+      const cfg = voiceState.cfg || {}
+      const vad = (cfg.call && cfg.call.vad) || {}
+      const threshold = vad.threshold !== undefined ? vad.threshold : 0.02
+      return callRms >= threshold
+    }
 
     const cardStyle = { border: '1px solid rgba(128,128,128,.35)', borderRadius: 10, padding: 10, marginTop: 6, maxWidth: 640 }
     const rowStyle = { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }
