@@ -44,13 +44,13 @@ return {
         }
       }).catch(function () {})
     }
-    function setVoiceOverride(sid, v) {
-      const cur = (voiceState.cfg && voiceState.cfg.voiceMode && voiceState.cfg.voiceMode.sessions) || {}
-      const sessions = Object.assign({}, cur)
-      sessions[sid] = !!v // 显式布尔：全局默认开时也能用 false 覆盖关闭该会话
-      return host.call('guide-dog/set-config', { patch: { voiceMode: { sessions: sessions } } }).then(function (r) {
-        if (r && r.ok) return loadVoiceCfg()
-      }).catch(function () {})
+    function setVoiceOverride(sid, value) {
+      const patch = { voiceMode: { sessions: {} } }
+      patch.voiceMode.sessions[sid] = value // M11：单键 patch，不重建整表（host deepMerge 合并）
+      return host.call('guide-dog/set-config', { patch: patch }).then(function (r) {
+        if (r && r.ok) loadVoiceCfg()
+        return r
+      }).catch(function () { return null })
     }
     // ---- 模块级播放器：会话切换不中断；新播放任务覆盖旧任务 ----
     let curAudio = null
@@ -482,11 +482,11 @@ return {
                   rec.onstop = function () {
                     if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
                     if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
+                    partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写（须在守卫之前：陈旧路径上迟到的 partial 也不得 ghost 插入旧会话草稿）
                     // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，而闭包里的 sid/inputActions
                     // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交。
                     // 不能以 micRec==null 判陈旧：正常停止路径（toggleMic）也是先置 micRec=null 再 stop。
                     if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return // M9：丢弃陈旧提交
-                    partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
                     transcribe(sid, props.inputActions, set)
                   }
                   recSessionRef = { sid: sid, alive: true } // M9：录音归属当前会话（onstop 提交前校验）
