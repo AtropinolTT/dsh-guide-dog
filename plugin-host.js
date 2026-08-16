@@ -603,6 +603,14 @@ if __name__ == '__main__':
         return await fsSvc.readBytes(t, undefined, maxBytes)
       } catch (e) { return null }
     }
+    // M10: fsSvc.readBytes 无 offset，只读文件开头 maxBytes；
+    // readRange 经 shell (dd + head/tail + base64) 只读 [start, start+len)。
+    async function readRange(abs, start, len) {
+      if (!runRaw || !quote) return null
+      const r = await runRaw('dd if=' + quote(abs) + ' bs=4096 skip=' + Math.floor(start / 4096) + ' 2>/dev/null | head -c ' + (len + (start % 4096)) + ' | tail -c +' + ((start % 4096) + 1) + ' | base64 -w0', { timeoutMs: 30000 })
+      if (r.exitCode !== 0 || !r.stdout) return null
+      try { return Buffer.from(r.stdout.trim(), 'base64') } catch (e) { return null }
+    }
     async function listDir(abs) {
       if (!fsSvc) return null
       try {
@@ -865,16 +873,14 @@ if __name__ == '__main__':
               if (!st) { res.writeHead(404); res.end(); return }
               const size = st.size || 0
               if (size > MAX_FILE_BYTES) { res.writeHead(413); res.end(); return }
-              const bytes = await readBytes(abs, size || MAX_FILE_BYTES)
-              if (!bytes) { res.writeHead(404); res.end(); return }
               const headers = { 'content-type': mime, 'accept-ranges': 'bytes', 'content-length': String(size) }
               let status = 200
-              let body = bytes
+              let rangeLen = -1 // -1 = 全量
+              let start = -1 // range 起点（rangeLen >= 0 时有效）
               const range = req.headers && req.headers.range ? String(req.headers.range) : ''
               if (range) {
                 const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
                 if (m && (m[1] || m[2])) {
-                  let start = 0
                   let end = size - 1
                   if (m[1] === '') {
                     start = Math.max(0, size - parseInt(m[2] || '0', 10))
@@ -886,14 +892,17 @@ if __name__ == '__main__':
                     res.writeHead(416, { 'content-range': 'bytes */' + size }); res.end(); return
                   }
                   end = Math.min(end, size - 1)
-                  body = bytes.slice(start, end + 1)
+                  rangeLen = end - start + 1
                   status = 206
                   headers['content-range'] = 'bytes ' + start + '-' + end + '/' + size
-                  headers['content-length'] = String(body.length)
+                  headers['content-length'] = String(rangeLen)
                 }
               }
+              // M10：只读所需区段，不全量缓冲（fsSvc.readBytes 无 offset，range 走 readRange）
+              const bytes = rangeLen >= 0 ? await readRange(abs, start, rangeLen) : await readBytes(abs, size || MAX_FILE_BYTES)
+              if (!bytes) { res.writeHead(404); res.end(); return }
               res.writeHead(status, headers)
-              res.end(req.method === 'HEAD' ? undefined : body)
+              res.end(req.method === 'HEAD' ? undefined : bytes)
             } catch (e) {
               try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
             }
