@@ -1082,6 +1082,33 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         console.error('[guide-dog] voice mode variable failed: ' + String(e))
       }
     }
+    // ---- 共识优先 prompt 变量（Task 8 Step 4） ----
+    // 接线说明（实证）：cordis ctx.effect(execute) 会立即调用 execute 并把其返回的函数作为
+    // 生命周期 disposer；systemPrompt.variable() 本身已即时注册并返回 exact effect disposer，
+    // 若直接 ctx.effect(disp) 会立刻调用 disp → 变量被即刻注销。故沿用上方 M3 同款接线
+    // （ctx.effect(function () { return disp })）：disp 仅在 scope 注销时被调用。
+    if (systemPrompt && systemPrompt.variable) {
+      try {
+        const disp1 = systemPrompt.variable('guide_dog_call_consensus', function (context) {
+          const cfg = loadConfig()
+          const sid = context && context.sessionId ? String(context.sessionId) : ''
+          const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
+          const a11yOn = cfg.a11y && cfg.a11y.enabled
+          if (!callOn && !a11yOn) return undefined
+          const a11yExtra = a11yOn ? '无障碍模式已开启：所有可能改变状态的操作（发送、删除、覆盖等）执行前都必须先简短说明并得到你的语音确认。' : ''
+          return '用户正通过语音和你对话，像和合作伙伴讨论一样：先理解意图，不清楚就问（问多少看实际情况，语音通道保持简洁）；主动说明关键信息；写入/修改前先简短说明要做什么，等用户点头；用户随时可能提问或插话，认真回应。' + a11yExtra
+        })
+        if (typeof disp1 === 'function') ctx.effect(function () { return disp1 })
+      } catch (e) { /* ignore */ }
+      try {
+        const disp2 = systemPrompt.variable('guide_dog_a11y_constraints', function () {
+          const cfg = loadConfig()
+          if (!(cfg.a11y && cfg.a11y.enabled)) return undefined
+          return '无障碍模式：①破坏性操作必须先语音确认（"将删除 X，确定吗？请说确定或取消"）；②颜色/图标/布局一律用文字描述；③重要状态变化必须口头通知。'
+        })
+        if (typeof disp2 === 'function') ctx.effect(function () { return disp2 })
+      } catch (e) { /* ignore */ }
+    }
 
     // ---------- tools ----------
     function registerTool(definition) {
@@ -1530,6 +1557,147 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         })
       })()
     }
+    // ---- 共识优先（spec §6.7） ----
+    const WRITE_TOOL_NAMES = ['write', 'edit']
+    const DESTRUCTIVE_BASH_RE = /(^|\s|\||;|&&)(rm|mv|cp|truncate|dd|mkfs|git\s+push)\b|>>?[\s\S]*$/m
+    function consensusSummary(name, args) {
+      try {
+        if (name === 'write') {
+          const p = args && args.file_path ? String(args.file_path) : '?'
+          const content = args && args.content ? String(args.content) : ''
+          return '写入文件 ' + p + '（' + content.length + ' 字符）'
+        }
+        if (name === 'edit') {
+          const p = args && args.file_path ? String(args.file_path) : '?'
+          const oldS = args && args.old_string ? String(args.old_string) : ''
+          return '修改文件 ' + p + '（替换 ' + oldS.length + ' 字符片段）'
+        }
+        if (name === 'bash') {
+          const cmd = args && args.command ? String(args.command) : ''
+          if (DESTRUCTIVE_BASH_RE.test(cmd)) return '执行命令：' + cmd.slice(0, 80)
+          return ''
+        }
+        return ''
+      } catch (e) { return '' }
+    }
+    const callActiveFlags = new Map() // sessionId -> boolean（瞬时：用户正在发声，Task 9 窗口期高灵敏上报）
+    ctx.effect(function () {
+      try {
+        // C4 修复（2026-08-16 审稿）：call-active RPC 拆两用——
+        //   {active:true, kind:'session'} → callActiveSessions.add（持久激活，Task 7 startCall/stopCall 上报）
+        //   {active:true/false, kind:'speaking'} → callActiveFlags.set（瞬时发声，Task 9 共识窗口上报）
+        return harness.handle('guide-dog/call-active', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: false, error: 'bad_args' }
+          const kind = args && args.kind === 'session' ? 'session' : 'speaking'
+          const active = !!(args && args.active)
+          if (kind === 'session') {
+            if (active) callActiveSessions.add(String(sid))
+            else callActiveSessions.delete(String(sid))
+          } else {
+            callActiveFlags.set(String(sid), active)
+          }
+          return { ok: true }
+        })
+      } catch (e) { return function () {} }
+    })
+    async function announceAndWait(sid, text) {
+      // 播报摘要（走同一 TTS 管线，source:'consensus'）；等待窗口；期间用户发声（speaking 置位）→ aborted
+      // C5 修复（2026-08-16 审稿）：① 摘要必须入 voiceQueue 且**带 consensus 标记**（speakImpl 只生成 mp3
+      //   不排队，旧代码直接 speakImpl → client 轮询取不到 → 用户听不到摘要、窗口永不开启）；
+      //   ② 只在生成完成后推最终条目（占位条目会被 client 先弹出——队列是 shift 语义）；
+      //   ③ 窗口在**摘要生成完成**后开始计时（client 播放到它需要 ~1-2s，窗口覆盖播放尾声与之后）；
+      //   ④ 窗口期监听 speaking 标志从 false 变 true（Task 9 开窗即上报的旧语义自噬，已改为仅真实发声上报）。
+      await serialSpeak(function () {
+        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'consensus' }).then(function (r) {
+          const q2 = voiceQueue.get(String(sid)) || []
+          if (r && r.ok && r.url) {
+            q2.push({ url: r.url, key: 'consensus:' + sid + ':' + Date.now(), consensus: true })
+          } else {
+            q2.push({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          }
+          if (q2.length > VOICE_QUEUE_MAX) q2.shift()
+          voiceQueue.set(String(sid), q2)
+        }).catch(function (e) {
+          const q3 = voiceQueue.get(String(sid)) || []
+          q3.push({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.shift()
+          voiceQueue.set(String(sid), q3)
+        })
+      })
+      const cfg = loadConfig()
+      const winMs = (cfg.call && cfg.call.consensus && cfg.call.consensus.summaryWindowMs) || 3000
+      const start = Date.now()
+      // 窗口开始：清瞬时标志，之后任何发声都会置 true → aborted
+      callActiveFlags.set(String(sid), false)
+      while (Date.now() - start < winMs) {
+        if (callActiveFlags.get(String(sid)) === true) return 'aborted'
+        await sleep(100)
+      }
+      return 'proceed'
+    }
+    function consensusEnabled(sid) {
+      const cfg = loadConfig()
+      const a11yOn = cfg.a11y && cfg.a11y.enabled
+      const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
+      return !!(a11yOn || callOn)
+    }
+    // C1 修复（2026-08-16 审稿）：user 确认词监听器——用户回复"确定/确认/可以/好"（普通回合内容）
+    // → markConsentPending(sid)；下一次 pre-execute 消费该 pending 并 grantConsent。
+    // 注意：监听 user 消息事件（Phase 1 的 session/event 监听的是 assistant/message，此处是 user 消息分支）。
+    const CONSENT_YES_RE = /^(确定|确认|可以|好的?|行|就这么办|继续)$/
+    const CONSENT_NO_RE = /^(取消|不行|不要|算了|停)$/
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'user/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid || !consensusEnabled(sid)) return
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join(' ').trim()
+        if (!text) return
+        const t = text.replace(/[，。！？\s]/g, '')
+        if (CONSENT_YES_RE.test(t)) markConsentPending(sid)
+        else if (CONSENT_NO_RE.test(t)) { clearConsent(sid); callActiveFlags.set(String(sid), false) }
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('tools/pre-execute', async function (exec, next) {
+      try {
+        // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
+        // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
+        // sessionId 推导：agent.session.id（T4 探针实证待确认；若证伪改为 agents 服务推导）
+        const sid = exec && exec.agent && exec.agent.session ? String(exec.agent.session.id || '') : ''
+        if (!sid || !consensusEnabled(sid)) return next()
+        const name = exec && exec.name ? String(exec.name) : ''
+        const args = exec && exec.arguments ? exec.arguments : {}
+        const isWrite = WRITE_TOOL_NAMES.indexOf(name) >= 0
+        const isDestructiveBash = name === 'bash' && DESTRUCTIVE_BASH_RE.test(String((args && args.command) || ''))
+        if (!isWrite && !isDestructiveBash) return next()
+        // 摘要：写工具强制；bash 仅破坏性命令
+        const summary = consensusSummary(name, args)
+        if (!summary) return next()
+        const turnSeq = exec.agent ? exec.agent.turn : null
+        // C1 修复：未共识但用户刚说过确认词 → 消费 pending 并授予本轮 consent（不拦截）
+        if (!hasConsent(sid, turnSeq) && consumeConsentPending(sid)) {
+          grantConsent(sid, turnSeq) // 原样存储：null → hasConsent 退化为"已授予"；数字 → 精确匹配
+        }
+        if (hasConsent(sid, turnSeq)) {
+          // 已共识：执行前摘要 + 打断窗口
+          const verdict = await announceAndWait(sid, '接下来' + summary)
+          if (verdict === 'aborted') return { kind: 'deny', reason: 'aborted_by_user' }
+          return next()
+        }
+        // 未共识：拦截，让模型语音提问
+        return { kind: 'deny', reason: 'needs_voice_confirmation' }
+      } catch (e) {
+        // spec §6.8：宁可拦错不可放错；口播原因（不静默）
+        try {
+          const sid = exec && exec.agent && exec.agent.session ? String(exec.agent.session.id || '') : ''
+          if (sid) serialSpeak(function () { return speakImpl({ text: '共识检查失败，已阻止本次操作', sessionId: sid, turnSeq: null, source: 'consensus' }).catch(function () { return null }) })
+        } catch (e2) { /* ignore */ }
+        return { kind: 'deny', reason: 'consensus_failed' }
+      }
+    })
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
