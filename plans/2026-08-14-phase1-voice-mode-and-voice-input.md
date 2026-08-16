@@ -1,5 +1,7 @@
 # Phase 1（语音模式硬化 + 语音输入）实施计划
 
+> **📌 历史记录（2026-08-16 注）**：本文档记录 Phase 1 在**动态插件时代**（`gdog-1` + `cordis_define`/`cordis_run` + 批准弹窗）的执行过程，**已全部完成并验收**（v6 落地、v11 全链路验证）。2026-08-16 起交付形态升级为**静态 web-profile bundle**（`dsh-guide-dog`，见 README "Restart recovery"），本文档保留为历史记录，**不按新架构改写**——文中的 `gdog-1`/`cordis_*`/`pkg-*`/`~/.guide-dog/` 路径均为当时实况；新实施请参照 spec §3 架构升级说明与 `deploy/convert_bundle.py`/`deploy/publish.py` 流程。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 gdog-1 插件 v2 的 Phase 1 落地三条硬指标（机制保证自动发声 / 文字语音一致 / 失败必反馈）+ 语音输入（麦克风→STT→输入框），并补齐两层语音模式设置与设置页。

@@ -26,29 +26,27 @@ the [mmx CLI](https://www.npmjs.com/package/mmx-cli) (MiniMax):
 
 | File | Purpose |
 |---|---|
-| `plugin-host.js` | Host half (tools, RPC, media route, prompt section) |
-| `plugin-client.js` | Client half (tool cards + settings page) |
-| `plugin-source.js` | Both halves concatenated for re-deployment |
+| `plugin-host.js` | Host half — **source of record** (tools, RPC, media route, prompt section, voice mode) |
+| `plugin-client.js` | Client half — **source of record** (tool cards, settings page, voice cluster) |
+| `bundle/` | Static web-profile bundle generated from the two halves (`deploy/convert_bundle.py`) |
+| `deploy/` | `convert_bundle.py` (source → bundle) and `publish.py` (bundle → `~/.dsh/dsh-guide-dog` + web profile registration) |
 | `README.md` | This file |
 
-## Deploy
+## Deploy (static web-profile bundle — current)
 
-1. Create the plugin (host + client halves in ONE package):
+1. Edit the source of record: `plugin-host.js` / `plugin-client.js`.
+2. `python3 deploy/convert_bundle.py` — regenerate `bundle/lib/`.
+3. `python3 deploy/publish.py` — copy to `~/.dsh/dsh-guide-dog`, idempotently
+   register in `~/.dsh/profiles/web` (dependency link + `bundles` entry +
+   node_modules symlink), remove the superseded autoload bundle.
+4. **Restart DSH** (`dsh web`) — bundles are parsed at startup.
 
-   ```
-   cordis_define  plugin.kind=new, idPrefix=gdog
-                 code.host=<plugin-host.js>  code.client=<plugin-client.js>
-   cordis_run     <pluginId> <packageId> run
-   ```
+No dynamic plugin, no approval cards, no per-session instances: after a DSH
+restart the tools and voice UI come back with the profile itself. Full details
+and pitfalls in the "Restart recovery" section below.
 
-2. Approve the Client-half activation in the web UI (single check mark). The
-   Host half (tools, route, prompt section) activates with it.
-3. Verify: the model's tool list contains `guide_dog_*`, and the Settings →
-   **Guide Dog** page shows the mmx auth status.
-
-After a harness restart the plugin is gone (dynamic plugins are process-local);
-re-run the two commands above to restore it. `plugin-source.js` exists so you
-can re-deploy without hunting through session history.
+`plugin-source.js` is a legacy dynamic-era artifact (both halves concatenated);
+kept for reference, not used by the current deploy flow.
 
 ## Tools
 
@@ -91,9 +89,10 @@ Example visual-check flow on DeepSeek:
 
 ## Media store & serving
 
-- Media lives in `<workspaceRoot>/.guide-dog/media` (inside the session
-  workspace, so the `workspace-write` sandbox allows mmx to write there;
-  no permission escalation needed).
+- Media lives in `~/.dsh/guide-dog/.guide-dog/media` — the **global store**
+  under `GLOBAL_ROOT = ~/.dsh/guide-dog` (one instance for the whole web
+  profile since 2026-08-16; no longer the per-workspace sandbox root — see
+  "Restart recovery" below).
 - Served by a same-origin prefix route `/guide-dog/media` with:
   - extension allowlist (`jpg/jpeg/png/gif/webp/mp3/wav/m4a/ogg/mp4/webm`),
   - basename-only lookup + traversal guard,
@@ -183,8 +182,8 @@ Settings → **Guide Dog** (id `guide-dog`):
 
 ### config.json schema
 
-Lives at `<workspaceRoot>/.guide-dog/config.json` (auto-created from defaults;
-all keys optional, deep-merged over the defaults):
+Lives at `~/.dsh/guide-dog/.guide-dog/config.json` (auto-created from
+defaults; all keys optional, deep-merged over the defaults):
 
 ```json
 {
@@ -232,8 +231,9 @@ shown in the Settings → STT row. Model choices: `base` (fast) / `small`
 ```
 node --check plugin-host.js && node --check plugin-client.js          # syntax
 curl -s http://127.0.0.1:3080/guide-dog/recorder | head -5             # recorder page serves HTML
-curl -s http://127.0.0.1:3080/guide-dog/status | head -5               # status RPC
-cat <workspaceRoot>/.guide-dog/status.json                             # whisper probe result
+curl -s -X POST http://127.0.0.1:3080/guide-dog/api/guide-dog/status \
+  -H 'content-type: application/json' -d '{}' | head -5               # status RPC (compat layer)
+cat ~/.dsh/guide-dog/.guide-dog/status.json                            # whisper probe result
 ```
 
 Manual checks (after deploy): click the speaker button (voice mode on, turns
@@ -281,8 +281,9 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
 - **Video never finishes** — the poll loop honors the call's abort signal and
   times out after 15 minutes; re-run with a shorter `duration` or different
   `model`.
-- **Cards show generic JSON** — the client half was not approved/loaded; approve
-  the run and refresh the page.
+- **Cards show generic JSON** — the client half did not load; check that the
+  bundle client route `/plugins/dsh-guide-dog/client.js` returns 200 after a
+  DSH restart, and refresh the page.
 - **Stop / update** — everything (tools, route, prompt section, cards, settings
   entry) is disposed automatically; media files remain.
 

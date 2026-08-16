@@ -2,34 +2,34 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 gdog-1 插件 Phase 2 落地通话模式：零 WebSocket 双通道（上行整段 POST 转写 + 下行 chunked HTTP 流式 TTS）、VAD 自动/按住说话双模式、共识优先交互（写操作拦截 + 语音摘要 + 打断窗口）、进度播报、打断、语音命令与容错，先修复 Phase 1 终审遗留技术债 M9/M10/M11。
+**Goal:** 在 dsh-guide-dog 插件（静态 web-profile bundle）Phase 2 落地通话模式：零 WebSocket 双通道（上行整段 POST 转写 + 下行 chunked HTTP 流式 TTS）、VAD 自动/按住说话双模式、共识优先交互（写操作拦截 + 语音摘要 + 打断窗口）、进度播报、打断、语音命令与容错，先修复 Phase 1 终审遗留技术债 M9/M10/M11。
 
-**Architecture:** 单插件演进（spec 方案 A）。host 半新增 STREAM 节（`/guide-dog/tts-stream` chunked 流式路由 + token 签发 + 分句/预合成）、CONSENSUS 节（`tools/pre-execute` 写操作拦截 + 摘要 TTS + 3s 打断窗口 + consent 内存）、CALL 节（call-transcribe 路由 + 播报队列）；client 半新增 CALL PANEL（header action 按钮 + overlay 面板 + dock 状态条 + VAD/PTT 采集状态机）、STREAM PLAYER（fetch getReader + PCM→WAV + Web Audio 无缝队列 + barge-in）、命令匹配。**关键事实（实施前已验证）**：① host 沙箱无 socket/WebSocket 全局（Builtin 实测仅 ctx/harness/console/btoa/atob/TextEncoder/TextDecoder）——`wss://api.minimax.io` 不可直连，TTS 主通道为 `mmx speech synthesize --stream`（实测中文短句首字节 600ms、24kHz s16le）；② `WebRoute.handler=(req,res)` 持原生 node:http 对象（源码确认 "may hold the response open, e.g. SSE"），`res.write` 增量写即 chunked 流；③ `subprocess.spawn({stdio:{stdout:'pipe'}})` → `handle.stdout: Readable`（原生流，直接喂 `res.write`）；④ `tools/pre-execute` waterfall → `PreToolDecision = allow | deny{reason} | ask{reason?}`（`exec.name/arguments/agent/token` 可用）；⑤ 事件 `agent/status`/`tools/result`/`agent/error`/`session/event` 均存在且按 agent 作用域 emit。**实现顺序**：技术债 → 配置/token → 探测包（client 槽位与浏览器流式能力）→ 上行 → 共识 → 播报 → 下行 → 播放 → 打断/命令 → 容错 → 组装部署 → 验收。
+**Architecture:** 单插件演进（spec 方案 A）。host 半（`plugin-host.js` 真源 → `deploy/convert_bundle.py` → `bundle/lib/index.js`）新增 STREAM 节（`/guide-dog/tts-stream` chunked 流式路由 + token 签发 + 分句/预合成）、CONSENSUS 节（`tools/pre-execute` 写操作拦截 + 摘要 TTS + 3s 打断窗口 + consent 内存）、CALL 节（call-transcribe 路由 + 播报队列）；client 半（`plugin-client.js` → `bundle/lib/client.js`）新增 CALL PANEL（header action 按钮 + overlay 面板 + dock 状态条 + VAD/PTT 采集状态机）、STREAM PLAYER（fetch getReader + PCM→WAV + Web Audio 无缝队列 + barge-in）、命令匹配。**关键事实（实施前已验证）**：① 静态 bundle host 半跑在 DSH host Node 进程（非动态沙箱）：Node 全局（Buffer/URL/process/setTimeout 等）可用；兼容层 `harness = {defineTool, registerTool, handle}` 由 convert_bundle.py 注入（handle → JSON POST 路由 `/guide-dog/api/<name>`，双前缀；defineTool 归一化 JSON Schema）；② TTS 主通道为 `mmx speech synthesize --stream`（实测中文短句首字节 600ms、24kHz s16le）；③ `WebRoute.handler=(req,res)` 持原生 node:http 对象（源码确认 "may hold the response open, e.g. SSE"），`res.write` 增量写即 chunked 流；④ `subprocess.spawn({stdio:{stdout:'pipe'}})` → `handle.stdout: Readable`（原生流，直接喂 `res.write`）；⑤ `tools/pre-execute` waterfall → `PreToolDecision = allow | deny{reason} | ask{reason?}`（`exec.name/arguments/agent/token` 可用）；⑥ 事件 `agent/status`/`tools/result`/`agent/error`/`session/event` 均存在且按 agent 作用域 emit。**实现顺序**：技术债 → 配置/token → 探测（Inspect + 临时 bundle 探针）→ 上行 → 共识 → 播报 → 下行 → 播放 → 打断/命令 → 容错 → 组装部署 → 验收。
 
-**Tech Stack:** 动态 Cordis 插件（plain JS，无 import/JSX/useRef）；mmx CLI（`speech synthesize --stream`，pcm 24kHz）；faster-whisper（STT，复用 Phase 1）；Web Audio API（AnalyserNode VAD / decodeAudioData 播放队列）；React（client UI）。
+**Tech Stack:** 静态 Cordis web-profile bundle（host ESM `name/apply/inject` + client `__ModuleLoader__` CJS 工厂；真源为 plain JS，无 import/JSX/useRef——convert_bundle.py 负责包装）；mmx CLI（`speech synthesize --stream`，pcm 24kHz）；faster-whisper（STT，复用 Phase 1）；Web Audio API（AnalyserNode VAD / decodeAudioData 播放队列）；React（client UI，`require('react')` 平台 seed）。
 
-**Spec:** `guide-dog-dsh/specs/2026-08-14-guide-dog-v2-design.md`（§4、§6 全部、§7.1 联动矩阵、§8.1/§8.2/§8.3/§8.4）
+**Spec:** `guide-dog-dsh/specs/2026-08-14-guide-dog-v2-design.md`（§4、§6 全部、§7.1 联动矩阵、§8.1/§8.2/§8.3/§8.4；已按 2026-08-16 静态 bundle 架构修订）
 
 ## Global Constraints
 
-- 动态插件：`code.host`/`code.client` 为纯 JS 函数体；**禁止** import/require/TS/JSX/装饰器；client 用 `React.createElement`，且 **`useRef` 不可用**（用模块级变量替代）；**ASI 陷阱**：括号开头语句（含 IIFE）前必须加分号（Phase 1 根因事故，pkg-4/7 曾因此失败）。
-- 插件身份：`gdog-1`（现 running，currentPackageId=pkg-14）。新包 `cordis_define` kind `existing` 追加；激活 `cordis_run` mode `update`；client 变更需用户批准，被拒不得自动重试。
-- client Builtin 仅：`ctx`、`React`（createElement/useState/useEffect）、`host.call`、`styles.insert`、`console`。**client 端不得声明 `inject`**；timer 服务经 `ctx.get('timer')` 可选获取并判空（签名 `timeout/interval/throttle/debounce`）。浏览器全局（fetch/MediaRecorder/AudioContext/AnalyserNode/decodeAudioData/WebSocket 等）Phase 1 探测确认可用（"all browser globals available"），但 **fetch ReadableStream 流式读取与 Web Audio 播放队列须在探测任务实测**（Task 4）。
-- host Builtin：`ctx/harness/console/btoa/atob/TextEncoder/TextDecoder`。host 既有辅助函数（行号已核实 2026-08-14 晚）：`MEDIA_ROUTE`(11)、`CONFIG_DEFAULTS`(31)、`deepMerge`(36)、`guideDogRoot`(44)、`configReady`(56)、`doRefreshConfig`(67)、`refreshConfig`(79)、`loadConfig`(80)、`writeStatus`(105)、`transcribeImpl`(204)、`quote`(260)、`pick`(263)、`serialIndex`(281)、`runRaw`(288)、`ensureMediaDir`(333)、`hasCJK`(465)、`resolveVoice`(474)、`speakImpl`(503)、RECORDER 节(665)、VOICE MODE 节(1164)、`voiceQueue`(1171)、`VOICE_QUEUE_MAX`(1170)、RPC 区(1107-1216)。
-- host 沙箱无 `process`/`Buffer`/`stream` 全局；但 `res`（路由 handler 入参）与 `handle.stdout`（subprocess pipe 出参）为宿主对象实例，其方法（`res.write`/`res.end`/`on('data')`）可直接调用；stdout chunk 为 Buffer 实例，按 Uint8Array 处理喂 `res.write`（探测任务验证）。
+- **部署模型（2026-08-16 静态 bundle 定案，替代 cordis_define/cordis_run）**：所有改动落在真源 `plugin-host.js` / `plugin-client.js`（动态格式 `return { apply(ctx) {...} }`，纯 JS；**禁止** import/require/TS/JSX/装饰器；client 用 `React.createElement`，且 **`useRef` 不可用**（用模块级变量替代）；**ASI 陷阱**：括号开头语句（含 IIFE）前必须加分号——Phase 1 根因事故曾因此失败）。改完运行 `python3 deploy/convert_bundle.py`（重生成 `bundle/lib/index.js` + `bundle/lib/client.js`）→ `python3 deploy/publish.py`（同步 `~/.dsh/dsh-guide-dog` + 幂等注册 web profile）→ **重启 DSH**（bundles 启动时解析）→ 验证。**无批准弹窗、无 per-session 实例**；`node --check` 双侧语法检查每次改动后必做。
+- 插件身份：`dsh-guide-dog`（静态 bundle，全局单实例）。不再有 `gdog-1`/`pkg-*`/`cordis_define`/`cordis_run`。
+- client 半（bundle/lib/client.js）：`window.__ModuleLoader__.load({id:'dsh-guide-dog', factory})`；`const React = require('react')`（平台 seed 词）；styles 兼容层（convert_bundle.py 自建 `<style data-guide-dog>` 标签，`styles.insert` 同签名）；host 兼容层（`host.call(name, args)` → 同源 `fetch('/guide-dog/api/'+name, {method:'POST', JSON})`）；**插件对象声明 `inject: ['slots']`**（client Loader 支持插件级 inject，better-sidebar 先例）。timer 服务经 `ctx.get('timer')` 可选获取并判空（签名 `timeout/interval/throttle/debounce`）。浏览器全局（fetch/MediaRecorder/AudioContext/AnalyserNode/decodeAudioData 等）Phase 1 探测确认可用，但 **fetch ReadableStream 流式读取与 Web Audio 播放队列须在探测任务实测**（Task 4）。
+- host 半（bundle/lib/index.js）：跑在 DSH host Node 进程——**Node 全局（Buffer/URL/process/setTimeout/TextEncoder/btoa 等）可用**；`inject` 已声明 8 服务（shell/fs/webServer/sandboxPolicy/systemPrompt/subprocess/timer/tools），apply 内 `ctx.get(...)` 直接取。host 既有辅助函数（行号已核实 2026-08-16，plugin-host.js 1516 行）：`MEDIA_ROUTE`(11)、`CONFIG_DEFAULTS`(31)、`deepMerge`(36)、`guideDogRoot`(44)、`configReady`(56)、`doRefreshConfig`(67)、`refreshConfig`(79)、`loadConfig`(80)、`writeStatus`(105)、`transcribeImpl`(420)、`quote`(503)、`pick`(506)、`sleep`(515)、`serialSpeak`(519)、`serialIndex`(524)、`runRaw`(531)、`ensureMediaDir`(576)、`statFile`(591)、`readBytes`(599)、`writeTextFile`(613)、`hasCJK`(708)、`resolveVoice`(717)、`speakImpl`(746)、RECORDER 节(908)、VOICE MODE 节(1407)、`VOICE_QUEUE_MAX`(1413)、`voiceQueue`(1414)、RPC 区(1353-1510)。
+- `res`（路由 handler 入参）与 `handle.stdout`（subprocess pipe 出参）为宿主对象实例，其方法（`res.write`/`res.end`/`on('data')`）可直接调用；stdout chunk 为 Buffer 实例，按 Uint8Array 处理喂 `res.write`（探测任务验证）。
 - subprocess 用法（v1 核实）：`subprocess.spawn({ argv, cwd, stdio: { stdin:'ignore', stdout:{maxBytes} | 'pipe', stderr:{maxBytes} }, graceMs })` → handle：`handle.done`（Promise）、`handle.terminate()`、`handle.stdout`（仅 `'pipe'` 时存在，Readable）。**collect 模式输出经脚本写文件 + `readTextFile` 读**（v1 定案）；**pipe 模式仅 Phase 2 下行流使用**。
 - fs 服务**无二进制写/删除**：二进制经 base64 文本文件 + 外部进程解码；删除经 `runRaw('rm -f <精确路径>')`（禁止通配符，`quote()` 阻止 glob）。
 - 工具/事件契约：`tools/pre-execute` waterfall 签名 `(exec: ToolExecution, next) => Promise<PreToolDecision>`，`ToolExecution = {callId, name, arguments, agent?, token, rootCallId}`（arguments 已 lossless-JSON 解析并冻结）；`PreToolDecision = {kind:'allow'} | {kind:'deny', reason} | {kind:'ask', reason?}`。**拦截用 `deny`**（`ask` 走审批流程，不是语音共识）。
-- 错误码（spec §8.3 修订版）：`bad_args / tts_failed / tts_timeout / stt_failed / stt_timeout / engine_unavailable / mic_denied / empty_speech / ws_rejected / ws_lost / vision_failed / config_write_failed / needs_voice_confirmation / stream_interrupted`。**内部错误码一律从该枚举取，不得新增自由文本错误码**；错误项统一 `{error: <码>, message: <人读文本>}`。
+- 错误码（spec §8.3 修订版，零 WS 决策）：`bad_args / tts_failed / tts_timeout / stt_failed / stt_timeout / engine_unavailable / mic_denied / empty_speech / stream_rejected / stream_interrupted / vision_failed / config_write_failed / needs_voice_confirmation / aborted_by_user / consensus_failed`。**内部错误码一律从该枚举取，不得新增自由文本错误码**；错误项统一 `{error: <码>, message: <人读文本>}`。~~ws_rejected/ws_lost~~ 已废弃（零 WS）。
 - 大小上限（spec §8.1）：call-transcribe 音频 ≤20MB（base64 按 27MB 判定）；describe-screen 图片 ≤8MB（Phase 3）。
-- 路径规则：所有 host 新代码一律**绝对路径**——`guideDogRoot()` + `'/.guide-dog/…'` 拼写；`subprocess.spawn` 的 `cwd` 与 argv 全部绝对化。
+- 路径规则：所有 host 新代码一律**绝对路径**——`guideDogRoot()` 在 bundle 中恒返回 **GLOBAL_ROOT = `homedir() + '/.dsh/guide-dog'`**（convert_bundle.py 替换；不再依赖 sandboxPolicy/pwd），runtime 目录为 `GLOBAL_ROOT + '/.guide-dog/…'`；`subprocess.spawn` 的 `cwd` 与 argv 全部绝对化。
 - host `timerSvc.timeout` 只用已验证的 `sleep(ms)`（Promise 形式）做超时竞速；不依赖未验证的 callback 形式。
-- 沙箱 workspace-write：shell 写入限 `workspaceRoot=/home/tt-wsl-ubuntu`（`~/.guide-dog/` 合规）；**长任务/播放/转写/流式 TTS 用 `subprocess` 服务（非沙箱）**。
-- 仓库文件是源码记录：`plugin-host.js`+`plugin-client.js` 为真源，`plugin-source.js` 由两者拼接（`// ==== HOST HALF ====` / `// ==== CLIENT HALF ====` 分隔），部署用；每次改动后重生成 + `node --check`。
+- 沙箱说明（2026-08-16 修订）：**静态 bundle 无 per-session 沙箱**——host 半经 `shell`/`fs`/`subprocess` 服务直接操作（v11 实证 media 目录创建于 `~/.dsh/guide-dog/.guide-dog/media`）；**长任务/播放/转写/流式 TTS 仍用 `subprocess` 服务**（避免阻塞事件循环）。
+- 仓库文件是源码记录：`plugin-host.js`+`plugin-client.js` 为真源；`deploy/convert_bundle.py` 生成 `bundle/lib/`（**不再是 `plugin-source.js`**——该拼接体为动态插件时代遗留，勿再更新）；部署产物为 `bundle/` + `~/.dsh/dsh-guide-dog`。
 - 播放语义（v2.1 裁决延续）：模块级 `Audio`/播放队列，会话切换不销毁不重播；新播放任务覆盖当前。
 - 会话切换语义（Phase 2 新增）：**录音中切会话 → 丢弃当前片段不误提交**（防 M9 类陈旧闭包）。
 - 共识优先生效范围：仅通话模式开启或 a11y 开启时（`call.consensus.enabled` 且通话激活 / `a11y.enabled`）；打字模式保持 Phase 1 现状。
-- 审批策略 ask：`cordis_run update` 需用户批准；被拒不得自动重试。
+- 验证/部署无审批：`deploy/publish.py` 写 `~/.dsh` 需提权（文件沙箱 danger-full-access，用户一贯批准）；探测用 Inspect 与临时 bundle 探针，不做动态插件。
 
 ## File Structure
 
@@ -37,20 +37,21 @@
 |---|---|---|
 | `guide-dog-dsh/plugin-host.js` | CALL 配置节（call/a11y 默认值 + tts-token + consent）、STREAM 节（tts-stream 路由 + 分句 + 预合成）、CONSENSUS 节（pre-execute 拦截 + 摘要 + 窗口）、播报节（agent 事件 → 队列）、call-transcribe 路由、M10 修复 | Modify（按行号锚点插入） |
 | `guide-dog-dsh/plugin-client.js` | CALL PANEL 节（header.actions/overlay/dock + 模式开关）、采集状态机（VAD/PTT）、STREAM PLAYER 节（fetch 流 + Web Audio 队列 + barge-in）、命令匹配节、共识窗口协调、M9/M11 修复 | Modify |
-| `guide-dog-dsh/plugin-source.js` | 部署用拼接体 | Regenerate（Task 15） |
+| `guide-dog-dsh/deploy/convert_bundle.py` | 真源 → `bundle/lib/index.js` + `bundle/lib/client.js`（静态格式，含兼容层） | Regenerate 产物（每次改真源后运行，Task 15 定案） |
+| `guide-dog-dsh/deploy/publish.py` | 同步 `~/.dsh/dsh-guide-dog` + 幂等注册 web profile（link+bundles+symlink）+ 移除 autoload | Run（Task 15；写 ~/.dsh 需提权） |
 | `guide-dog-dsh/README.md` | Phase 2 用法、配置 schema、验收方法 | Modify（Task 15） |
-| `~/.guide-dog/config.json` | 运行时配置（新增 call/a11y 节） | Runtime |
-| `~/.guide-dog/status.json` / `probe3.json` | 探测状态 / Phase 2 契约探测 | Runtime |
+| `~/.dsh/guide-dog/.guide-dog/config.json` | 运行时配置（新增 call/a11y 节；GLOBAL_ROOT = `~/.dsh/guide-dog`） | Runtime |
+| `~/.dsh/guide-dog/.guide-dog/status.json` / `probe3.json` | 探测状态 / Phase 2 契约探测 | Runtime |
 
 ---
 
 ### Task 0: 技术债 M9（client 录音 onstop 陈旧闭包）
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-client.js`（`startRec`/`rec.onstop` 区域，行 262-279）
+- Modify: `guide-dog-dsh/plugin-client.js`（`startRec`/`rec.onstop` 区域，行 411-531；卸载清理 380-389）
 
 **Interfaces:**
-- Consumes: `micRec`（模块级 `{rec, stream}`）、`transcribe(sid, inputActions, set)`（行 148）、`props.sessionId`
+- Consumes: `micRec`（模块级 `{rec, stream}`）、`transcribe(sid, inputActions, set)`（行 290）、`props.sessionId`
 - Produces: `recSessionRef` 模块级变量（录音归属会话），`transcribe()` 入口加归属校验
 
 **背景（Phase 1 终审 M9）**：`rec.onstop = function () { transcribe(sid, props.inputActions, set) }` 闭包捕获录音**开始**时的 `sid` 与 `inputActions`——录音中切换会话（组件卸载）后 `onstop` 仍会触发，把音频提交给**旧会话**且使用已失效的 `inputActions`。修复：录音归属记录 + 提交前校验 + 卸载时丢弃。
@@ -81,18 +82,18 @@ console.log('PASS: 卸载后丢弃')
 
 - [ ] **Step 2: 运行复现，确认现状失败**
 
-Run: `node repro-m9.js`（新建于 `/home/tt-wsl-ubuntu/skills-repo/.superpowers/sdd/2026-08-14-phase1-voice-mode-and-voice-input/`）
+Run: `node repro/repro-m9.js`（新建于 `guide-dog-dsh/repro/`，随任务提交进 guide-dog 仓库）
 Expected: `Assertion failed` 或 transcribeCalls.length > 0（现状闭包不校验）。
 
 - [ ] **Step 3: 实现修复（plugin-client.js）**
 
-在模块级（行 53 `curAudio` 附近）新增：
+在模块级（行 56 `curAudio` 附近）新增：
 
 ```js
 let recSessionRef = null // { sid, alive }：录音归属；卸载置 alive=false → onstop 丢弃
 ```
 
-修改 `startRec`（行 262-279）：`getUserMedia` 成功后设置归属，`onstop` 校验：
+修改 `startRec`（行 411-531）：`getUserMedia` 成功后设置归属，`onstop` 校验：
 
 ```js
 rec.onstop = function () {
@@ -107,7 +108,7 @@ rec.onstop = function () {
 recSessionRef = { sid: sid, alive: true }
 ```
 
-修改卸载清理（行 231-240）：置 `recSessionRef.alive = false`：
+修改卸载清理（行 380-389）：置 `recSessionRef.alive = false`：
 
 ```js
 return function () {
@@ -122,7 +123,7 @@ return function () {
 
 - [ ] **Step 4: 运行复现，确认修复通过**
 
-Run: `node repro-m9.js`
+Run: `node repro/repro-m9.js`
 Expected: `PASS: 卸载后丢弃`。
 
 - [ ] **Step 5: 语法与提交**
@@ -138,10 +139,10 @@ git commit -m "fix(phase2): M9 — drop stale mic onstop submission after sessio
 ### Task 1: 技术债 M10（媒体路由 range 流式化）
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-host.js`（MEDIA_ROUTE handler，行 601-663）
+- Modify: `guide-dog-dsh/plugin-host.js`（MEDIA_ROUTE handler，行 848-905）
 
 **Interfaces:**
-- Consumes: `statFile`(117)、`readBytes`(125)、`fsSvc`、`EXT_MIME`、`MAX_FILE_BYTES`、`mediaDir`
+- Consumes: `statFile`(591)、`readBytes`(599)、`fsSvc`、`EXT_MIME`、`MAX_FILE_BYTES`、`mediaDir`
 - Produces: 无新接口（handler 内部改造）——range 请求只读所需字节，不再全量缓冲
 
 **背景（Phase 1 终审 M10）**：媒体路由 `readBytes(abs, size)` 把**整个文件**读进内存再 `bytes.slice(start, end+1)` 响应 range——大视频 seek 时浪费内存且首字节延迟高。修复：只读 range 对应区段。
@@ -170,12 +171,12 @@ console.log('PASS: range 计算正确；修复后 readBytes 应只读', r.end - 
 
 - [ ] **Step 2: 运行复现，确认 range 计算逻辑**
 
-Run: `node repro-m10.js`
+Run: `node repro/repro-m10.js`
 Expected: `PASS: range 计算正确…`。
 
-- [ ] **Step 3: 实现修复（plugin-host.js 行 619-653）**
+- [ ] **Step 3: 实现修复（plugin-host.js 行 870-905）**
 
-将 `const bytes = await readBytes(abs, size || MAX_FILE_BYTES)`（行 625）**下移**到 range 解析之后，并按 range 只读区段：
+将 `const bytes = await readBytes(abs, size || MAX_FILE_BYTES)`（行 884）**下移**到 range 解析之后，并按 range 只读区段：
 
 ```js
               const st = await statFile(abs)
@@ -236,7 +237,7 @@ git commit -m "fix(phase2): M10 — media route reads only requested byte range"
 ### Task 2: 技术债 M11（setVoiceOverride 并发覆盖）
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-client.js`（`setVoiceOverride`，行 180-220 区域）、`guide-dog-dsh/plugin-host.js`（`saveConfig` 确认 deepMerge，行 86-104）
+- Modify: `guide-dog-dsh/plugin-client.js`（`setVoiceOverride`，行 47-54）、`guide-dog-dsh/plugin-host.js`（`saveConfig` 确认 deepMerge，行 81-104）
 
 **Interfaces:**
 - Consumes: `host.call('guide-dog/set-config', {patch})`（host 侧 deepMerge + configWriteChain 串行化，v1 已实现）
@@ -252,7 +253,7 @@ cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && grep -n "setVoiceOverride" p
 Expected: 找到实现（预期形如 `patch = { voiceMode: { sessions: <整表重建> } }`）。
 
 ```js
-// repro-m11.js：两个并发 toggle，各自基于过期快照重建整表 → 后写覆盖先写
+// repro/repro-m11.js：两个并发 toggle，各自基于过期快照重建整表 → 后写覆盖先写
 let cfg = { voiceMode: { default: false, sessions: {} } }
 let calls = []
 function oldSetVoiceOverride(sid, value) {
@@ -273,7 +274,7 @@ console.log('PASS: 单键 patch 不丢键（newSetVoiceOverride 语义）')
 
 - [ ] **Step 2: 运行复现**
 
-Run: `node repro-m11.js`
+Run: `node repro/repro-m11.js`
 Expected: `PASS: 单键 patch 不丢键…`（说明语义差异；现状 `oldSetVoiceOverride` 会丢键）。
 
 - [ ] **Step 3: 实现修复（plugin-client.js）**
@@ -306,10 +307,10 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
 ### Task 3: Host call 配置节（call/a11y 默认值 + tts-token 签发 + consent 管理）
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-host.js`（CONFIG_DEFAULTS 行 31-35、RPC 区行 1107 之后）
+- Modify: `guide-dog-dsh/plugin-host.js`（CONFIG_DEFAULTS 行 31-35、RPC 区行 1353 之后）
 
 **Interfaces:**
-- Consumes: `CONFIG_DEFAULTS`(31)、`deepMerge`(36)、`loadConfig`(80)、`saveConfig`(86)、`guideDogRoot`(44)、`harness.handle`
+- Consumes: `CONFIG_DEFAULTS`(31)、`deepMerge`(36)、`loadConfig`(80)、`saveConfig`(81)、`guideDogRoot`(44)、兼容层 `harness.handle`（→ `/guide-dog/api/<name>` JSON POST 路由）
 - Produces:
   - `CONFIG_DEFAULTS` 扩展 `call`/`a11y` 节（spec §4 精确形状）
   - `ttsTokens: Map<token, {sessionId, exp}>` + `async issueTtsToken(sessionId): Promise<string>`（5 分钟有效、单次消费）+ `consumeTtsToken(token, sessionId): boolean`
@@ -335,7 +336,7 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
 
 - [ ] **Step 2: 插入 token 与 consent 管理**
 
-在 VOICE MODE 节（行 1164 注释前）插入：
+在 VOICE MODE 节（行 1407 注释前）插入：
 
 ```js
     // ============ CALL 节（Phase 2，host） ============
@@ -373,7 +374,7 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
 
 - [ ] **Step 3: 注册 tts-token RPC**
 
-在 RPC 区（行 1138 `guide-dog/transcribe` handler 之后）插入：
+在 RPC 区（行 1381 `guide-dog/transcribe` handler 之后）插入：
 
 ```js
     ctx.effect(function () {
@@ -398,171 +399,168 @@ git commit -m "feat(phase2): call config defaults, tts-token issuance, consent m
 
 ---
 
-### Task 4: 探测包（client 槽位 / 浏览器流式能力 / host 契约实测）
+### Task 4: 契约探测（Inspect 槽位 + 临时 bundle 探针）
+
+> **2026-08-16 修订（静态 bundle 时代）**：不再用动态探测插件（cordis_define/cordis_run 已弃用）。槽位形状直接用 **Inspect 只读探针**（零部署）；host/client 运行期能力用**临时探针代码**打进真源、经 convert+publish+重启采集，随后删除。
 
 **Files:**
-- Create: `guide-dog-dsh/plugin-probe2-client.js`（临时探测 client 半；host 半空函数）
-- Runtime: `~/.guide-dog/probe3.json`（探测结果回填）
+- Modify: `guide-dog-dsh/plugin-host.js`（临时：probe-write RPC + pre-execute 观察 + probe-stream 路由，`// PROBE-START` 标记）
+- Modify: `guide-dog-dsh/plugin-client.js`（临时：浏览器全局探测 + 槽位渲染观察，`// PROBE-START` 标记）
+- Runtime: `~/.dsh/guide-dog/.guide-dog/probe3.json`（探测结果回填）
 
 **Interfaces:**
 - Consumes: 无（纯探测）
-- Produces: 探测结论写 `probe3.json`，供 Task 6/7/11/12 定案：
-  1. `conversation.session.header.actions` 槽位形状（owner props：`sessionId`？）与 order 占用
-  2. `conversation.input.dock` 槽位形状与 order 占用
-  3. client 浏览器全局：`fetch` ReadableStream（`res.body.getReader`）、`AudioContext`/`AnalyserNode`/`decodeAudioData`、`Uint8Array`、`DataView` 可用性
-  4. host `tools/pre-execute` 触发形状（注册探测 listener，观察 `exec.name/arguments`）
-  5. host `subprocess` pipe 模式：`handle.stdout.on('data')` 收到 Uint8Array 并 `res.write` 成功（用 `mmx speech synthesize --stream` 短句直测 chunked 路由）
+- Produces: 探测结论写 `probe3.json` + Inspect 快照，供 Task 6/7/11/12 定案：
+  1. `conversation.session.header.actions` 槽位形状（owner props：`sessionId`？）与 order 占用 —— **Inspect 直接查**
+  2. `conversation.input.dock` 槽位形状与 order 占用 —— **Inspect 直接查**
+  3. client 浏览器全局：`fetch` ReadableStream（`res.body.getReader`）、`AudioContext`/`AnalyserNode`/`decodeAudioData`、`Uint8Array`、`DataView` 可用性（临时 client 探针）
+  4. host `tools/pre-execute` 触发形状（临时 listener，观察 `exec.name/arguments/agent`）
+  5. host `subprocess` pipe 模式：`handle.stdout.on('data')` 收到 Buffer/Uint8Array 并 `res.write` 成功（`mmx speech synthesize --stream` 短句直测 chunked 路由）
   6. `WebRoute` handler 中 `res.write` 流式实测（写 2 个分块 + 延迟，验证 chunked 编码）
 
-- [ ] **Step 1: 编写探测 client 半**
+- [ ] **Step 1: Inspect 查槽位（零部署）**
 
-`guide-dog-dsh/plugin-probe2-client.js`（部署时作为 code.client；host 半用空函数）：
+```bash
+# client Slots 树 → 定位 conversation.session.header.actions 与 conversation.input.dock
+# 工具：cordis_inspect_query（client 平台，provider=Slots，method=listSubTree）
+#   root 省略 → 目录树；root=conversation.session.header.actions → 完整契约 + 现有 occupants（order 占用）
+#   root=conversation.input.dock → 完整契约 + 现有 occupants
+```
+Expected: 记录 owner props 精确键名（`sessionId` 等）与 order 占用（确认 30/31 不冲突）。
+
+- [ ] **Step 2: 打入临时探针（plugin-host.js / plugin-client.js）**
+
+plugin-host.js（RECORDER 节后插入，`// PROBE-START` / `// PROBE-END` 包裹，Task 4 末删除）：
 
 ```js
-function () {
-  return {
-    apply: function (ctx) {
-      const slots = ctx.get('slots')
-      const host = ctx.get('host')
-      const console = globalThis.console
-      if (!slots || !host) return
-      const out = {}
-      // 1. 槽位探测：header.actions 与 input.dock（只读注入，观察 props）
+    // ============ PROBE-START（Phase 2 Task 4 临时，勿提交最终） ============
+    ctx.effect(function () {
       try {
-        slots.inject('conversation.session.header.actions', function () {
+        return harness.handle('guide-dog/probe-write', async function (args) {
+          const root = await guideDogRoot()
+          await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
+          const data = Object.assign({}, args && args.data, { preExec: globalThis.__gdProbe || null })
+          await writeTextFile(root + '/.guide-dog/probe3.json', JSON.stringify(data, null, 2))
+          return { ok: true }
+        })
+      } catch (e) { return function () {} }
+    })
+    ctx.on('tools/pre-execute', async function (exec, next) {
+      try {
+        const seen = (globalThis.__gdProbe = globalThis.__gdProbe || { count: 0, names: [], agents: [] })
+        seen.count++
+        if (seen.names.length < 20) seen.names.push(exec && exec.name)
+        const ag = exec && exec.agent
+        if (seen.agents.length < 5) seen.agents.push({ hasSession: !!(ag && ag.session), sessionKeys: ag && ag.session ? Object.keys(ag.session) : [] })
+        return next()
+      } catch (e) { return next() }
+    })
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact', path: '/guide-dog/probe-stream',
+          handler: async function (req, res) {
+            try {
+              res.writeHead(200, { 'content-type': 'audio/pcm', 'transfer-encoding': 'chunked' })
+              const handle = subprocess.spawn({
+                argv: ['mmx', 'speech', 'synthesize', '--stream', '--format', 'pcm', '--sample-rate', '24000', '--text', '探测流式通道'],
+                cwd: (await guideDogRoot()) + '/.guide-dog',
+                stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 1024 * 1024 } },
+                graceMs: 3000,
+              })
+              let bytes = 0
+              handle.stdout.on('data', function (chunk) {
+                bytes += chunk && chunk.length ? chunk.length : 0
+                try { res.write(chunk) } catch (e) { try { handle.terminate() } catch (e2) {} }
+              })
+              await handle.done
+              try { res.end() } catch (e) {}
+            } catch (e) {
+              try { res.writeHead(500); res.end(String(e)) } catch (e2) {}
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+    // ============ PROBE-END ============
+```
+
+plugin-client.js（toast 节后插入，`// PROBE-START` / `// PROBE-END` 包裹）：
+
+```js
+    // ============ PROBE-START（Phase 2 Task 4 临时，勿提交最终） ============
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.session.header.actions', function () {
           return slots.register({ name: 'conversation.session.header.actions', id: 'gd-probe-hdr', order: 30, label: function () { return 'ProbeHdr' } },
             function (props) {
-              out.headerActions = { keys: Object.keys(props || {}), sid: props && props.sessionId }
-              return React.createElement('div', null, 'H')
+              host.call('guide-dog/probe-write', { data: { headerActions: { keys: Object.keys(props || {}), sid: props && props.sessionId } } }).catch(function () {})
+              return null
             })
         })
-      } catch (e) { out.headerActionsErr = String(e) }
+      } catch (e) { return function () {} }
+    })
+    ctx.effect(function () {
       try {
-        slots.inject('conversation.input.dock', function () {
+        return slots.inject('conversation.input.dock', function () {
           return slots.register({ name: 'conversation.input.dock', id: 'gd-probe-dock', order: 30, label: function () { return 'ProbeDock' } },
             function (props) {
-              out.inputDock = { keys: Object.keys(props || {}), sid: props && props.sessionId }
-              return React.createElement('div', null, 'D')
+              host.call('guide-dog/probe-write', { data: { inputDock: { keys: Object.keys(props || {}), sid: props && props.sessionId } } }).catch(function () {})
+              return null
             })
         })
-      } catch (e) { out.inputDockErr = String(e) }
-      // 2. 浏览器全局探测
-      out.globals = {
+      } catch (e) { return function () {} }
+    })
+    ctx.effect(function () {
+      const out = {
         fetchStream: typeof fetch === 'function' && typeof fetch('data:application/octet-stream,AA').then === 'function',
         audioContext: typeof AudioContext === 'function' || typeof webkitAudioContext === 'function',
         analyser: typeof AnalyserNode === 'function',
-        decodeAudioData: typeof AudioContext === 'function' ? 'construct-need' : 'n/a',
         uint8: typeof Uint8Array === 'function',
         dataView: typeof DataView === 'function',
         readableStream: typeof ReadableStream === 'function',
+        bodyGetReader: typeof fetch === 'function' && typeof (new Response('x').body && new Response('x').body.getReader) === 'function',
       }
-      // 3. RPC 回填：部署后从设置页/控制台读取
-      setTimeout(function () {
-        host.call('guide-dog/probe-write', { data: out }).catch(function () {})
-      }, 5000)
-    },
-  }
-}
+      host.call('guide-dog/probe-write', { data: { globals: out } }).catch(function () {})
+      return function () {}
+    })
+    // ============ PROBE-END ============
 ```
 
-> 注：client 半可用 React 全局（Phase 1 确认）。探测结果经临时 RPC `guide-dog/probe-write` 写 `probe3.json`（host 半在 Step 2 提供）。
+> 注：client 探针用 `host.call`（兼容层 → fetch POST `/guide-dog/api/guide-dog/probe-write`）回填；`Response` 为浏览器全局（Phase 1 已确认浏览器全局可用）。
 
-- [ ] **Step 2: 提供 host 半探测 RPC**
-
-host 半（临时部署时用）：注册 `guide-dog/probe-write`（写 `probe3.json`）+ `tools/pre-execute` 探测 listener + pipe 流式路由探测：
-
-```js
-// host 半（临时，Task 4 专用；不作为最终代码提交）
-function () {
-  return {
-    apply: function (ctx) {
-      const harness = ctx.get('harness')
-      const webServer = ctx.get('webServer')
-      const subprocess = ctx.get('subprocess')
-      const fsSvc = ctx.get('fs')
-      // probe-write RPC
-      if (harness) {
-        ctx.effect(function () {
-          return harness.handle('guide-dog/probe-write', async function (args) {
-            try {
-              const root = (ctx.get('sandboxPolicy') && ctx.get('sandboxPolicy').workspaceRoot) || ''
-              await fsSvc.writeText({ cwd: root, path: '/.guide-dog/probe3.json' }, JSON.stringify(args && args.data, null, 2))
-              return { ok: true }
-            } catch (e) { return { ok: false, error: String(e) } }
-          })
-        })
-      }
-      // tools/pre-execute 探测
-      if (ctx.on) {
-        ctx.on('tools/pre-execute', async function (exec, next) {
-          const seen = globalThis.__gdProbe || { count: 0, names: [] }
-          seen.count++
-          if (seen.names.length < 20) seen.names.push(exec && exec.name)
-          seen.lastArgs = exec && exec.arguments
-          globalThis.__gdProbe = seen
-          return next()
-        })
-      }
-      // pipe + chunked 实测路由
-      if (webServer && subprocess && fsSvc) {
-        ctx.effect(function () {
-          return webServer.register({
-            kind: 'exact', path: '/guide-dog/probe-stream',
-            handler: async function (req, res) {
-              try {
-                res.writeHead(200, { 'content-type': 'audio/pcm', 'transfer-encoding': 'chunked' })
-                const handle = subprocess.spawn({
-                  argv: ['mmx', 'speech', 'synthesize', '--stream', '--format', 'pcm', '--sample-rate', '24000', '--text', '探测流式通道'],
-                  cwd: '/tmp',
-                  stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 1024 * 1024 } },
-                  graceMs: 3000,
-                })
-                let bytes = 0
-                handle.stdout.on('data', function (chunk) {
-                  bytes += chunk && chunk.length ? chunk.length : 0
-                  try { res.write(chunk) } catch (e) { try { handle.terminate() } catch (e2) {} }
-                })
-                await handle.done
-                try { res.end() } catch (e) {}
-              } catch (e) {
-                try { res.writeHead(500); res.end(String(e)) } catch (e2) {}
-              }
-            },
-          })
-        })
-      }
-    },
-  }
-}
-```
-
-- [ ] **Step 3: 部署探测包并采集**
+- [ ] **Step 3: 部署并采集**
 
 ```bash
-cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && node --check plugin-probe2-client.js
-# 部署方式：cordis_define kind existing（gdog-1）追加探测包——
-#   code.host = 现有 plugin-host.js 内容 + Step 2 的探测代码（probe-write RPC / pre-execute 观察 / probe-stream 路由）
-#   code.client = plugin-probe2-client.js（含完整 client 半包装：function(){return {apply:...}}）
-# cordis_run update（需批准）；批准后：
-# 观察 header.actions 按钮与 dock 条渲染；控制台读取 out 数据；host 侧 cat ~/.guide-dog/probe3.json
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && node --check plugin-host.js && node --check plugin-client.js
+python3 deploy/convert_bundle.py
+# publish 需提权（写 ~/.dsh）：python3 deploy/publish.py
+# 重启 DSH 后：
 curl -s http://127.0.0.1:3080/guide-dog/probe-stream -o /tmp/probe3.pcm -w 'http=%{http_code} bytes=%{size_download} time=%{time_total}\n'
 # 对比 mmx 直出大小（约 5 秒音频 ≈ 240KB @24kHz s16）
+# 槽位与 globals：浏览器打开任意会话 → 触发 header.actions/dock 渲染 → 读 probe3.json
+cat ~/.dsh/guide-dog/.guide-dog/probe3.json
+# pre-execute 观察：让模型跑任意工具（如 bash ls）→ probe-write 自动合并 __gdProbe 写入 probe3.json
 ```
-Expected: `probe3.json` 含槽位 props keys 与全局可用性；probe-stream 返回 200 且 bytes > 0（chunked 流式成立）；`tools/pre-execute` 观察记录（部署期间任何工具调用都会计数）。
+Expected: `probe3.json` 含槽位 props keys、globals 可用性、pre-execute 观察记录（`preExec.count/names/agents`）；probe-stream 返回 200 且 bytes > 0（chunked 流式成立）。
 
 - [ ] **Step 4: 定案记录**
 
-将探测结论回填到本计划的 Interfaces 与台账（`/home/tt-wsl-ubuntu/skills-repo/.superpowers/sdd/2026-08-14-phase1-voice-mode-and-voice-input/progress.md` 追加"Phase 2 Task 4 探测结论"）。重点定案：
+将探测结论回填到本计划的 Interfaces 与 `docs/progress.md`（追加"Phase 2 Task 4 探测结论"）。重点定案：
 - `header.actions` / `input.dock` 的 owner props 精确键名（Task 6 的 UI 组件签名依赖）
 - `res.write` chunked 是否成功（决定 Task 11 主方案 vs 降级逐句 mp3）
 - `handle.stdout` data chunk 形态（Buffer/Uint8Array，Task 11 直接使用）
+- `exec.agent.session` 形状（Task 8/10 的 sessionId 推导依赖；若 agent 无 session 字段，改从 `agents` 服务推导）
 
-- [ ] **Step 5: 清理探测插件并提交**
+- [ ] **Step 5: 清理探针并提交**
 
 ```bash
-# cordis_undefine 探测插件（或 cordis_stop）；gdog-1 保持 pkg-14 运行
-cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && rm -f plugin-probe2-client.js
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh
+# 删除两文件中的 PROBE-START..PROBE-END 块（含标记行）
+node --check plugin-host.js && node --check plugin-client.js
 git add -A && git commit -m "chore(phase2): probe round — slots header.actions/input.dock, browser stream globals, pre-execute shape, pipe chunked route (results in probe3.json)"
+# 探针代码已随本轮 commit 删除；bundle 无需立即重新 convert（下次 Task 5 部署一并重建）
 ```
 
 ---
@@ -570,17 +568,17 @@ git add -A && git commit -m "chore(phase2): probe round — slots header.actions
 ### Task 5: Host 上行路由（POST /guide-dog/call-transcribe）
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-host.js`（RECORDER 节之后，行 663 之后新增）
+- Modify: `guide-dog-dsh/plugin-host.js`（RECORDER 节之后，行 908 之后新增）
 
 **Interfaces:**
-- Consumes: `transcribeImpl`(204)（入参 `{audioB64, mime, sessionId?, language?}` → `{ok,text,language,durationMs}`）、`runRaw`(288)、`quote`(260)、`writeTextFile`(139)、`readTextFile`、`guideDogRoot`(44)、`webServer.register`
+- Consumes: `transcribeImpl`(420)（入参 `{audioB64, mime, sessionId?, language?}` → `{ok,text,language,durationMs}`）、`runRaw`(531)、`quote`(503)、`writeTextFile`(613)、`readTextFile`、`guideDogRoot`(44)、`webServer.register`
 - Produces: `POST /guide-dog/call-transcribe`（raw webm body ≤20MB → `{ok,text,language}` JSON；Origin 同源校验）
 
 **背景**：call 上行与 Phase 1 麦克风共用 STT 管线；区别是 client 直接 POST raw body（不走 base64 RPC，省 33% 体积与 RPC 开销）。
 
 - [ ] **Step 1: 实现路由**
 
-在 RECORDER 节（行 663 `})` 之后）插入：
+在 RECORDER 节（行 908 `RECORDER_HTML` 常量之后）插入：
 
 ```js
     // ============ CALL 上行（Phase 2，host） ============
@@ -624,33 +622,31 @@ git add -A && git commit -m "chore(phase2): probe round — slots header.actions
     })
 ```
 
-> ⚠️ host 沙箱**无 `Buffer` 全局**（Builtin 实测）——`Buffer.concat`/`buf.toString` 在沙箱不可用。**Step 2 定案替代**：用 `TextDecoder`（Builtin 有）将 Uint8Array 拼成二进制字符串再 `btoa`（btoa 对二进制字符串逐字节安全）——`for await (const chunk of req)` 的 chunk 是 Buffer，其 `chunk.length` 可用、按 Uint8Array 处理：
+> ✅ **2026-08-16 修订（静态 bundle）**：host 半跑在 DSH host Node 进程，**`Buffer` 全局可用**——直接 `Buffer.concat(chunks)` + `buf.toString('base64')` 即可，无需 btoa 二进制字符串路径。保留 btoa 写法亦可（Node 也有 btoa），但以 Buffer 为准：
 
 ```js
-              let bin = ''
+              const chunks = []
+              let total = 0
               for await (const chunk of req) {
-                const u8 = new Uint8Array(chunk.buffer || chunk, chunk.byteOffset || 0, chunk.byteLength)
-                const s = String.fromCharCode.apply(null, u8)
-                bin += s
-                if (bin.length > 27 * 1024 * 1024) { res.writeHead(413); res.end(); return }
+                chunks.push(chunk)
+                total += chunk.length
+                if (total > 20 * 1024 * 1024) { res.writeHead(413); res.end(); return }
               }
-              const b64 = btoa(bin)
+              const b64 = Buffer.concat(chunks).toString('base64')
 ```
 
-- [ ] **Step 2: 沙箱兼容验证**
+- [ ] **Step 2: 语法验证（Buffer 路径）**
 
 ```bash
-# 用本地 harness 同款包装验证 btoa(bin) 路径（repro 脚本：Uint8Array → 二进制字符串 → btoa）
-cd /home/tt-wsl-ubuntu/skills-repo/.superpowers/sdd/2026-08-14-phase1-voice-mode-and-voice-input && node -e "
-const u8 = new Uint8Array([0x1F, 0xA6, 0x00, 0xFF])
-let bin = ''
-for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000))
-const b64 = btoa(bin)
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && node -e "
+// 验证 Buffer.concat + base64 路径（Node 全局，静态 bundle 同环境）
+const chunks = [Buffer.from([0x1F, 0xA6]), Buffer.from([0x00, 0xFF])]
+const b64 = Buffer.concat(chunks).toString('base64')
 console.log('b64:', b64) // 期望 H6YA/w==
-console.log('PASS: btoa binary-string path works')
+console.log('PASS: Buffer.concat base64 path works')
 "
 ```
-Expected: `PASS`（btoa 对任意字节的二进制字符串安全；0x8000 分块防栈溢出——v1 beep RPC 同款模式，行 1159）。
+Expected: `PASS`（0x8000 分块防栈溢出的 btoa 路径不再需要；Node Buffer 直连）。
 
 - [ ] **Step 3: 语法与提交**
 
@@ -665,7 +661,7 @@ git commit -m "feat(phase2): call-transcribe route (raw webm POST, shared transc
 ### Task 6: Client call UI（发起按钮 + 面板 + 状态条 + 模式开关）
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-client.js`（新 CALL PANEL 节，插在 toast 节之后；行 315 之后）
+- Modify: `guide-dog-dsh/plugin-client.js`（新 CALL PANEL 节，插在 toast 节之后；行 592 之后）
 
 **Interfaces:**
 - Consumes: `slots.inject/register`（Phase 1 模式）、`React.createElement`、`host.call`、`timerSvc`、主题令牌 `--dsw-alias-*`（Phase 1 已用）
@@ -830,7 +826,7 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
 - Modify: `guide-dog-dsh/plugin-client.js`（CALL PANEL 节内，替换 Task 6 的 `startCall/stopCall/startSegment/stopSegment` 桩）
 
 **Interfaces:**
-- Consumes: Task 6 的 `callState/setCallState/subscribeCall`、`insertText`(126)/`submitInput`(135)（Phase 1 已有）、`host.call`、`callSessionId`、配置 `voiceInput.maxSeconds`/`call.vad.*`/`call.mode`
+- Consumes: Task 6 的 `callState/setCallState/subscribeCall`、`insertText`(248)/`submitInput`(257)（Phase 1 已有）、`host.call`、`callSessionId`、配置 `voiceInput.maxSeconds`/`call.vad.*`/`call.mode`
 - Produces:
   - `startCall(sid)`：getUserMedia + MediaRecorder + AnalyserNode 初始化；`callState.active=true`
   - `stopCall()`：停止录音与播放、释放流、`callState.active=false`
@@ -973,7 +969,7 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
     }
 ```
 
-> ⚠️ **`window.__gdInputActions` 是临时通道**：header action 的 owner props 未必含 `inputActions`（Task 4 探测定案）。若探测确认 header.actions 无 `inputActions`，则在 **CALL PANEL 节内额外注入一个不可见的 `conversation.input.left` 或 `input.right` 组件**（Phase 1 已确认 input.left 的 props 含 `inputActions`），把 `props.inputActions` 存模块级 `gdInputActions`，Task 7 的提交走它。**Step 2 定案**。
+> ⚠️ **`window.__gdInputActions` 是临时通道**：静态 bundle 的 client 跑在浏览器（ModuleLoader 工厂），`window` 可用但**模块级变量是本插件惯例**（Phase 1 全部状态都是模块级）。header action 的 owner props 未必含 `inputActions`（Task 4 Inspect 定案）。若探测确认 header.actions 无 `inputActions`，则在 **CALL PANEL 节内额外注入一个不可见的 `conversation.input.left` 或 `input.right` 组件**（Phase 1 已确认 input.left 的 props 含 `inputActions`），把 `props.inputActions` 存模块级 `gdInputActions`，Task 7 的提交走它。**Step 2 定案**。
 
 - [ ] **Step 2: 定案 inputActions 获取通道**
 
@@ -1013,7 +1009,7 @@ git commit -m "feat(phase2): call capture state machine — MediaRecorder + Anal
 - Modify: `guide-dog-dsh/plugin-host.js`（CALL 节内，Task 3 的 token/consent 之后）
 
 **Interfaces:**
-- Consumes: Task 3 的 `consent/grantConsent/hasConsent/clearConsent`、`loadConfig`(80)、`speakImpl`(503)、`serialSpeak`(45)、`sleep`(41)、`voiceQueue`(1171)（播报复用）、`quote`(260)、`timerSvc`
+- Consumes: Task 3 的 `consent/grantConsent/hasConsent/clearConsent`、`loadConfig`(80)、`speakImpl`(746)、`serialSpeak`(519)、`sleep`(515)、`voiceQueue`(1414)（播报复用）、`quote`(503)、`timerSvc`
 - Produces:
   - `WRITE_TOOL_NAMES = ['write', 'edit']`（精确工具名）+ `DESTRUCTIVE_BASH_RE`（bash 破坏性命令启发式）
   - `async consensusSummary(exec): Promise<string>`（一句话摘要：目标路径 + 操作类型 + 片段）
@@ -1026,7 +1022,7 @@ git commit -m "feat(phase2): call capture state machine — MediaRecorder + Anal
 - [ ] **Step 1: 写失败测试（摘要与窗口逻辑，纯函数）**
 
 ```js
-// repro-consensus.js：摘要生成与 consent 判定
+// repro/repro-consensus.js：摘要生成与 consent 判定
 function consensusSummary(name, args) {
   if (name === 'write') {
     const p = args && args.file_path ? String(args.file_path) : ''
@@ -1053,7 +1049,7 @@ console.log('PASS: consensus summary + destructive heuristic')
 
 - [ ] **Step 2: 运行复现**
 
-Run: `node repro-consensus.js`
+Run: `node repro/repro-consensus.js`
 Expected: `PASS: consensus summary + destructive heuristic`。
 
 - [ ] **Step 3: 实现拦截器（plugin-host.js CALL 节）**
@@ -1160,7 +1156,7 @@ Expected: `PASS: consensus summary + destructive heuristic`。
 
 - [ ] **Step 4: 注册系统提示变量**
 
-在既有 `systemPrompt.variable` 区块（行 767 附近）之后追加：
+在既有 `systemPrompt.variable` 区块（行 1010 附近）之后追加：
 
 ```js
     if (systemPrompt && systemPrompt.variable) {
@@ -1263,13 +1259,13 @@ git commit -m "feat(phase2): consensus window coordination — sensitive VAD pro
 - Modify: `guide-dog-dsh/plugin-host.js`（CALL 节内，Task 8 之后）
 
 **Interfaces:**
-- Consumes: `speakImpl`(503)、`serialSpeak`(45)、`voiceQueue`(1171)、`loadConfig`(80)、`ctx.on` 事件 `agent/status`/`tools/result`/`agent/error`（存在性已实测）
+- Consumes: `speakImpl`(746)、`serialSpeak`(519)、`voiceQueue`(1414)、`loadConfig`(80)、`ctx.on` 事件 `agent/status`/`tools/result`/`agent/error`（存在性已实测）
 - Produces: `progressPhrase(toolName): string`（工具→短语映射，spec §6.4 表）；`shouldAnnounce(toolName): boolean`（白名单）；事件监听器（仅通话/a11y 激活会话生效，播报入 voiceQueue 优先位）
 
 - [ ] **Step 1: 写失败测试（映射纯函数）**
 
 ```js
-// repro-progress.js
+// repro/repro-progress.js
 function progressPhrase(name) {
   const map = { bash: '正在执行命令', read: '正在查找文件', grep: '正在查找文件', glob: '正在查找文件',
     write: '正在修改文件', edit: '正在修改文件', web_search: '正在搜索网页',
@@ -1284,7 +1280,7 @@ console.log('PASS: progress phrase mapping')
 
 - [ ] **Step 2: 运行复现**
 
-Run: `node repro-progress.js`
+Run: `node repro/repro-progress.js`
 Expected: `PASS: progress phrase mapping`。
 
 - [ ] **Step 3: 实现事件监听（plugin-host.js CALL 节）**
@@ -1376,12 +1372,12 @@ git commit -m "feat(phase2): progress announcements — agent/status, tools/resu
 - Modify: `guide-dog-dsh/plugin-host.js`（CALL 节内，Task 10 之后）
 
 **Interfaces:**
-- Consumes: Task 3 的 `consumeTtsToken`、`loadConfig`(80)、`guideDogRoot`(44)、`subprocess`（pipe 模式，Task 4 验证）、`webServer.register`、`sleep`(41)
+- Consumes: Task 3 的 `consumeTtsToken`、`loadConfig`(80)、`guideDogRoot`(44)、`subprocess`（pipe 模式，Task 4 验证）、`webServer.register`、`sleep`(515)
 - Produces:
   - `splitSentences(text): string[]`（`call.stream.sentenceSplit` 字符集分句 + `maxSentenceChars` 截断）
   - `GET /guide-dog/tts-stream?token=…&sid=…&text=<句>`（URL 编码文本；token 校验 → spawn mmx --stream → `res.write` 管道 → end；异常 terminate）
   - `speechStreamBusy: Map<sessionId, boolean>`（防同会话并发流）
-  - RPC `guide-dog/speech-text`（`{sessionId, text, source}` → host 分句 → 依序为每句生成流 URL 入 `voiceQueue`（带 `stream` 标记），client 播放器识别并改走流式）——**下行主通道定案**：client 播放器对 `stream` 条目发 `GET tts-stream`，对普通条目用 `<audio>` 播放（Phase 1 兼容）
+  - `session/event` 下行触发（**无 speech-text RPC**，2026-08-16 对齐实现）：assistant 消息落地 → 分句 → 依序推 `{stream:true, text}` 条目入 `voiceQueue`（`stream` 标记）——client 播放器识别 `stream` 条目发 `GET tts-stream`，普通条目用 `<audio>` 播放（Phase 1 兼容）；与 Phase 1 语音模式监听器互斥见 Step 3 共存注意
 
 - [ ] **Step 1: 写失败测试（分句纯函数）**
 
@@ -1416,7 +1412,7 @@ console.log('PASS: sentence splitting + maxChars truncation')
 
 - [ ] **Step 2: 运行复现**
 
-Run: `node repro-split.js`
+Run: `node repro/repro-split.js`
 Expected: `PASS: sentence splitting + maxChars truncation`。
 
 - [ ] **Step 3: 实现分句与流式路由（plugin-host.js CALL 节）**
@@ -1522,31 +1518,28 @@ Expected: `PASS: sentence splitting + maxChars truncation`。
     })
 ```
 
-> ⚠️ **URL/URLSearchParams 在 host 沙箱的可用性**：Builtin 列表无 `URL`。**替代**：手写解析 `req.url`（`?` 分割 + `split('&')` + `decodeURIComponent`）。**Step 4 定案**：若沙箱无 `URL`，改为：
+> ⚠️ **与 Phase 1 voice-mode 监听器共存（2026-08-16 新增注意）**：Phase 1 的 `session/event` 监听器（行 1415，VOICE MODE 节）在语音模式生效时也会为同一消息入队 mp3 条目——**通话激活 + 语音模式开启同时成立时会双播**。本 Task 的监听器需在 Phase 1 监听器内加互斥：语音模式监听器入口处，若 `callActiveFlags.get(sid)` 为真（或 a11y 开启）则跳过（流式通道接管）。实现时改 VOICE MODE 节的 listener 首部（行 1415-1421），加一行：`if ((callActiveFlags.get(sid) || false) || (loadConfig().a11y && loadConfig().a11y.enabled)) return`——注意 `callActiveFlags` 在 Task 3 定义（本监听器先注册但回调运行时 Task 3 已执行，模块级 Map 引用安全）。
+
+> ✅ **2026-08-16 修订（静态 bundle）**：host 半跑在 DSH host Node 进程，**`URL`/`URLSearchParams` 全局可用**——直接 `new URL(req.url, 'http://local')` + `searchParams`，无需手写解析。以标准 URL 为准：
 
 ```js
-              const qs = String(req.url || '/').split('?')
-              const params = {}
-              if (qs[1]) qs[1].split('&').forEach(function (kv) {
-                const i = kv.indexOf('='); if (i > 0) { try { params[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1)) } catch (e) { /* ignore */ } }
-              })
-              const token = params.token || ''
-              const sid = params.sid || ''
-              const text = params.text || ''
+              const url = new URL(String(req.url || '/'), 'http://local')
+              const token = url.searchParams.get('token') || ''
+              const sid = url.searchParams.get('sid') || ''
+              const text = url.searchParams.get('text') || ''
 ```
 
-- [ ] **Step 4: 沙箱兼容验证（URL 可用性）**
+- [ ] **Step 4: 语法验证（URL 可用性）**
 
 ```bash
-cd /home/tt-wsl-ubuntu/skills-repo/.superpowers/sdd/2026-08-14-phase1-voice-mode-and-voice-input && node -e "
-// 模拟 host 沙箱 Builtin 集：仅 TextEncoder/TextDecoder/btoa/atob 等
-const sandbox = { TextEncoder: TextEncoder, TextDecoder: TextDecoder, btoa: btoa, atob: atob }
-console.log('URL in sandbox:', typeof URL)
-console.log('fetch in sandbox:', typeof fetch)
-console.log('WebSocket in sandbox:', typeof WebSocket)
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && node -e "
+// 静态 bundle host 半运行于 Node 进程：URL 全局可用
+const u = new URL('/guide-dog/tts-stream?token=abc&sid=s1&text=' + encodeURIComponent('你好'), 'http://local')
+console.log('token:', u.searchParams.get('token'), '| sid:', u.searchParams.get('sid'), '| text:', u.searchParams.get('text'))
+console.log('PASS: URL global available in static bundle host half')
 "
 ```
-Expected: 记录 `typeof URL` 结论；若 `undefined` 用 Step 3 的手写解析（计划默认按手写解析，稳妥）。
+Expected: `PASS`（手写解析 fallback 不再需要）。
 
 - [ ] **Step 5: 语法与提交**
 
@@ -1564,7 +1557,7 @@ git commit -m "feat(phase2): streaming TTS downlink — tts-stream route, senten
 - Modify: `guide-dog-dsh/plugin-client.js`（STREAM PLAYER 节，CALL PANEL 节之后）
 
 **Interfaces:**
-- Consumes: Task 7 的 `callMic`/`setCallState`/`stopCall`、Task 9 的 `notifyConsensusSpeech`、`voiceQueue` 轮询（Phase 1 已有，行 251-261）、`host.call('guide-dog/tts-token')`、`curAudio`（Phase 1 播放器）
+- Consumes: Task 7 的 `callMic`/`setCallState`/`stopCall`、Task 9 的 `notifyConsensusSpeech`、`voiceQueue` 轮询（Phase 1 已有，行 400-410）、`host.call('guide-dog/tts-token')`、`curAudio`（Phase 1 播放器）
 - Produces:
   - `playStreamEntry(entry, sid)`：token 获取 → `fetch('/guide-dog/tts-stream?...')` → `getReader()` 循环 → PCM 累积 → WAV 包装 → `decodeAudioData` → AudioBufferSourceNode 定时队列
   - `stopStreamPlayback()`：abort fetch + 停节点 + 清缓冲（Task 7 `stopCall` 调用）
@@ -1574,7 +1567,7 @@ git commit -m "feat(phase2): streaming TTS downlink — tts-stream route, senten
 - [ ] **Step 1: 写失败测试（WAV 包装纯函数）**
 
 ```js
-// repro-wav.js：PCM s16le → WAV（44 字节头 + 数据）
+// repro/repro-wav.js：PCM s16le → WAV（44 字节头 + 数据）
 function pcmToWav(pcm, sampleRate) {
   const n = pcm.length
   const out = new Uint8Array(44 + n)
@@ -1597,7 +1590,7 @@ console.log('PASS: PCM→WAV wrapper (24kHz s16le mono)')
 
 - [ ] **Step 2: 运行复现**
 
-Run: `node repro-wav.js`
+Run: `node repro/repro-wav.js`
 Expected: `PASS: PCM→WAV wrapper (24kHz s16le mono)`。
 
 - [ ] **Step 3: 实现流式播放器（plugin-client.js）**
@@ -1712,7 +1705,7 @@ Expected: `PASS: PCM→WAV wrapper (24kHz s16le mono)`。
 
 - [ ] **Step 4: 轮询消费识别 stream 条目**
 
-修改 Phase 1 轮询（行 255-259）：`r.entry.url` 分支保留；新增 `r.entry.stream` 分支：
+修改 Phase 1 轮询（行 400-410）：`r.entry.url` 分支保留；新增 `r.entry.stream` 分支：
 
 ```js
                 if (r.entry.url) playEntry(r.entry.url)
@@ -1750,7 +1743,7 @@ git commit -m "feat(phase2): stream player — fetch getReader, PCM→WAV, Web A
 - [ ] **Step 1: 写失败测试（命令匹配纯函数）**
 
 ```js
-// repro-cmds.js
+// repro/repro-cmds.js
 function matchCallCommand(text) {
   const t = String(text || '').replace(/[，。！？\s]/g, '')
   const table = [
@@ -1773,7 +1766,7 @@ console.log('PASS: call command matching')
 
 - [ ] **Step 2: 运行复现**
 
-Run: `node repro-cmds.js`
+Run: `node repro/repro-cmds.js`
 Expected: `PASS: call command matching`。
 
 - [ ] **Step 3: 实现打断接线（plugin-client.js）**
@@ -1956,26 +1949,22 @@ git commit -m "feat(phase2): fault tolerance — heartbeat announcement, stream 
 ### Task 15: 组装部署 + README
 
 **Files:**
-- Modify: `guide-dog-dsh/plugin-source.js`（重生成）、`guide-dog-dsh/README.md`（Phase 2 章节）
+- Modify: `guide-dog-dsh/README.md`（Phase 2 章节）；运行 `deploy/convert_bundle.py` + `deploy/publish.py`（不落 repo）
 
 **Interfaces:**
 - Consumes: 全部 Task 0-14 产物
-- Produces: 可部署的 `plugin-source.js`；README 的 Phase 2 文档（用法/配置/验收）
+- Produces: 可部署的 `bundle/lib/index.js` + `bundle/lib/client.js`（静态 bundle）；README 的 Phase 2 文档（用法/配置/验收）
 
-- [ ] **Step 1: 重生成 plugin-source.js**
+- [ ] **Step 1: 重生成静态 bundle 产物**
 
 ```bash
-cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && node -e "
-const fs = require('fs')
-const host = fs.readFileSync('plugin-host.js', 'utf8')
-const client = fs.readFileSync('plugin-client.js', 'utf8')
-const body = host + '\n// ==== CLIENT HALF ====\n' + client
-const out = '// Guide Dog for DSH — deploy bundle (host + client)\n// Generated from plugin-host.js + plugin-client.js\n' + body + '\n'
-fs.writeFileSync('plugin-source.js', out)
-console.log('plugin-source.js regenerated:', out.length, 'bytes')
-" && node --check plugin-source.js
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh
+node --check plugin-host.js && node --check plugin-client.js
+python3 deploy/convert_bundle.py   # 重生成 bundle/lib/index.js + bundle/lib/client.js
+node --check bundle/lib/index.js && node --check bundle/lib/client.js
+# 一致性校验（publish.py verify_sources）：模板与产物应同步
 ```
-Expected: 重生成成功 + 语法通过。
+Expected: convert 成功 + 双侧语法通过 + 一致性校验通过（`verify_sources` 无 diff）。
 
 - [ ] **Step 2: README Phase 2 章节**
 
@@ -1989,19 +1978,21 @@ Expected: 重生成成功 + 语法通过。
 - [ ] **Step 3: 部署并验证结构**
 
 ```bash
-cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && git add -A && git commit -m "docs(phase2): README call-mode section + regenerated plugin-source.js"
-# cordis_define kind existing（gdog-1）+ cordis_run update；批准后验证：
-curl -s http://127.0.0.1:3080/guide-dog/status | head -5
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && git add -A && git commit -m "docs(phase2): README call-mode section + bundle regeneration"
+# 部署（写 ~/.dsh 需提权）：python3 deploy/publish.py
+# 重启 DSH（bundles 启动时解析，必做）后验证：
+curl -s -X POST http://127.0.0.1:3080/guide-dog/api/guide-dog/get-config -H 'content-type: application/json' -d '{}' | head -c 300
 # 浏览器观察：header 通话按钮、dock 状态条、面板；设置页 call 节
+# 结构探针：cordis_inspect_query（client Slots）确认 guide-dog-call-btn / guide-dog-call-status / guide-dog-call-panel 占用
 ```
-Expected: 部署成功；UI 结构就位。
+Expected: 部署成功；RPC 200；UI 结构就位（Inspect 可见三个新 occupant）。
 
 ---
 
 ### Task 16: Phase 2 验收（spec §6.9 九条）
 
 **Files:**
-- Runtime: 手动验收记录 → `~/.guide-dog/phase2-acceptance.md`（或台账）
+- Runtime: 手动验收记录 → `~/.dsh/guide-dog/.guide-dog/phase2-acceptance.md`（或台账 docs/progress.md）
 
 **Interfaces:**
 - Consumes: 全部已部署功能

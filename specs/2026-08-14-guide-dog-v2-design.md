@@ -1,9 +1,11 @@
 # Guide Dog for DSH v2 — 设计文档
 
-**日期**：2026-08-14（§6/§7 于 2026-08-14 晚按 Phase 1 实施教训与用户裁决全面修订）
-**状态**：已与用户逐节确认（方案 A 单插件演进 + 四节设计 + 3 处契约修正）；Phase 2/3 修订版已确认
-**插件**：`gdog-1`（动态 Cordis 插件，host/client 双半）
+**日期**：2026-08-14（§6/§7 于 2026-08-14 晚按 Phase 1 实施教训与用户裁决全面修订；§3/§4/§6/§8 于 2026-08-16 按静态 bundle 架构升级修订）
+**状态**：已与用户逐节确认（方案 A 单插件演进 + 四节设计 + 3 处契约修正）；Phase 2/3 修订版已确认；**2026-08-16 架构升级为静态 web-profile bundle（v11 全链路验证通过）**
+**插件**：`dsh-guide-dog`（静态 web-profile bundle，host/client 双半，**全局单实例**；替代动态插件 + autoloader，无批准弹窗、无 per-session `gdog-*` 副本）
 **范围**：语音模式硬化（硬指标）、语音输入、通话模式、无障碍模式
+
+**架构升级说明（2026-08-16，v8-v11）**：交付形态从"动态 Cordis 插件（`cordis_define`/`cordis_run`，每会话一个 `gdog-*` 实例，需批准）"改为"**静态 web-profile bundle**"——`bundle/lib/index.js`（host，ESM `name`/`apply`/`inject`）+ `bundle/lib/client.js`（client，`window.__ModuleLoader__.load({id, factory})`），挂载于 `~/.dsh/profiles/web`（依赖 link + `bundles` 条目 + node_modules symlink），DSH 重启随 profile 自动加载。源码真源仍是 `plugin-host.js`/`plugin-client.js`（动态格式 `return { apply(ctx) {...} }`），`deploy/convert_bundle.py` 将其转换为静态格式。**本文档所有"契约/路径/部署"描述均已按静态 bundle 版本修订**；动态插件时代的历史记录见 `docs/progress.md` v1-v7。
 
 **Phase 2/3 修订总纲（2026-08-14 晚，基于 Phase 1 实施教训）**：
 
@@ -38,7 +40,7 @@ Guide Dog for DSH（导盲犬，由 MiniMax 驱动）是 DSH Web GUI 的多模�
 Phase 之间独立验收；Phase 3 依赖 Phase 2 的语音通道、流式 TTS 与共识优先机制。每个 Phase 产出一份独立实施计划（writing-plans），本 spec 是总设计。
 
 **明确不做（Out of scope）**：
-- 持久化安装（host composition 装进 `~/.dsh/profiles/web/cordis.patch.yml`）——既定后续工作，不在本 spec。
+- ~~持久化安装~~ → **已由静态 bundle 完成**（2026-08-16：挂载于 `~/.dsh/profiles/web`，DSH 重启自动加载，见 §3 架构升级说明）。
 - 语音克隆 / 自定义音色训练。
 - 用户屏幕共享（getDisplayMedia）——隐私与授权弹窗对视障用户不友好；后续可选扩展。
 - agent 代浏览任意网页并截图——DSH 无浏览器自动化服务，无通道。
@@ -52,38 +54,48 @@ Phase 之间独立验收；Phase 3 依赖 Phase 2 的语音通道、流式 TTS �
 
 ## 3. 总体架构
 
-**方案 A：单插件演进**。`gdog-1` 保持唯一插件；host 按关注点分节组织，client 按特性分组件。
+**方案 A：单插件演进**。`dsh-guide-dog` 保持唯一插件（静态 bundle，全局单实例）；host 按关注点分节组织，client 按特性分组件。
 
 ```
-gdog-1 (pluginId)
-├── Host 半（Node.js，rootCtx）
-│   ├── config   —— ~/.guide-dog/config.json 读写（原子写：临时文件+rename，权限 600）
-│   ├── tts      —— 现有 mmx TTS 管线 + 媒体库（~/.guide-dog/media/，复用 v1）
+dsh-guide-dog (静态 web-profile bundle)
+├── Host 半（bundle/lib/index.js，ESM：name/apply/inject）
+│   ├── inject    —— export const inject = [shell, fs, webServer, sandboxPolicy, systemPrompt, subprocess, timer, tools]
+│   │               （Cordis 服务齐备后才调 apply；无 inject 则 apply 早跑、ctx.get 全 undefined——v9 根因）
+│   ├── 兼容层    —— 替代动态沙箱 harness：defineTool（JSON Schema 归一化）/ registerTool（→ tools.register 全局注册，
+│   │               每会话可见）/ handle（→ webServer JSON POST 路由 /guide-dog/api/<name>）
+│   ├── config   —— ~/.dsh/guide-dog/.guide-dog/config.json 读写（GLOBAL_ROOT = homedir()+'/.dsh/guide-dog'；
+│   │               原子写：临时文件+rename，权限 600）
+│   ├── tts      —— 现有 mmx TTS 管线 + 媒体库（~/.dsh/guide-dog/.guide-dog/media/，复用 v1）
 │   ├── stt      —— faster-whisper 转写（Phase 1 起），MiniMax ASR 可配置备选
 │   ├── stream   —— /guide-dog/tts-stream chunked 流式 TTS（Phase 2 起，mmx --stream）
 │   ├── consensus —— tools/pre-execute 写操作拦截 + 语音摘要 + 打断窗口（Phase 2 起）
 │   ├── tools    —— v1 九个工具 + 语音相关新工具（见 §5.5）
-│   └── rpc      —— harness.handle 私有方法（speak / transcribe / config / tts-stream-token / describe-screen / list-media / voices / auth-status）
-└── Client 半（浏览器 SPA）
-    ├── voiceMode —— turnTail 自动发声钩子 + dock 状态徽章
-    ├── micInput  —— composer 麦克风按钮
+│   └── rpc      —— 兼容层 handle 注册的 JSON POST 路由（speak / transcribe / config / tts-token /
+│                   describe-screen / list-media / voices / auth-status / voice-queue）
+└── Client 半（bundle/lib/client.js，window.__ModuleLoader__.load({id:'dsh-guide-dog', factory})）
+    ├── 兼容层    —— require('react')（平台 seed）、自建 <style> 标签替代沙箱 styles、host.call → fetch JSON POST
+    ├── inject    —— 插件对象 inject: ['slots']（client Loader 支持插件级 inject；better-sidebar 先例）
+    ├── voiceMode —— host 事件驱动自动发声 + 轮询 voice-queue + toast（Phase 1 已验证）
+    ├── micInput  —— composer 麦克风按钮（输入框左下角群组，含实时预览/简体/音量指示）
     ├── callPanel —— 通话面板（shell.overlay）+ 状态条（dock）+ 发起按钮（header action）
     └── a11yBar   —— 无障碍面板（shell.overlay）+ 截图描述流程
 ```
 
-**已验证的 API 契约（2026-08-14 实测）**：
+**已验证的 API 契约（2026-08-14 实测；2026-08-16 按静态 bundle 修订）**：
 
 | 用途 | 契约 | 要点 |
 |---|---|---|
 | 自动发声数据源（v2 裁决） | host `session/event`（post-commit 追加流）+ `sessionQuery.readSession` | 消息事件含回复文本（与渲染同一内容）；client 轮询 `guide-dog/voice-queue` 播放（`timerSvc.interval` 已确认可用） |
 | 麦克风按钮 | `conversation.input.left`（list） | 群组 `guide-dog-voice`（order 30），Phase 1 已落地 |
-| 语音模式徽章/通话状态条 | `conversation.input.dock`（list） | 现有占用 order 0/10/20 → 本插件用 **30** |
+| 语音模式徽章/通话状态条 | `conversation.input.dock`（list） | 现有占用 order 0/10/20 → 本插件用 **30**（语音徽章已并入 input.left 群组，dock 留给通话状态条） |
 | 通话发起按钮 | `conversation.session.header.actions`（list） | 现有占用 -10/10/20 → 本插件用 **30** |
 | 通话/无障碍悬浮面板 | `shell.overlay`（list） | 默认 click-through，条目自行 opt-in 指针事件 |
 | 下行流式 TTS | `webServer.register` 路由 handler `(req, res)` | handler 持原生 `res`，可 `res.write` 增量写（源码确认 "may hold the response open, e.g. SSE"）；**无需 WebSocket** |
 | 写操作拦截 | `tools/pre-execute`（waterfall） | 通话/a11y 模式下拦截写类工具，返回 `needs_voice_confirmation` 待语音共识 |
 | 进度播报数据源 | host 事件 | `agent/status`、`tools/result`、`session/event`（持久化事件追加流，含消息落地）、`agent/error` 均存在且按 agent 作用域 emit |
-| RPC / 工具 | `harness.handle` / `harness.defineTool` / `harness.registerTool` | v1 已验证 |
+| RPC（静态 bundle） | 兼容层 `harness.handle(name, handler)` → `webServer.register` JSON POST 路由 `/guide-dog/api/<name>` | 逻辑名仍为 `guide-dog/*`（如 `guide-dog/get-config`），**物理 URL 为 `/guide-dog/api/guide-dog/get-config`（name 自带前缀 + 兼容层前缀，双前缀）**；client `host.call(name)` → 同源 fetch POST 同一 URL（v11 实测 200） |
+| 工具（静态 bundle） | 兼容层 `harness.defineTool`/`registerTool` → `tools.register` | **全局注册**：注册在 `tools` 服务（profile 级），每会话可见；`defineTool` 把 value-schema DSL（per-property `required:true`）归一化为标准 JSON Schema（v10 根因：JsonSchemaError） |
+| 插件加载（静态 bundle） | host：`export {name, apply, inject}`；client：`window.__ModuleLoader__.load({id, factory})` | **host 必须 `export inject` 服务列表**（Cordis 等齐服务才 apply，v9 根因）；client 插件对象声明 `inject: ['slots']`；`require('react')` 为平台 seed 词，可手写、无需构建链（better-sidebar 同款） |
 | 提示词注入 | `systemPrompt.section` + `systemPrompt.variable` | 会话级变量 provider 读配置返回当前状态文本 |
 | 设置页 | `settings.section`（id `guide-dog`，order 30） | v1 已有，扩展 |
 
@@ -91,13 +103,13 @@ gdog-1 (pluginId)
 1. 通话回合的用户消息提交**不走 `apiProxy.respond`**（那是传输层回执，不是消息注入入口）；改由 **client 端 `inputActions` 填框+提交**，与语音输入共用同一路径。
 2. ~~WS 安全~~ → 流式 TTS 安全：**Origin 严格白名单 + 每会话一次性令牌**（host 签发、5 分钟有效、单连接消费），与初稿 WS 令牌同一思路，套在 `tts-stream` URL 上。
 3. 无障碍自动截图触发点：**`tools/result`**（工具完成）而非静默期探测。
-4. **传输层改零 WebSocket**：host 沙箱无 socket API/WebSocket 全局（仅 `web.fetch`/`subprocess`），无法直连 MiniMax T2A WS；`mmx speech synthesize --stream`（实测首字节 600ms）+ chunked HTTP 流覆盖下行，整段 POST 覆盖上行。
+4. **传输层改零 WebSocket**：`mmx speech synthesize --stream`（实测首字节 600ms）+ chunked HTTP 流覆盖下行，整段 POST 覆盖上行。（2026-08-16 注：静态 bundle host 半跑在 DSH host Node 进程、非动态沙箱，理论上 Node 22+ 自带 WebSocket 客户端全局——但零 WS 决策不变：chunked HTTP 已实测达标、无新协议面、浏览器/CLI 双端复用同一管线。）
 
 ---
 
 ## 4. 配置模型
 
-文件：`~/.guide-dog/config.json`（workspaceRoot = `$HOME`，与媒体库同根）。host 启动时加载到内存，写操作走原子写。client 通过 RPC `guide-dog/get-config` / `guide-dog/set-config` 读写。
+文件：`~/.dsh/guide-dog/.guide-dog/config.json`（**GLOBAL_ROOT = `homedir() + '/.dsh/guide-dog'`**，与媒体库同根；v8 起不再用 workspaceRoot/sandboxPolicy 推导——静态 bundle 全局单实例，root 恒定）。host 启动时加载到内存，写操作走原子写。client 通过 RPC `guide-dog/get-config` / `guide-dog/set-config` 读写（物理 URL：`POST /guide-dog/api/guide-dog/get-config` 等）。
 
 ```jsonc
 {
@@ -165,7 +177,7 @@ gdog-1 (pluginId)
 > 实施期探测证实：client 的 `useSession()` 快照为 Proxy/类实例（`Object.keys` 为空，`messages/turns/nodes` 均 undefined），`turnTail` 的 owner.turn 亦无消息文本字段——client 侧无法可靠提取回复文本。故机制改为 host 事件驱动（三条硬指标不变）：
 
 - host 监听 `session/event`（post-commit 追加流）：命中 assistant 消息事件且该会话语音模式生效时，从事件消息内容提取文本（与对话渲染的同一份内容）→ 去重（`spokenTurns`，sessionId+seq）→ `speakImpl({text, sessionId, turnSeq, source:'voice-mode'})` → 成功入队 `voiceQueue[sessionId]`（含 url/key），失败入队错误项。
-- client 在输入框左下角 VOICE 群组内以 `timerSvc.interval`（1s）轮询 RPC `guide-dog/voice-queue`（带 sessionId，host 弹出即交付一次）→ 模块级 `Audio` 播放 / 错误项显示失败 + 提示音。
+- client 在输入框左下角 VOICE 群组内以 `timerSvc.interval`（1s）轮询 RPC `guide-dog/voice-queue`（带 sessionId，host 弹出即交付一次）→ 模块级 `Audio` 播放 / 错误项显示失败 + 提示音。（静态 bundle 下 RPC 物理路径 `POST /guide-dog/api/guide-dog/voice-queue`，client `host.call` 兼容层自动拼接，代码内逻辑名不变。）
 - **去重**：host 级 `Map<sessionId, Set<seq>>` 双保险（speakImpl 内已有）；队列弹出即消费，不重复播放。
 - **播放（会话级语义，v2.1 用户裁决）**：client 以模块级 `Audio` 对象播放（轮询在会话组件内，播放本身脱离会话组件生命周期）——**切换会话不重播、不中断**：正在播放的音频自然播到结束；仅当出现新的播放任务（任一会话的新队列条目）时才覆盖当前播放。播放结束/失败/被浏览器阻止均清理并显示错误（绝不静默）。
 - **失败反馈**：speakImpl 失败 → 队列错误项（error code + message）→ client 播放失败提示音（beep RPC data-URI）+ 右下角 toast 显示"朗读失败：<原因>"（约 6 秒自动消失）；尝试次数 ≤2，不重试循环。
@@ -182,7 +194,7 @@ gdog-1 (pluginId)
 - 流程：
   1. 点击开始录音：`getUserMedia({audio: true})` + `MediaRecorder`（优先 `audio/webm;codecs=opus`；后续可升级 AudioWorklet 裸 PCM 直采以省编解码），按钮进入红色脉冲态并计时（上限 `voiceInput.maxSeconds`，到时自动停止）。按钮旁提供语言三档开关（自动/中文/英文，映射 `voiceInput.language`）。
   2. 停止 → `blob → arrayBuffer → base64` → `host.call('guide-dog/transcribe', { audioB64, mime, sessionId, language })`。
-  3. host：base64 解码 → 临时文件 `~/.guide-dog/tmp/rec-<ts>.webm` → STT（§5.3）→ 返回 `{ ok, text, language, durationMs }`；成功后删除临时文件。
+  3. host：base64 解码 → 临时文件 `~/.dsh/guide-dog/.guide-dog/tmp/rec-<ts>.webm` → STT（§5.3）→ 返回 `{ ok, text, language, durationMs }`；成功后删除临时文件。
   4. client：文本插入 composer——`inputActions` 追加/设置文本并聚焦（具体方法名以实施期核实的 `InputActions` 契约为准）；`autoSend=false`（默认）仅插入，用户编辑后发送；`autoSend=true` 插入后立即提交。
 - 状态机：`idle → recording → transcribing → idle | error`。录音中再次点击 = 停止；错误态：麦克风权限拒绝（徽章+提示"请在浏览器设置中允许麦克风"）、识别为空（"没听清，请再说一次"，语音模式开启时口播）、STT 引擎不可用（提示安装指引，见 §5.3）。延迟预算：松键后 2–4s 出字（≤15s 音频 + faster-whisper CPU 1.5–2.5s）属正常。
 - 隐私：whisper 引擎下音频只写临时文件、用后即删，不出本机；minimax 引擎下音频上云，config 中明示（§9）。
@@ -192,7 +204,7 @@ gdog-1 (pluginId)
 调研结论（2026-08，官方文档核实）：MiniMax **只有 TTS**（HTTP + WebSocket），**无公开 ASR/STT、无 realtime 语音 API、无 asr-01 模型**（官方同传 demo 的语音识别用的是 Whisper）。因此 STT 必须本地或浏览器侧。
 
 - 首选 **whisper**（faster-whisper）：host 启动时探测 `python3 -c "import faster_whisper"`；缺失时 RPC 返回 `engine_unavailable` + 安装指引（`pip install faster-whisper`），设置页显示探测状态与一键指引。15s 音频 CPU int8 转写约 1.5–2.5s。
-- 转写调用：`subprocess` 服务 spawn `python3 <plugin 内置脚本> --model small --output json`（脚本由 host 在首次启动时通过 fs 服务写入 `~/.guide-dog/scripts/whisper_transcribe.py`，输入路径、输出 `{text, language, durationMs}` JSON）。模型 `base`/`small` 可配置；语言取 `voiceInput.language`（`auto` 时逐窗口自动检测，zh/en 短句偶有误判→三档开关兜底）。
+- 转写调用：`subprocess` 服务 spawn `python3 <plugin 内置脚本> --model small --output json`（脚本由 host 在首次启动时通过 fs 服务写入 `~/.dsh/guide-dog/.guide-dog/scripts/whisper_transcribe.py`，输入路径、输出 `{text, language, durationMs}` JSON）。模型 `base`/`small` 可配置；语言取 `voiceInput.language`（`auto` 时逐窗口自动检测，zh/en 短句偶有误判→三档开关兜底）。
 - 增强 **sherpa**（`engine: "sherpa"`）：sherpa-onnx（Zipformer 中英流式 / SenseVoice 中文·粤·日·韩 VAD+ASR 一体，官方有浏览器 WASM 演示）——通话模式升级路径（§6.3），语音输入也可选。
 - **降级（Phase 1 决策）**：本地引擎缺失时，语音输入回退为 **host 托管录音页**（`/guide-dog/recorder`，独立页面 MediaRecorder → 上传转写，仍走本地 whisper）——浏览器沙箱限制下也保证可用；Web Speech API（浏览器→云端识别、Chrome 系、不可控）列为后续可选降级，Phase 1 不实现。
 - 保留位 **minimax**：MiniMax 发布公开 ASR 端点后启用（config 已留位）。
@@ -200,10 +212,10 @@ gdog-1 (pluginId)
 
 ### 5.4 Phase 1 验收
 
-1. **硬指标 1**：语音模式开启后，构造一次"模型未调用任何 speak 类工具"的回复——回复落地自动发声（观察 dock 徽章与音频播放），证明与工具调用解耦。
+1. **硬指标 1**：语音模式开启后，构造一次"模型未调用任何 speak 类工具"的回复——回复落地自动发声（观察 VOICE 群组小喇叭状态与音频播放），证明与工具调用解耦。
 2. **硬指标 2**：语音模式开启，输出含 markdown 的回复——朗读内容与可见文本语义一致（代码块/URL 按规则剥离）；关闭时无自动发声。
-3. **硬指标 3**：临时断网/伪造 TTS 失败——播放失败提示音、dock 徽章显示失败原因、不静默。
-4. 两层设置：全局默认关→会话开→新会话恢复默认；徽章显示正确。
+3. **硬指标 3**：临时断网/伪造 TTS 失败——播放失败提示音、右下角 toast 显示失败原因、不静默。
+4. 两层设置：全局默认关→会话开→新会话恢复默认；小喇叭状态显示正确。
 5. 语音输入：录音→识别→插入输入框（未自动发送）→编辑→发送成功；自动发送开关生效；权限拒绝与空识别错误路径可见。
 
 ---
@@ -216,16 +228,16 @@ gdog-1 (pluginId)
 
 - `conversation.session.header.actions`（order 30，id `guide-dog-call`）：通话开关按钮。
 - `shell.overlay`（id `guide-dog-call-panel`）：通话面板——状态行（收听中/处理中/播报中）、**模式开关（VAD 自动 ↔ 按住说话）**、静音、语速调节、挂断。
-- `conversation.input.dock`（order 31，id `guide-dog-call-status`）：通话状态条（简短，供语音模式徽章旁并排）。
+- `conversation.input.dock`（order 31，id `guide-dog-call-status`）：通话状态条（简短，供语音模式小喇叭旁并排）。
 - 会话切换语义沿用 v2.1 裁决：播放继续不重播；**录音中切会话 → 丢弃当前片段不误提交**（防 M9 类陈旧闭包）。
 
 ### 6.2 双通道（零 WebSocket）
 
-**为什么放弃 WebSocket**：host 沙箱内置符号仅 `ctx/harness/console/btoa/atob/TextEncoder/TextDecoder`——无 socket API、无 WebSocket 全局（实测 Inspect）；`web.fetch` 仅 HTTP、`subprocess` 只能 spawn CLI，**host 无法直连 `wss://api.minimax.io`**（spec 初稿 §6.5 主通道不可行）。同时 `WebRoute.handler = (req, res)` 持原生 node:http 对象（源码确认 "may hold the response open, e.g. SSE"），`res.write` 增量写即 chunked 流——下行流式无需任何新协议。
+**为什么放弃 WebSocket**：动态沙箱时代 host 内置符号仅 `ctx/harness/console/btoa/atob/TextEncoder/TextDecoder`——无 socket API、无 WebSocket 全局；`web.fetch` 仅 HTTP、`subprocess` 只能 spawn CLI，**host 无法直连 `wss://api.minimax.io`**（spec 初稿 §6.5 主通道不可行）。2026-08-16 静态 bundle 后 host 半跑在 DSH host Node 进程（非沙箱），Node 22+ 自带 WebSocket 客户端——但**零 WS 决策不变**：① `mmx speech synthesize --stream`（实测首字节 600ms）已达标，chunked HTTP 无新协议面；② `WebRoute.handler = (req, res)` 持原生 node:http 对象（源码确认 "may hold the response open, e.g. SSE"），`res.write` 增量写即 chunked 流，浏览器/CLI 双端复用同一管线；③ 避免 host 侧 WS 客户端生命周期（重连/心跳/代理）全部自研的新失败面。
 
 - **上行（client→host，回合制）**：录音整段 → `POST /guide-dog/call-transcribe`（webm/opus，≤20MB，复用 Phase 1 `transcribeImpl` 与 whisper 管线）→ `{ok, text, language}`。与 Phase 1 麦克风完全同管线，无新协议。
-- **下行（host→client，流式）**：`GET /guide-dog/tts-stream?id=<seg>&token=…` → host 按句 spawn `mmx speech synthesize --stream --format pcm --sample-rate 24000`，stdout 管道增量喂 `res.write` → client `fetch().body.getReader()` 读流 → Web Audio 无缝调度播放。
-- **安全**：① Origin 白名单（host 侧比对 `Origin` 头）；② 每会话一次性 token（`host.call('guide-dog/tts-token', {sessionId})` 签发，5 分钟有效、单连接消费、host 内存保存——初稿 WS 令牌同一思路，套在 URL 上）；③ 流句 id 必须属于该会话。
+- **下行（host→client，流式）**：`GET /guide-dog/tts-stream?token=…&sid=…&text=<句>` → host 按句 spawn `mmx speech synthesize --stream --format pcm --sample-rate 24000`，stdout 管道增量喂 `res.write` → client `fetch().body.getReader()` 读流 → Web Audio 无缝调度播放。
+- **安全**：① Origin 白名单（host 侧比对 `Origin` 头）；② 每会话一次性 token（`host.call('guide-dog/tts-token', {sessionId})` 签发，5 分钟有效、单连接消费、host 内存保存——初稿 WS 令牌同一思路，套在 URL 上）；③ 流句文本必须属于该会话（token 绑定 sessionId）。
 - **失败兜底（若 chunked 流实测不可靠）**：降级为逐句 mp3 文件 + `voiceQueue` 轮询播放（Phase 1 已验证模式）；以"首音频延迟 <1.5s、播放间隙 <400ms"为判据选择。
 
 ### 6.3 回合循环
@@ -356,7 +368,7 @@ consent 已就绪（或刚确认）
 ### 7.2 截图 → 描述 → 播报
 
 - 入口：`shell.overlay`（id `guide-dog-a11y-panel`）控制面板 + 语音命令（"看看屏幕"）+ 设置页开关。
-- **捕获（本地，无第三方依赖）**：主选 `foreignObject` 方案——`<svg><foreignObject>` 序列化 `document.documentElement` **视口** → canvas → **JPEG** base64（修订：原 PNG 在 4K 屏可达 8MB+，JPEG q0.8 + maxWidth 1600px 约 200–500KB，GUI 无透明需求；同源媒体不产生 canvas 污染）；备选：host 首次运行时经 `web.fetch` 下载固定版本 html2canvas UMD 到 `~/.guide-dog/lib/`，经 `/guide-dog/lib/` 同源托管，client `<script>` 加载（渲染保真度不足时启用）。不做全页滚动拼接（视障用户以当前视口为上下文）。
+- **捕获（本地，无第三方依赖）**：主选 `foreignObject` 方案——`<svg><foreignObject>` 序列化 `document.documentElement` **视口** → canvas → **JPEG** base64（修订：原 PNG 在 4K 屏可达 8MB+，JPEG q0.8 + maxWidth 1600px 约 200–500KB，GUI 无透明需求；同源媒体不产生 canvas 污染）；备选：host 首次运行时经 `web.fetch` 下载固定版本 html2canvas UMD 到 `~/.dsh/guide-dog/.guide-dog/lib/`，经 `/guide-dog/lib/` 同源托管，client `<script>` 加载（渲染保真度不足时启用）。不做全页滚动拼接（视障用户以当前视口为上下文）。
 - 调研对照：html2canvas 零权限但保真度低（复杂 CSS/WebGL 丢失、跨域资源污染需代理）；CDP `Page.captureScreenshot` 像素级但需浏览器自动化（DSH 无此服务，out of scope）；`getDisplayMedia` 真实屏幕需授权（out of scope）。
 - **描述**：`host.call('guide-dog/describe-screen', { imageB64, mode })`（优先 RPC——Phase 1 已验证 20MB 级 base64 RPC；若实测受限退 `POST /guide-dog/describe-upload`）→ host 调 MiniMax vision（复用 v1 `guide_dog_inspect` 管线）→ 返回结构化文本。三种模式：
   - `summary`：1–2 句概要——界面在做什么、关键状态、有无错误/新内容。
@@ -366,7 +378,7 @@ consent 已就绪（或刚确认）
 - **播报**：结果经 TTS 管线朗读；`summaryFirst=true` 时默认只播概要，"详细/继续"才展开。
 - **自动触发**：`a11y.autoNarrate=true` 时，host 监听 `tools/result`（本会话）→ 仅**界面改变类工具**入队列：`bash / write / edit / web_search / guide_dog_image / guide_dog_video / guide_dog_music`（read/grep/glob/skill 等静默，防轰炸）→ 防抖 3s + 节流 10s → `a11yQueue[sessionId]`（与 voiceQueue 同款轮询模式，client 1s 轮询）→ client 截屏 → describe（summary 模式）→ 播报。
 - **生成媒体自动描述**：`guide_dog_image/video/music` 完成后，除界面概要外追加一句对生成物的 vision 描述（§7.3-2 的"拒绝纯视觉信息"落地，复用 `guide_dog_inspect` focus 逻辑）。
-- **历史**：描述文本存入 `~/.guide-dog/a11y-history/`（纯文本 md，**不存截图**）。
+- **历史**：描述文本存入 `~/.dsh/guide-dog/.guide-dog/a11y-history/`（纯文本 md，**不存截图**）。
 - **本地降级**：`a11y.visionCloud=false` 时不上云——client 本地提取可见文本（text nodes + `aria-label` + role）按 DOM 顺序拼接 → 截断 2000 字符 → 作为概要直接播报；"详细/按顺序播报"降级为同一文本概要，面板注明"本地模式"。
 
 ### 7.3 人文关怀硬约束（需求级，验收项）
@@ -405,7 +417,7 @@ consent 已就绪（或刚确认）
 1. "看看屏幕"：截图→vision 描述→播报，summary/detailed/ordered 三模式。
 2. 自动播报：agent 完成一个工具步骤（界面改变类）后 10s 内自动播报界面概要（节流/防抖验证）。
 3. 纯语音完成任务：全程不碰键盘鼠标，语音指示 agent 完成一个多步任务（如"生成一张图并描述它"），破坏性操作出现语音确认（共识拦截器证据）。
-4. 隐私：`visionCloud=false` 时断网仍可本地文本概要；`~/.guide-dog/a11y-history/` 无图片文件。
+4. 隐私：`visionCloud=false` 时断网仍可本地文本概要；`~/.dsh/guide-dog/.guide-dog/a11y-history/` 无图片文件。
 5. 节奏命令与打断在无障碍模式下全部生效。
 6. 联动矩阵：a11y 开启时即使 `voiceMode.default=false` 也自动朗读；通话面板常驻。
 7. 约束注入：`guide_dog_a11y_constraints` / `guide_dog_call_consensus` 变量随每次模型调用注入（可在会话日志/提示词装配中验证）。
@@ -416,8 +428,8 @@ consent 已就绪（或刚确认）
 
 ### 8.1 媒体与文件
 
-- 复用 v1 媒体库（`~/.guide-dog/media/` + `.index.json` + `/guide-dog/media` 路由）。
-- 新增目录：`~/.guide-dog/tmp/`（录音临时文件，用后即删）、`~/.guide-dog/scripts/`（whisper 转写脚本，host 启动时写入）、`~/.guide-dog/lib/`（html2canvas 备选库）、`~/.guide-dog/a11y-history/`（纯文本）。
+- 复用 v1 媒体库（`~/.dsh/guide-dog/.guide-dog/media/` + `.index.json` + `/guide-dog/media` 路由）。
+- 新增目录（全部在 GLOBAL_ROOT = `~/.dsh/guide-dog` 下）：`~/.dsh/guide-dog/.guide-dog/tmp/`（录音临时文件，用后即删）、`~/.dsh/guide-dog/.guide-dog/scripts/`（whisper 转写脚本，host 启动时写入）、`~/.dsh/guide-dog/.guide-dog/lib/`（html2canvas 备选库）、`~/.dsh/guide-dog/.guide-dog/a11y-history/`（纯文本）、`~/.dsh/guide-dog/.guide-dog/models/`（faster-whisper 模型缓存，v1 起）。
 - 大小上限：transcribe 音频 ≤20MB；describe-screen 图片 ≤8MB。
 
 ### 8.2 安全与隐私
@@ -431,7 +443,7 @@ consent 已就绪（或刚确认）
 
 ### 8.3 错误码（统一枚举）
 
-`bad_args / tts_failed / tts_timeout / stt_failed / stt_timeout / engine_unavailable / mic_denied / empty_speech / ws_rejected / ws_lost / vision_failed / config_write_failed / needs_voice_confirmation / stream_interrupted`——client 统一映射为提示音 + 文案 + （语音模式开启时）口播。
+`bad_args / tts_failed / tts_timeout / stt_failed / stt_timeout / engine_unavailable / mic_denied / empty_speech / stream_rejected / stream_interrupted / vision_failed / config_write_failed / needs_voice_confirmation / aborted_by_user / consensus_failed`——client 统一映射为提示音 + 文案 + （语音模式开启时）口播。**零 WS 决策下不再有 `ws_rejected`/`ws_lost`**：流安全拒绝用 `stream_rejected`（token/Origin 校验失败），流中断用 `stream_interrupted`。
 
 ### 8.4 设置页扩展（settings.section `guide-dog`）
 
@@ -441,8 +453,10 @@ consent 已就绪（或刚确认）
 
 ## 9. 实施顺序与依赖
 
-1. **Phase 1-A 语音模式**：config 层 → speak RPC 扩展（source/dedup/失败码）→ turnTail 钩子 → dock 徽章 → systemPrompt.variable。✅ 已完成（2026-08-14）
-2. **Phase 1-B 语音输入**：transcribe RPC + whisper 脚本 → mic 按钮 → inputActions 插入 → 错误路径。✅ 已完成（2026-08-14）
+> **部署与验证流程（2026-08-16 静态 bundle 定案）**：每个 Phase 的代码改动都落在真源 `plugin-host.js`/`plugin-client.js` → `python3 deploy/convert_bundle.py`（重生成 `bundle/lib/`）→ `python3 deploy/publish.py`（同步 `~/.dsh/dsh-guide-dog` + 幂等注册 web profile）→ **重启 DSH**（bundles 启动时解析，重启必做）→ 按验收清单验证。无 cordis_define/cordis_run、无批准弹窗。阶段性验证用 `cordis_inspect_query`（client Slots / host Tool 只读探针）与 curl RPC 路由。
+
+1. **Phase 1-A 语音模式**：config 层 → speak RPC 扩展（source/dedup/失败码）→ host 事件驱动自动发声 → input.left 群组 → systemPrompt.variable。✅ 已完成（2026-08-14，v6/v11 验证）
+2. **Phase 1-B 语音输入**：transcribe RPC + whisper 脚本 → mic 按钮（含实时预览/音量指示）→ inputActions 插入 → 错误路径。✅ 已完成（2026-08-14，v6/v11 验证）
 3. **Phase 2（技术债前置）**：M9（录音 onstop 陈旧闭包）/ M10（媒体路由 range 流式化）/ M11（会话 override 并发覆盖）→ call 配置 + 面板/状态条/发起按钮 → 上行（VAD/PTT + 转写 + 提交）→ **共识优先拦截器**（tools/pre-execute + 摘要 + 窗口）→ 进度播报 → 下行流式 TTS（mmx --stream + chunked 路由 + Web Audio）→ 打断 → 语音命令 → 容错 → §6.9 验收。
 4. **Phase 3**：a11y 联动矩阵 → 捕获管线（foreignObject JPEG）→ describe-screen RPC → 播报三模式 → 自动触发（tools/result 白名单 + 防抖/节流）→ 共识拦截器扩大 → 人文关怀约束（prompt + 语音命令）→ 本地降级 → §7.5 验收。
 
@@ -456,7 +470,7 @@ consent 已就绪（或刚确认）
 
 | 主题 | 结论 | 本 spec 采纳 |
 |---|---|---|
-| 通话框架 | LiveKit Agents + agent-starter-react 最完整（WebRTC 全栈）；Pipecat（WS 传输 + 浏览器 web-vad）更贴合 DSH（主机 Node 即 agent，浏览器 WS 直连） | 不引框架，抄参数体系与打断协议；**传输层零 WS**（§6.2：host 沙箱无 socket API，改 chunked HTTP 流 + 整段 POST） |
+| 通话框架 | LiveKit Agents + agent-starter-react 最完整（WebRTC 全栈）；Pipecat（WS 传输 + 浏览器 web-vad）更贴合 DSH（主机 Node 即 agent，浏览器 WS 直连） | 不引框架，抄参数体系与打断协议；**传输层零 WS**（§6.2：mmx --stream + chunked HTTP 流 + 整段 POST，无新协议面） |
 | 打断 | Pipecat InterruptionFrame：停播 → 取消 LLM 在途生成 → 清 TTS 缓冲 → 冲刷未播音频，一个音频写周期内静音 | §6.6（abort fetch + 终止 mmx 进程） |
 | 轮转 | LiveKit 5 种轮转模式；endpointing 静默 0.5–3s；preemptive generation（话毕即生成） | §6.3/§6.5（句间预合成） |
 | VAD | 浏览器跑 Silero（web-vad / ricky0123，AudioWorklet）；Ultravox 分层 VAD（32ms 粗检 + 神经 VAD）+ 打断最短 90ms | §6.3（energy → silero 升级路径） |
@@ -465,6 +479,6 @@ consent 已就绪（或刚确认）
 | 无障碍 UX | Be My AI（拍照问答+分层回答）、Seeing AI（结构化通道）vs Lookout（连续反馈）；WCAG 1.4.1/3.3.4；ARIA Disclosure；PaliGemma screen2words | §7.3 |
 | 共识优先 | grill-me（Matt Pocock）：设计树 + 前沿轮询 + 事实/决策分离 + **确认门（共识前不行动）** | §6.7（语音版裁剪：每轮 1–3 问、机制层 tools/pre-execute 拦截 + 摘要 + 打断窗口） |
 | 截图 | html2canvas/dom-to-image 零权限低保真；CDP 像素级（DSH 无，out of scope）；getDisplayMedia（out of scope） | §7.2（foreignObject 主选 + html2canvas 备选，JPEG 视口捕获） |
-| MiniMax 音频 | **仅 TTS**：WS `wss://api.minimax.io/ws/v1/t2a_v2` 与 HTTP `POST /v1/t2a_v2`；**`mmx speech synthesize --stream`（实测首字节 600ms，pcm/flac/wav/opus 格式）**；模型 speech-2.8/2.6/02/01 系列；**无公开 ASR / 无 realtime API / 无 asr-01** | §5.3（STT 必须本地）/§6.5（mmx --stream 主通道；T2A WS 因 host 无 socket 能力弃用） |
+| MiniMax 音频 | **仅 TTS**：WS `wss://api.minimax.io/ws/v1/t2a_v2` 与 HTTP `POST /v1/t2a_v2`；**`mmx speech synthesize --stream`（实测首字节 600ms，pcm/flac/wav/opus 格式）**；模型 speech-2.8/2.6/02/01 系列；**无公开 ASR / 无 realtime API / 无 asr-01** | §5.3（STT 必须本地）/§6.5（mmx --stream 主通道；T2A WS 弃用——chunked HTTP 已达标且无新协议面） |
 
 **关键链接**（完整列表见调研报告 §6）：[LiveKit turns](https://docs.livekit.io/agents/logic/turns.md) · [LiveKit tuning](https://docs.livekit.io/agents/logic/turns/tuning.md) · [LiveKit adaptive interruption](https://docs.livekit.io/agents/logic/turns/adaptive-interruption-handling.md) · [Pipecat interruptions](https://docs.pipecat.ai/pipecat/fundamentals/interruptions.md) · [Pipecat speech-input](https://docs.pipecat.ai/pipecat/learn/speech-input.md) · [web-vad](https://github.com/jptaylor/web-vad) · [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) · [faster-whisper](https://pypi.org/project/faster-whisper/) · [MiniMax T2A WS 指南](https://platform.minimax.io/docs/guides/speech-t2a-websocket) · [MiniMax T2A WS API](https://platform.minimax.io/docs/api-reference/speech-t2a-websocket.md) · [grill-me](https://github.com/mattpocock/skills/tree/main/skills/productivity/grill-me) · [grilling 机制](https://aihero.dev/skills-grilling) · [WCAG 2.2](https://www.w3.org/WAI/WCAG22/) · [ARIA Disclosure](https://www.w3.org/WAI/ARIA/apg/patterns/disclosure/) · [Be My AI](https://www.bemyeyes.com/business/news/introducing-be-my-ai-formerly-virtual-volunteer-for-people-who-are-blind-or-have-low-vision-powered-by-openais-gpt-4/)
