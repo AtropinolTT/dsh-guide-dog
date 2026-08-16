@@ -2,6 +2,24 @@ import { homedir } from 'node:os'
 
 export const name = 'dsh-guide-dog'
 
+// Cordis parks this plugin until every listed service is registered, then
+// calls apply. Without inject the bundle's apply ran before the core
+// services existed and every ctx.get(...) came back undefined (observed
+// 2026-08-16: "apply shell=false fs=false ..." + "cannot get property
+// \"tools\" without inject"). Same mechanism the published
+// dsh-better-sidebar bundle uses (its host half exports inject:
+// webServer/sessions/loader/tools).
+export const inject = [
+  'shell',
+  'fs',
+  'webServer',
+  'sandboxPolicy',
+  'systemPrompt',
+  'subprocess',
+  'timer',
+  'tools',
+]
+
 export function apply(ctx) {
   // Compatibility layer: the dynamic host half ran inside the
   // cordis-host-runner sandbox, which injected `harness`
@@ -610,13 +628,7 @@ if __name__ == '__main__':
     // ---------- media store ----------
     async function ensureMediaDir() {
       if (mediaDir) return mediaDir
-      let root = ''
-      if (sandboxPolicy && sandboxPolicy.workspaceRoot) root = sandboxPolicy.workspaceRoot
-      if (!root) {
-        const p = await runRaw('pwd', { timeoutMs: 10000 })
-        root = (p.stdout || '').trim()
-      }
-      const dir = root + '/.guide-dog/media'
+      const dir = GLOBAL_ROOT + '/.guide-dog/media'
       const mk = await runRaw('mkdir -p ' + quote(dir), { timeoutMs: 10000 })
       if (mk.exitCode !== 0) throw new Error('cannot create media dir ' + dir + ': ' + mk.stderr)
       mediaDir = dir

@@ -33,6 +33,24 @@ HOST_HEAD = """import { homedir } from 'node:os'
 
 export const name = 'dsh-guide-dog'
 
+// Cordis parks this plugin until every listed service is registered, then
+// calls apply. Without inject the bundle's apply ran before the core
+// services existed and every ctx.get(...) came back undefined (observed
+// 2026-08-16: "apply shell=false fs=false ..." + "cannot get property
+// \\"tools\\" without inject"). Same mechanism the published
+// dsh-better-sidebar bundle uses (its host half exports inject:
+// webServer/sessions/loader/tools).
+export const inject = [
+  'shell',
+  'fs',
+  'webServer',
+  'sandboxPolicy',
+  'systemPrompt',
+  'subprocess',
+  'timer',
+  'tools',
+]
+
 export function apply(ctx) {
   // Compatibility layer: the dynamic host half ran inside the
   // cordis-host-runner sandbox, which injected `harness`
@@ -148,10 +166,39 @@ def convert():
     if n != 1:
         raise SystemExit('guideDogRoot replacement matched %d times (expected 1)' % n)
 
+    # ensureMediaDir keeps its own sandbox-root resolution; pin it to the
+    # global root as well (without this it fell back to `pwd`, which needs the
+    # shell service, and produced "/.guide-dog/media").
+    pat2 = re.compile(
+        r"    async function ensureMediaDir\(\) \{\n"
+        r"      if \(mediaDir\) return mediaDir\n"
+        r"      let root = ''\n"
+        r"      if \(sandboxPolicy && sandboxPolicy\.workspaceRoot\) root = sandboxPolicy\.workspaceRoot\n"
+        r"      if \(!root\) \{\n"
+        r"        const p = await runRaw\('pwd', \{ timeoutMs: 10000 \}\)\n"
+        r"        root = \(p\.stdout \|\| ''\)\.trim\(\)\n"
+        r"      \}\n"
+        r"      const dir = root \+ '/\.guide-dog/media'\n",
+        re.S)
+    new_host, n2 = pat2.subn(
+        "    async function ensureMediaDir() {\n"
+        "      if (mediaDir) return mediaDir\n"
+        "      const dir = GLOBAL_ROOT + '/.guide-dog/media'\n",
+        new_host)
+    if n2 != 1:
+        raise SystemExit('ensureMediaDir replacement matched %d times (expected 1)' % n2)
+
     with open(os.path.join(OUT_DIR, 'index.js'), 'w', encoding='utf-8') as f:
         f.write(HOST_HEAD + new_host + HOST_TAIL)
 
     client = open(os.path.join(REPO, 'plugin-client.js'), encoding='utf-8').read()
+    # Client plugin-level inject: wait for the `slots` service before apply
+    # (the static client Loader honours plugin inject like the host one; the
+    # dynamic sandbox provided services differently).
+    pat3 = re.compile(r"return \{\n  async apply\(ctx\) \{")
+    client, n3 = pat3.subn("return {\n  inject: ['slots'],\n  async apply(ctx) {", client)
+    if n3 != 1:
+        raise SystemExit('client apply header matched %d times (expected 1)' % n3)
     with open(os.path.join(OUT_DIR, 'client.js'), 'w', encoding='utf-8') as f:
         f.write(CLIENT_HEAD + client + CLIENT_TAIL)
 

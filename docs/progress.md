@@ -241,3 +241,29 @@ Phase 1 终审完成: V4-Pro SHIP WITH MINORS（无 Critical/Important；5 UPGRA
   ②UI voice 群组（无批准）③config 迁移（旧 workspace/.guide-dog/config.json
   不自动迁移，全局 ~/.dsh/guide-dog/.guide-dog/config.json 重新配置）
   ④四项清单复验。
+
+## 2026-08-16 傍晚：静态 bundle 首启修复（v9）——inject 声明 + 全局根漏改
+
+- 现象（用户重启后）：`[guide-dog] apply shell=false fs=false ...`（全部服务
+  undefined）、9 个工具注册全失败（`cannot get property "tools" without
+  inject`）、`media dir init failed: cannot create media dir
+  /.guide-dog/media: shell service unavailable`。
+- 根因（对照官方先例实证）：
+  ①bundle 插件必须导出 `inject` 服务列表——Cordis 在服务缺失时挂起 apply，
+  全部就绪后才执行。dsh-better-sidebar host 半 `const inject =
+  ["webServer","sessions","loader","tools"]` + `export {inject}`。guide-dog
+  bundle 无 inject → apply 在 core 服务注册前执行 → ctx.get 全 undefined。
+  `c.tools.register` 属性访问触发 Cordis 注入检查（"without inject"）。
+  ②convert_bundle.py 只改了 guideDogRoot()，漏了 ensureMediaDir() 的独立
+  root 解析（sandboxPolicy 不可用 → fallback runRaw('pwd') 需 shell → root=''
+  → '/.guide-dog/media'）。
+- 修复：convert_bundle.py ①HOST_HEAD 生成 `export const inject =
+  [shell,fs,webServer,sandboxPolicy,systemPrompt,subprocess,timer,tools]`
+  ②ensureMediaDir 改用 GLOBAL_ROOT ③client 插件对象注入 `inject: ['slots']`
+  （client Loader 同样支持插件级 inject；better-sidebar client 半 inject:
+  slots/sessions/connection/workspaces/locale 为先例）。
+- 验证：node --check 双侧 OK；bundle 重生成；publish 部署后 import 确认
+  name/apply/inject(8 服务) 导出正确；profile 幂等（dsh-guide-dog 已注册、
+  autoload 不在）。
+- 待办：用户再次重启 DSH → 预期：apply 日志全 true、工具注册成功、
+  media dir = ~/.dsh/guide-dog/.guide-dog/media；client voice 群组出现。

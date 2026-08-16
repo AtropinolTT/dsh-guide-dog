@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
     };
     const plugin = (() => {
 return {
+  inject: ['slots'],
   async apply(ctx) {
     const slots = ctx.get('slots')
     if (!slots) return
