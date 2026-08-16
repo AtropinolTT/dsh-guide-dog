@@ -202,3 +202,42 @@ Phase 1 终审完成: V4-Pro SHIP WITH MINORS（无 Critical/Important；5 UPGRA
   已发布到 ~/.dsh/guide-dog-autoload（hash/权限同前），真源+运行副本 IN SYNC。
 - 探针 dbg-1 已 undefine 清理。
 - 待办：用户再次重启 DSH → 应看到 deploy 日志/UI 批准 → cordis_inspect_self 见 gdog-*。
+
+## 2026-08-16 下午：架构升级（v8）——动态插件 → 静态 web-profile bundle
+
+- 触发：v7 修复生效后（gdog-1/pkg-1 自动部署成功、host/client 双半激活、
+  guide_dog_* 工具实测可用），用户发现"每个 session 启动了一个 gdog-*"。
+  用户期望："和 dsh-better-sidebar 一样无感加载"——一个全局实例、无批准、
+  无 per-session 副本。
+- 根因（设计如此）：动态插件 registry 按 sessionId 归属，autoload 为每个
+  agent（会话/子代理）各部署一个 gdog 实例；每个实例的 client 激活还需
+  一次 UI 批准。host 侧工具无重复（每会话各自可见），registry 当前会话
+  仅 gdog-1。
+- 方案（对照官方先例完整验证）：静态 bundle。关键发现：
+  ①dsh-better-sidebar **有完整 client 半**（exports["./client"] + dsh.client
+  {platform, inject}）——之前"纯 host"认知错误，官方形态 = host main +
+  client exports + dsh.client + dsh.bundle.patch。
+  ②client 半是 window.__ModuleLoader__.load({id, factory}) CJS 工厂，
+  require('react') 为平台 seed 词——**可手写，无需构建链**。
+  ③host 半 harness API 可做兼容层：defineTool 透传（schema 已标准）、
+  registerTool → ctx.tools.register（全局注册，所有会话可见）、
+  handle → webServer JSON POST 路由（/guide-dog/api/*）。
+  ④动态 client 半的 styles（沙箱注入）→ 自建 <style> 标签；
+  host.call（私有 RPC）→ 同源 fetch。
+- 实施：
+  - deploy/convert_bundle.py：plugin-host.js/plugin-client.js → bundle/lib/
+    （host = ESM name/apply；client = __ModuleLoader__ factory）。guideDogRoot
+    从 per-workspace 沙箱根改为全局 ~/.dsh/guide-dog（config/media/scripts
+    单一份）。
+  - bundle/package.json（name: dsh-guide-dog，exports["./client"]，dsh.client
+    inject: client-runtime + client-ui-slots，dsh.bundle.patch）+ cordis.patch.yml。
+  - deploy/publish.py：同步 bundle 到 ~/.dsh/dsh-guide-dog；profile 注册
+    dsh-guide-dog（link+bundles+symlink）并**移除 dsh-guide-dog-autoload**
+    （防动态实例与静态 bundle 并存）。legacy deploy/autoload 目录保留回退。
+- 验证：bundle ESM import OK（name/apply 导出正确）；profile bundles =
+  [dsh-base, dsh-web-app, dsh-superpowers, dsh-better-sidebar, dsh-at-file,
+  dsh-guide-dog]（autoload 已移除）；node --check 双侧语法 OK。
+- 待办：用户重启 DSH → 验证：①guide_dog_* 工具全局可见（无 gdog-* 插件）
+  ②UI voice 群组（无批准）③config 迁移（旧 workspace/.guide-dog/config.json
+  不自动迁移，全局 ~/.dsh/guide-dog/.guide-dog/config.json 重新配置）
+  ④四项清单复验。

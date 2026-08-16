@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Publish Guide Dog deployment artifacts from the repo to the trusted home
-directory consumed by the dsh-guide-dog-autoload host plugin.
+"""Publish Guide Dog artifacts from the repo to the trusted home directory.
 
-Why a separate deployment dir (2026-08-15 security review, HIGH finding):
-the repo lives inside a session workspace (workspace-write), so the autoloader
-must never read plugin sources from there — anything with workspace write
-access could plant code that later runs with host privileges. This script
-copies the sources plus an autoload copy into ~/.dsh (outside workspaces),
-writes a SHA-256 manifest, and the autoloader refuses to deploy on any
-mismatch.
+The active delivery is the STATIC web-profile bundle (`bundle/`): one global
+host half + client half, mounted like the published dsh-better-sidebar — no
+dynamic plugin, no approvals, no per-session gdog-* instances. This script
+copies the bundle into ~/.dsh/dsh-guide-dog (outside workspaces, so a
+compromised workspace cannot plant code that later runs with host
+privileges), registers it in the web profile, and removes the superseded
+per-session auto-deployer bundle (dsh-guide-dog-autoload) so it stops
+deploying dynamic instances alongside the static one.
+
+The legacy dynamic deploy dir (~/.dsh/guide-dog-deploy) and autoload copy
+are still refreshed for rollback/offline use, but nothing consumes them once
+the autoload bundle is gone from the profile.
 
 Run after changing plugin-host.js / plugin-client.js / scripts/whisper_transcribe.py
 or autoload/lib/index.js:
 
+    python3 deploy/convert_bundle.py   # regenerate bundle/lib from the plugin halves
     python3 deploy/publish.py
 
 Requires write access to ~/.dsh (elevation on systems with a file sandbox).
@@ -27,11 +32,14 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOME_DEPLOY = os.path.expanduser('~/.dsh/guide-dog-deploy')
 HOME_AUTOLOAD = os.path.expanduser('~/.dsh/guide-dog-autoload')
+HOME_BUNDLE = os.path.expanduser('~/.dsh/dsh-guide-dog')
 # `dsh web` is an alias for `--profile web` (see DSH README); the GUI runs the
-# web profile, so the autoload bundle must be registered there. Registering it
-# only in another profile (e.g. cc-tui) silently does nothing for the GUI.
+# web profile, so the bundle must be registered there. Registering it only in
+# another profile (e.g. cc-tui) silently does nothing for the GUI.
 PROFILE_DIR = os.path.expanduser('~/.dsh/profiles/web')
-BUNDLE_NAME = 'dsh-guide-dog-autoload'
+BUNDLE_NAME = 'dsh-guide-dog'
+# Superseded per-session dynamic auto-deployer (root causes #1-#3, 2026-08-15/16).
+OLD_BUNDLE = 'dsh-guide-dog-autoload'
 
 SOURCES = ['plugin-host.js', 'plugin-client.js']
 
@@ -74,13 +82,15 @@ def sha256(path):
 
 
 def register_profile():
-    """Idempotently register the autoload bundle in the active web profile.
+    """Idempotently register the static bundle in the active web profile and
+    remove the superseded autoload bundle.
 
     DSH reads `dsh.profile.bundles` from <profile>/package.json at startup and
     resolves each bundle name from the profile's own node_modules. Without this
-    registration the autoloader never loads and the dynamic plugin is not
-    restored after a restart (observed 2026-08-15: registered in cc-tui only,
-    while `dsh web` runs the web profile).
+    registration the bundle never loads (observed 2026-08-15 with cc-tui vs
+    web profile). Removing OLD_BUNDLE is required: if the autoloader stayed
+    mounted it would keep deploying per-session dynamic gdog-* instances next
+    to the static bundle.
 
     Returns a list of human-readable actions taken (empty when already in
     place, so re-runs are no-ops).
@@ -90,42 +100,66 @@ def register_profile():
     if not os.path.isfile(pkg_path):
         fail('profile package.json not found: ' + pkg_path)
     pkg = json.load(open(pkg_path, encoding='utf-8'))
-    dep_key = 'link:' + HOME_AUTOLOAD
     deps = pkg.setdefault('dependencies', {})
+    bundles = pkg.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
+    # 1) add the static bundle
+    dep_key = 'link:' + HOME_BUNDLE
     if deps.get(BUNDLE_NAME) != dep_key:
         deps[BUNDLE_NAME] = dep_key
         actions.append('added dependency %s -> %s' % (BUNDLE_NAME, dep_key))
-    bundles = pkg.setdefault('dsh', {}).setdefault('profile', {}).setdefault('bundles', [])
     if BUNDLE_NAME not in bundles:
         bundles.append(BUNDLE_NAME)
         actions.append('added %s to dsh.profile.bundles' % BUNDLE_NAME)
+    # 2) remove the superseded autoload bundle
+    if OLD_BUNDLE in deps:
+        del deps[OLD_BUNDLE]
+        actions.append('removed dependency %s' % OLD_BUNDLE)
+    if OLD_BUNDLE in bundles:
+        bundles.remove(OLD_BUNDLE)
+        actions.append('removed %s from dsh.profile.bundles' % OLD_BUNDLE)
     if actions:
         tmp = pkg_path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(pkg, f, indent=2, ensure_ascii=False)
             f.write('\n')
         os.replace(tmp, pkg_path)
-    # node_modules symlink (pnpm link: layout; matches the dsh-auto-review
-    # precedent of a manual symlink without running pnpm install).
+    # node_modules symlinks (pnpm link: layout; matches the dsh-better-sidebar
+    # precedent of manual symlinks without running pnpm install).
     nm = os.path.join(PROFILE_DIR, 'node_modules')
     os.makedirs(nm, exist_ok=True)
     link = os.path.join(nm, BUNDLE_NAME)
-    target = os.path.relpath(HOME_AUTOLOAD, os.path.dirname(link))
+    target = os.path.relpath(HOME_BUNDLE, os.path.dirname(link))
     if not os.path.islink(link) or os.readlink(link) != target:
         if os.path.lexists(link):
             os.unlink(link)
         os.symlink(target, link)
         actions.append('symlinked node_modules/%s -> %s' % (BUNDLE_NAME, target))
+    oldlink = os.path.join(nm, OLD_BUNDLE)
+    if os.path.islink(oldlink) or os.path.lexists(oldlink):
+        os.unlink(oldlink)
+        actions.append('removed symlink node_modules/%s' % OLD_BUNDLE)
     for a in actions:
         print('profile: ' + a)
     if not actions:
-        print('profile: ' + BUNDLE_NAME + ' already registered in ' + PROFILE_DIR)
+        print('profile: ' + BUNDLE_NAME + ' registered, ' + OLD_BUNDLE + ' absent — already in place in ' + PROFILE_DIR)
     return actions
 
 
 def main():
     verify_sources()
 
+    # Static bundle (the active delivery).
+    for d in (HOME_BUNDLE,):
+        os.makedirs(d, exist_ok=True)
+    for rel in ('package.json', 'cordis.patch.yml', 'lib/index.js', 'lib/client.js'):
+        src = os.path.join(REPO, 'bundle', rel)
+        dst = os.path.join(HOME_BUNDLE, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o600)
+        print('copied bundle/' + rel)
+
+    # Legacy dynamic deploy dir + autoload copy: kept fresh for rollback.
     for d in (HOME_DEPLOY, HOME_AUTOLOAD):
         os.makedirs(d, exist_ok=True)
 
@@ -152,7 +186,7 @@ def main():
         os.chmod(dst, 0o600)
         print('copied autoload/' + rel)
 
-    print('published to ' + HOME_DEPLOY + ' and ' + HOME_AUTOLOAD)
+    print('published static bundle to ' + HOME_BUNDLE + ' (legacy deploy/autoload kept fresh)')
     register_profile()
     print('publish complete — restart DSH (`dsh web`) for the bundle change to load')
 

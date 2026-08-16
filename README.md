@@ -301,46 +301,52 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   parseable; the plugin treats exit 0 as success and verifies the file via
   `fs.stat`.
 
-## Restart recovery (dynamic plugin)
+## Restart recovery (static web-profile bundle)
 
-Guide Dog runs as a **dynamic Cordis plugin** — it lives only in the running
-DSH process and is **lost when DSH restarts**. Runtime state persists
-(`<workspaceRoot>/.guide-dog/`: `config.json`, `media/`, `scripts/`,
-`status.json`), but the plugin code must be redeployed from the source of
-record:
+Since 2026-08-16 Guide Dog ships as a **static bundle** mounted in the web
+profile — one global host half + one client half, exactly like the published
+`dsh-better-sidebar`. No dynamic plugin, no per-session `gdog-*` instances,
+no approval cards: after a DSH restart the tools and the voice UI come back
+with the profile itself.
 
-1. `cordis_define` (kind: `new`, idPrefix e.g. `gdog`) with
-   `code.host` = `plugin-host.js` and `code.client` = `plugin-client.js`
-   (both halves are also concatenated in `plugin-source.js`).
-2. `cordis_run` the returned package and approve/refresh the page.
-3. Verify: the voice cluster (speaker / language dropdown / mic) appears at
-   the input box's bottom-left, and Settings → Guide Dog shows the config
-   blocks.
+The source of record stays the two dynamic-plugin halves
+(`plugin-host.js` / `plugin-client.js`); `deploy/convert_bundle.py`
+regenerates `bundle/lib/` from them:
 
-### Auto-reload after restart (`dsh-guide-dog-autoload`)
+- **host half** (`bundle/lib/index.js`, ESM `name`/`apply`): a tiny
+  compatibility layer replaces the dynamic sandbox's `harness` — tool
+  definitions are registered via the global `tools` registry (visible to
+  every session), and the former `harness.handle` RPCs (`guide-dog/*`) become
+  JSON POST routes under `/guide-dog/api/`. The per-workspace sandbox root is
+  replaced by the global store `~/.dsh/guide-dog/` (config, media, scripts).
+- **client half** (`bundle/lib/client.js`): a
+  `window.__ModuleLoader__.load({id, factory})` CJS factory like the
+  published bundles; `require('react')` from the platform seed, self-managed
+  `<style>` tag instead of the sandbox `styles`, and `host.call` becomes
+  same-origin `fetch` against the JSON routes.
 
-Manual redeploy does not survive a restart either, so a **host bundle**
-(`autoload/`) watches `agent/created` and re-deploys the dynamic plugin for
-every agent session:
+Deploy once after any plugin change:
 
-1. `python3 deploy/publish.py` — verifies template/bundle consistency, copies
-   the sources to `~/.dsh/guide-dog-deploy/` (outside any workspace) with a
-   SHA-256 `manifest.json`, copies the autoload package to
-   `~/.dsh/guide-dog-autoload/`, and **idempotently registers the bundle in
-   the web profile** (`~/.dsh/profiles/web`: dependency link + `bundles`
-   entry + `node_modules` symlink).
-2. Restart DSH (`dsh web`) — bundles are parsed at startup, so a restart is
+1. `python3 deploy/convert_bundle.py` — regenerate `bundle/lib/`.
+2. `python3 deploy/publish.py` — copies the bundle to `~/.dsh/dsh-guide-dog`
+   (outside workspaces), **idempotently registers it in the web profile**
+   (`~/.dsh/profiles/web`: dependency link + `bundles` entry + `node_modules`
+   symlink) and **removes the superseded `dsh-guide-dog-autoload` bundle**
+   (which otherwise keeps deploying per-session dynamic instances).
+3. Restart DSH (`dsh web`) — bundles are parsed at startup, so a restart is
    required after any change.
-3. On session creation the autoloader hash-checks the deployed sources
-   (tamper → refuse to deploy), then `define`s + `run`s a fresh `gdog-*`
-   plugin. The **first client activation per DSH process needs one human
-   approval** in the UI (the browser runs the client half); afterwards the
-   grant covers future versions until the next restart.
+
+Legacy history: the earlier auto-deployer (`autoload/`) — a host bundle that
+watched `agent/created` and `define`+`run`ed a fresh `gdog-*` dynamic plugin
+per session — is retained in the repo and still published to
+`~/.dsh/guide-dog-deploy` / `~/.dsh/guide-dog-autoload` for rollback, but
+nothing consumes it once removed from the profile.
 
 Profile pitfall (observed 2026-08-15): `dsh web` is an alias for
-`--profile web` — the GUI runs the **web** profile. Registering the autoload
-bundle only in another profile (e.g. `cc-tui`) silently does nothing for the
-GUI; `deploy/publish.py` always targets `~/.dsh/profiles/web`.
+`--profile web` — the GUI runs the **web** profile. Registering a bundle
+only in another profile (e.g. `cc-tui`) silently does nothing for the GUI;
+`deploy/publish.py` always targets `~/.dsh/profiles/web`.
+
 
 Service-scope pitfall (observed 2026-08-16 — root cause #3): the
 `dynamicCordisRunner` and `agents` services are registered on **agent-scoped
