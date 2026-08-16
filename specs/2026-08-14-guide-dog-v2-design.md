@@ -70,8 +70,8 @@ dsh-guide-dog (静态 web-profile bundle)
 │   ├── stream   —— /guide-dog/tts-stream chunked 流式 TTS（Phase 2 起，mmx --stream）
 │   ├── consensus —— tools/pre-execute 写操作拦截 + 语音摘要 + 打断窗口（Phase 2 起）
 │   ├── tools    —— v1 九个工具 + 语音相关新工具（见 §5.5）
-│   └── rpc      —— 兼容层 handle 注册的 JSON POST 路由（speak / transcribe / config / tts-token /
-│                   describe-screen / list-media / voices / auth-status / voice-queue）
+│   └── rpc      —— 兼容层 handle 注册的 JSON POST 路由（speak / transcribe / get-config / set-config / status / beep / tts-token /
+│                   call-active / call-command / describe-screen / list-media / voices / auth-status / voice-queue）
 └── Client 半（bundle/lib/client.js，window.__ModuleLoader__.load({id:'dsh-guide-dog', factory})）
     ├── 兼容层    —— require('react')（平台 seed）、自建 <style> 标签替代沙箱 styles、host.call → fetch JSON POST
     ├── inject    —— 插件对象 inject: ['slots']（client Loader 支持插件级 inject；better-sidebar 先例）
@@ -136,7 +136,7 @@ dsh-guide-dog (静态 web-profile bundle)
     },
     "stream": {
       "format": "pcm",           // mmx --stream --format pcm（s16le 单声道）
-      "sampleRate": 24000,       // 实测可用；默认 32000
+      "sampleRate": 24000,       // mmx --stream 实测可用；24000 为本字段默认（mmx 自身默认 32000，此处显式覆盖）
       "sentenceSplit": "。！？.!?\n",  // 分句正则字符集
       "maxSentenceChars": 200    // 超长句强制截断（防单句首字节延迟失控）
     },
@@ -254,7 +254,7 @@ dsh-guide-dog (静态 web-profile bundle)
                             └─ 播放中 VAD 检测到用户发声 → barge-in（§6.6）→ 回到顶部
 ```
 
-- 采集：**MediaRecorder（webm/opus）+ 并行 AnalyserNode 能量检测**（Phase 1 已验证路径；AudioWorklet 16kHz 裸 PCM 留作升级位，免编解码直喂 VAD/STT）。
+- 采集：**MediaRecorder（`audio/wav` 优先——Phase 1 实测增量切片可解码；`audio/webm;codecs=opus` 整段回退）+ 并行 AnalyserNode 能量检测**（I5 修订 2026-08-16：Phase 1 实际落地为 wav 优先，webm 仅整段回退）；AudioWorklet 16kHz 裸 PCM 留作升级位，免编解码直喂 VAD/STT。
 - VAD（Phase 2 v1）：`call.vad.method='energy'`——RMS 能量阈值（`call.vad.threshold`，背景噪声大时调高）、静音 700ms 判定结束、最短语音 300ms、单段上限 60s。
 - VAD 升级路径（调研结论）：`call.vad.method='silero'`——**web-vad**（Silero ONNX + AudioWorklet，浏览器内跑，Pipecat 客户端同款，打断延迟最低）；`sherpa`——sherpa-onnx（VAD+ASR 一体）。参数借鉴：LiveKit 轮转区间（静默 0.5–3s）、Ultravox 分层 VAD + 打断最短 90ms 门槛（本 spec 用 `interruptMinMs: 300`）。
 - **PTT 模式**（`call.mode='ptt'`）：按住面板麦克风说话、松开即发送（WhatsApp 式）；VAD 参数在 PTT 下不参与端点判定（仅做打断监测）。用户可自行决定 VAD 体验不好时切换。
@@ -306,10 +306,11 @@ host 监听（按会话过滤，`this: Scoped<Agent>` 事件天然按 agent 作�
 ```
 写类工具触发（write/edit + bash 破坏性命令启发式：rm/mv/cp/truncate/dd/覆盖重定向/git push 等）
    │
-   ├─ 本轮无 consent ──► 拦截返回 {error:'needs_voice_confirmation'}
+   ├─ 本轮无 consent ──► 拦截返回 {kind:'deny', reason:'needs_voice_confirmation'}
    │                      agent 读结果后语音提问（聊天式："接下来要修改 X，可以吗？"）
    │                      → 用户语音回答（"确定"是普通回合，命令表不截胡）
-   │                      → host 内存标记 consent = {sessionId, turnSeq}
+   │                      → host 监听 user 消息，确认词命中 → markConsentPending → 下一次
+   │                        pre-execute 消费 pending 并 grantConsent(sessionId, turnSeq)
    ▼
 consent 已就绪（或刚确认）
    │
@@ -323,7 +324,7 @@ consent 已就绪（或刚确认）
    └─ 无发言 → 放行执行
 ```
 
-- **确认粒度**：一次语音确认放行**本轮通话内全部写操作**（多文件任务不啰嗦）。
+- **确认粒度**：一次语音确认放行**本轮通话内全部写操作**（多文件任务不啰嗦；consent 按 `{sessionId, turnSeq}` 记录，同一 turn 内多个写工具共享）。
 - **打断机会**：摘要播报后的等待窗口 + 播放中 barge-in 双保险——**窗口期内工具物理上尚未启动**，用户说话即中止，这是机制保证的"执行前打断机会"，不依赖模型自觉。
 - **放行后**：`tools/post-execute`（可选）继续观察；执行结果由进度播报（§6.4）与回复朗读自然覆盖。
 

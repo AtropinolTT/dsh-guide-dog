@@ -23,7 +23,7 @@
 - 错误码（spec §8.3 修订版，零 WS 决策）：`bad_args / tts_failed / tts_timeout / stt_failed / stt_timeout / engine_unavailable / mic_denied / empty_speech / stream_rejected / stream_interrupted / vision_failed / config_write_failed / needs_voice_confirmation / aborted_by_user / consensus_failed`。**内部错误码一律从该枚举取，不得新增自由文本错误码**；错误项统一 `{error: <码>, message: <人读文本>}`。~~ws_rejected/ws_lost~~ 已废弃（零 WS）。
 - 大小上限（spec §8.1）：call-transcribe 音频 ≤20MB（base64 按 27MB 判定）；describe-screen 图片 ≤8MB（Phase 3）。
 - 路径规则：所有 host 新代码一律**绝对路径**——`guideDogRoot()` 在 bundle 中恒返回 **GLOBAL_ROOT = `homedir() + '/.dsh/guide-dog'`**（convert_bundle.py 替换；不再依赖 sandboxPolicy/pwd），runtime 目录为 `GLOBAL_ROOT + '/.guide-dog/…'`；`subprocess.spawn` 的 `cwd` 与 argv 全部绝对化。
-- host `timerSvc.timeout` 只用已验证的 `sleep(ms)`（Promise 形式）做超时竞速；不依赖未验证的 callback 形式。
+- host `timerSvc.timeout` 只用已验证的 `sleep(ms)`（Promise 形式）做超时竞速；不依赖未验证的 callback 形式。**host `timerSvc.interval`（callback 形式）仅 client 已验证**（I3，2026-08-16 审稿）——Task 3/14 的 token 清理与心跳若用 host `interval`，须先在 Task 4 探测确认（`typeof timerSvc.interval === 'function'` 且返回 disposer）；不可用则改用 `sleep` 递归轮询（Task 3 Step 2 已给替代代码）。
 - 沙箱说明（2026-08-16 修订）：**静态 bundle 无 per-session 沙箱**——host 半经 `shell`/`fs`/`subprocess` 服务直接操作（v11 实证 media 目录创建于 `~/.dsh/guide-dog/.guide-dog/media`）；**长任务/播放/转写/流式 TTS 仍用 `subprocess` 服务**（避免阻塞事件循环）。
 - 仓库文件是源码记录：`plugin-host.js`+`plugin-client.js` 为真源；`deploy/convert_bundle.py` 生成 `bundle/lib/`（**不再是 `plugin-source.js`**——该拼接体为动态插件时代遗留，勿再更新）；部署产物为 `bundle/` + `~/.dsh/dsh-guide-dog`。
 - 播放语义（v2.1 裁决延续）：模块级 `Audio`/播放队列，会话切换不销毁不重播；新播放任务覆盖当前。
@@ -174,9 +174,9 @@ console.log('PASS: range 计算正确；修复后 readBytes 应只读', r.end - 
 Run: `node repro/repro-m10.js`
 Expected: `PASS: range 计算正确…`。
 
-- [ ] **Step 3: 实现修复（plugin-host.js 行 870-905）**
+- [ ] **Step 3: 实现修复（plugin-host.js 行 860-905）**
 
-将 `const bytes = await readBytes(abs, size || MAX_FILE_BYTES)`（行 884）**下移**到 range 解析之后，并按 range 只读区段：
+将 `const bytes = await readBytes(abs, size || MAX_FILE_BYTES)`（行 868）**下移**到 range 解析之后，并按 range 只读区段：
 
 ```js
               const st = await statFile(abs)
@@ -315,6 +315,8 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
   - `CONFIG_DEFAULTS` 扩展 `call`/`a11y` 节（spec §4 精确形状）
   - `ttsTokens: Map<token, {sessionId, exp}>` + `async issueTtsToken(sessionId): Promise<string>`（5 分钟有效、单次消费）+ `consumeTtsToken(token, sessionId): boolean`
   - `consent: Map<sessionId, number>`（turnSeq）+ `grantConsent(sid, turnSeq)` / `hasConsent(sid, turnSeq)` / `clearConsent(sid)`（会话/轮次粒度，内存态）
+  - `consentPending: Set<sessionId>` + `markConsentPending(sid)` / `consumeConsentPending(sid)`（C1 修复：user 确认词监听器置位，pre-execute 消费）
+  - `callActiveSessions: Set<sessionId>` + `isCallActive(sid)`（C4 修复：持久通话激活，Task 7 的 startCall/stopCall 经 RPC 置位）
   - RPC `guide-dog/tts-token`（`{sessionId}` → `{ok, token}`）
 
 - [ ] **Step 1: 扩展 CONFIG_DEFAULTS**
@@ -342,6 +344,10 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
     // ============ CALL 节（Phase 2，host） ============
     const ttsTokens = new Map() // token -> { sessionId, exp }
     const consent = new Map() // sessionId -> turnSeq（本轮已语音确认）
+    // C1 修复（2026-08-16 审稿）：consentPending 记录"用户刚说过确认词"的会话；
+    // 由 user 消息监听器（Task 8 Step 3b）置位，下一次 pre-execute 消费并 grantConsent。
+    const consentPending = new Set() // sessionId（等待写入放行）
+    const callActiveSessions = new Set() // sessionId（持久通话激活，startCall/stopCall 时置位，C4 修复）
     async function issueTtsToken(sessionId) {
       const token = 'gd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
       ttsTokens.set(token, { sessionId: String(sessionId), exp: Date.now() + 5 * 60 * 1000 })
@@ -361,8 +367,17 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
       const v = consent.get(String(sid))
       return typeof turnSeq === 'number' ? v === turnSeq : v !== undefined
     }
+    // M10 语义说明（2026-08-16 审稿）：一次确认放行"本轮"全部写操作——grantConsent 在首次
+    // pre-execute 时以该 exec 的 turnSeq 授予；同一 assistant turn 内后续写工具共享同一
+    // exec.agent.turn → hasConsent 精确匹配通过。若 exec.agent.turn 为 null（探测未发现 turn），
+    // hasConsent 退化为"已授予即可"（v !== undefined），新用户回合前 clearConsent 兜底。
     function clearConsent(sid) { consent.delete(String(sid)) }
+    function markConsentPending(sid) { consentPending.add(String(sid)) }
+    function consumeConsentPending(sid) { return consentPending.delete(String(sid)) }
+    function isCallActive(sid) { return callActiveSessions.has(String(sid)) }
     // 定期清理过期 token（30s 检查，防泄漏）
+    // I3（2026-08-16 审稿）：host 侧 timerSvc.interval（callback 形式）未验证——
+    // 若 Task 4 探测确认 host interval 不可用，则改为 sleep 轮询（见下方注释替代）。
     const tokenTimer = timerSvc && typeof timerSvc.interval === 'function'
       ? timerSvc.interval(function () {
           const now = Date.now()
@@ -370,6 +385,19 @@ git commit -m "fix(phase2): M11 — per-key voiceMode.sessions patch (no whole-m
         }, 30000)
       : null
     if (tokenTimer) ctx.effect(tokenTimer)
+```
+
+> **I3 替代方案（若 host `timerSvc.interval` 探测不可用）**：用已验证的 `sleep` 轮询替代回调 interval：
+
+```js
+    // 替代：sleep 轮询（Promise 形式，已验证）
+    ;(function tokenSweeper() {
+      sleep(30000).then(function () {
+        const now = Date.now()
+        ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+        tokenSweeper()
+      })
+    })()
 ```
 
 - [ ] **Step 3: 注册 tts-token RPC**
@@ -417,6 +445,8 @@ git commit -m "feat(phase2): call config defaults, tts-token issuance, consent m
   4. host `tools/pre-execute` 触发形状（临时 listener，观察 `exec.name/arguments/agent`）
   5. host `subprocess` pipe 模式：`handle.stdout.on('data')` 收到 Buffer/Uint8Array 并 `res.write` 成功（`mmx speech synthesize --stream` 短句直测 chunked 路由）
   6. `WebRoute` handler 中 `res.write` 流式实测（写 2 个分块 + 延迟，验证 chunked 编码）
+  7. **`webServer.register` 的 `kind:'exact'` 支持**（I2，2026-08-16 审稿）：现有代码与兼容层只用 `kind:'prefix'`（plugin-host.js 行 849/948、convert_bundle.py 行 110），Task 5/11 的 `call-transcribe`/`tts-stream` 计划用 `kind:'exact'`——probe-stream 路由本身即 `kind:'exact'`，其 200 响应即 exact 支持证据；若 404/405 则改回 `kind:'prefix'` + 内部路径精确匹配（与 media/recorder 同款）
+  8. **事件 payload 形状**（I4，2026-08-16 审稿）：`agent/status`/`tools/result`/`agent/error` 三事件的 payload 键（`agent/status` 是 `{agent, status}`？`tools/result` 是 `(exec, result)` 两参？`agent/error` 是 `{agent, turn, step, error}`？）以及 **`exec.agent.session` 是否含 `id`**——Task 8/10/14 的 sessionId 推导全依赖此结论
 
 - [ ] **Step 1: Inspect 查槽位（零部署）**
 
@@ -454,6 +484,20 @@ plugin-host.js（RECORDER 节后插入，`// PROBE-START` / `// PROBE-END` 包�
         if (seen.agents.length < 5) seen.agents.push({ hasSession: !!(ag && ag.session), sessionKeys: ag && ag.session ? Object.keys(ag.session) : [] })
         return next()
       } catch (e) { return next() }
+    })
+    // I4 探测（2026-08-16 审稿）：事件 payload 形状
+    ctx.on('agent/status', function (payload) {
+      try { globalThis.__gdProbe = globalThis.__gdProbe || {}; globalThis.__gdProbe.agentStatus = { keys: Object.keys(payload || {}), hasAgent: !!(payload && payload.agent), status: payload && payload.status } } catch (e) { /* ignore */ }
+    })
+    ctx.on('tools/result', function (exec, result) {
+      try {
+        const p = globalThis.__gdProbe = globalThis.__gdProbe || {}
+        const ag = exec && exec.agent
+        p.toolsResult = { argCount: arguments.length, hasAgent: !!(ag), sessionKeys: ag && ag.session ? Object.keys(ag.session) : [], resultKeys: result ? Object.keys(result).slice(0, 10) : [] }
+      } catch (e) { /* ignore */ }
+    })
+    ctx.on('agent/error', function (payload) {
+      try { globalThis.__gdProbe = globalThis.__gdProbe || {}; globalThis.__gdProbe.agentError = { keys: Object.keys(payload || {}), hasAgent: !!(payload && payload.agent) } } catch (e) { /* ignore */ }
     })
     ctx.effect(function () {
       if (!webServer) return function () {}
@@ -591,10 +635,12 @@ git add -A && git commit -m "chore(phase2): probe round — slots header.actions
           handler: async function (req, res) {
             try {
               if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
-              // 同源校验：Origin 必须等于 GUI 来源（host 配置的 origin 或同源空）
+              // 同源校验（M5 修订 2026-08-16）：Origin 必须等于 GUI 来源——按 Host 头推导
+              // （'http://' + req.headers.host，GUI 由 dsh web 同源托管）；无 Origin 头（curl）放行，
+              // 便于本地验收。不再用 guideDogRoot() 作 truthy 占位。
               const origin = req.headers && req.headers.origin ? String(req.headers.origin) : ''
-              const guiOrigin = (await guideDogRoot()) && req.headers && req.headers.host ? 'http://' + String(req.headers.host) : ''
-              if (origin && guiOrigin && origin !== guiOrigin) { res.writeHead(403); res.end(); return }
+              const hostHdr = req.headers && req.headers.host ? String(req.headers.host) : ''
+              if (origin && hostHdr && origin !== 'http://' + hostHdr) { res.writeHead(403); res.end(); return }
               // 收集 body（≤20MB 硬上限）
               let chunks = []
               let total = 0
@@ -691,20 +737,23 @@ git commit -m "feat(phase2): call-transcribe route (raw webm POST, shared transc
 
 - [ ] **Step 2: header 发起按钮**
 
+> M4 修订（2026-08-16 审稿）：所有槽位注入必须用 `ctx.effect(function () { return slots.inject(...) })` 包裹（Phase 1 惯例，disposer 纳入插件生命周期；裸 `try { slots.inject } catch` 在 stop/update 时无法清理）。
+
 ```js
-    try {
-      slots.inject('conversation.session.header.actions', function () {
-        return slots.register(
-          { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
-          function (props) {
-            const sid = props.sessionId || callSessionId
-            callSessionId = sid
-            const [, force] = React.useState(0)
-            React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-            const active = callState.active
-            const style = {
-              display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
-              borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.session.header.actions', function () {
+          return slots.register(
+            { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
+            function (props) {
+              const sid = props.sessionId || callSessionId
+              callSessionId = sid
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              const active = callState.active
+              const style = {
+                display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
+                borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
               background: active ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
               color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
               fontFamily: 'inherit', fontSize: '12px',
@@ -721,37 +770,41 @@ git commit -m "feat(phase2): call-transcribe route (raw webm POST, shared transc
               },
             }, active ? '📞 通话中' : '📞 通话')
           })
-      })
-    } catch (e) { /* slot unavailable */ }
+        })
+      } catch (e) { return function () {} }
+    })
 ```
 
 - [ ] **Step 3: dock 状态条**
 
 ```js
-    try {
-      slots.inject('conversation.input.dock', function () {
-        return slots.register(
-          { name: 'conversation.input.dock', id: 'guide-dog-call-status', order: 31, label: function () { return 'Call status' } },
-          function (props) {
-            const [, force] = React.useState(0)
-            React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-            if (!callState.active) return null
-            const text = { listening: '收听中…', processing: '处理中…', speaking: '播报中…', idle: '就绪' }[callState.phase] || ''
-            const style = { fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #666)', padding: '0 4px', fontFamily: 'inherit' }
-            return React.createElement('span', { style: style }, text + (callState.muted ? ' · 静音' : ''))
-          })
-      })
-    } catch (e) { /* slot unavailable */ }
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.input.dock', function () {
+          return slots.register(
+            { name: 'conversation.input.dock', id: 'guide-dog-call-status', order: 31, label: function () { return 'Call status' } },
+            function (props) {
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              if (!callState.active) return null
+              const text = { listening: '收听中…', processing: '处理中…', speaking: '播报中…', idle: '就绪' }[callState.phase] || ''
+              const style = { fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #666)', padding: '0 4px', fontFamily: 'inherit' }
+              return React.createElement('span', { style: style }, text + (callState.muted ? ' · 静音' : ''))
+            })
+        })
+      } catch (e) { return function () {} }
+    })
 ```
 
 - [ ] **Step 4: overlay 面板**
 
 ```js
-    try {
-      slots.inject('shell.overlay', function () {
-        return slots.register(
-          { name: 'shell.overlay', id: 'guide-dog-call-panel', order: 40, label: function () { return 'Call panel' } },
-          function () {
+    ctx.effect(function () {
+      try {
+        return slots.inject('shell.overlay', function () {
+          return slots.register(
+            { name: 'shell.overlay', id: 'guide-dog-call-panel', order: 40, label: function () { return 'Call panel' } },
+            function () {
             const [, force] = React.useState(0)
             React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
             if (!callState.active) return null
@@ -795,8 +848,9 @@ git commit -m "feat(phase2): call-transcribe route (raw webm POST, shared transc
                   React.createElement('option', { value: '1.2' }, '1.2x'))),
               callState.error ? React.createElement('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: '6px' } }, callState.error) : null)
           })
-      })
-    } catch (e) { /* slot unavailable */ }
+        })
+      } catch (e) { return function () {} }
+    })
 ```
 
 - [ ] **Step 5: 接口桩（Task 7 实现）**
@@ -832,7 +886,7 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
   - `stopCall()`：停止录音与播放、释放流、`callState.active=false`
   - `startSegment()` / `stopSegment()`：VAD/PTT 段控制；`stopSegment` 时若段有效（时长≥minSpeechMs）→ 上传 → 转写 → `insertText`+`submitInput`
   - `callMic` 模块级 `{stream, rec, analyser, raf, segmentStart, chunks, segmentSeconds}`；`bargeIn()` 钩子（Task 12 用，检测到用户发声时调用）
-  - `callActiveRpc()`：录音开始时通知 host（`guide-dog/call-active`，Task 8 用于共识窗口中止判定）——本任务定义 RPC 调用，Task 8 实现 host 端
+  - `callActiveRpc(kind, active)`：分两种上报（C4 修复）——`startCall`/`stopCall` 上报 `{kind:'session'}`（持久通话激活，Task 10/11 判据）；`startSegment`/`stopSegment` 上报 `{kind:'speaking'}`（瞬时发声，Task 8 共识窗口中止判定）
   - `isUserSpeaking()`：供 Task 8/9 共识窗口查询（RMS 当前值）
 
 - [ ] **Step 1: 采集初始化与 VAD 引擎**
@@ -847,6 +901,7 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
     function startCall(sid) {
       if (callMic) return
       setCallState({ active: true, phase: 'listening', recording: false, error: null })
+      callActiveRpc('session', true) // C4：持久通话激活（Task 10 进度播报 / Task 11 下行流式判据）
       try {
         navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
           const AC = window.AudioContext || window.webkitAudioContext
@@ -913,6 +968,7 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
         callMic = null
       }
       callSegmentActive = false
+      callActiveRpc('session', false) // C4：持久激活关闭
       setCallState({ active: false, phase: 'idle', recording: false })
       stopStreamPlayback() // Task 12：停止下行播放
     }
@@ -928,14 +984,14 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
       if (!callMic || callSegmentActive) return
       callSegmentActive = true
       resetSegment()
-      callActiveRpc(true) // 通知 host：段进行中（共识窗口中止判定用）
+      callActiveRpc('speaking', true) // C4：瞬时发声（共识窗口中止判定用；非持久激活）
       setCallState({ recording: true })
     }
 
     function stopSegment() {
       if (!callMic || !callSegmentActive) return
       callSegmentActive = false
-      callActiveRpc(false)
+      callActiveRpc('speaking', false)
       setCallState({ recording: false, phase: 'processing' })
       const chunks = callMic.chunks
       callMic.chunks = []
@@ -964,8 +1020,8 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
       })
     }
 
-    function callActiveRpc(active) {
-      host.call('guide-dog/call-active', { sessionId: callSessionId || '', active: active }).catch(function () {})
+    function callActiveRpc(kind, active) {
+      host.call('guide-dog/call-active', { sessionId: callSessionId || '', kind: kind, active: active }).catch(function () {})
     }
 ```
 
@@ -979,16 +1035,18 @@ git commit -m "feat(phase2): call UI — header button, dock status, overlay pan
 
 ```js
     let gdInputActions = null
-    try {
-      slots.inject('conversation.input.left', function () {
-        return slots.register(
-          { name: 'conversation.input.left', id: 'guide-dog-call-input', order: 31, label: function () { return 'Call input' } },
-          function (props) {
-            gdInputActions = props.inputActions || gdInputActions
-            return null
-          })
-      })
-    } catch (e) { /* ignore */ }
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.input.left', function () {
+          return slots.register(
+            { name: 'conversation.input.left', id: 'guide-dog-call-input', order: 31, label: function () { return 'Call input' } },
+            function (props) {
+              gdInputActions = props.inputActions || gdInputActions
+              return null
+            })
+        })
+      } catch (e) { return function () {} }
+    })
 ```
 
 并在 `stopSegment` 中改用 `const actions = gdInputActions`。
@@ -1009,13 +1067,14 @@ git commit -m "feat(phase2): call capture state machine — MediaRecorder + Anal
 - Modify: `guide-dog-dsh/plugin-host.js`（CALL 节内，Task 3 的 token/consent 之后）
 
 **Interfaces:**
-- Consumes: Task 3 的 `consent/grantConsent/hasConsent/clearConsent`、`loadConfig`(80)、`speakImpl`(746)、`serialSpeak`(519)、`sleep`(515)、`voiceQueue`(1414)（播报复用）、`quote`(503)、`timerSvc`
+- Consumes: Task 3 的 `consent/grantConsent/hasConsent/clearConsent`、`consentPending/markConsentPending/consumeConsentPending`、`callActiveSessions/isCallActive`、`loadConfig`(80)、`speakImpl`(746)、`serialSpeak`(519)、`sleep`(515)、`voiceQueue`(1414)（播报复用）、`quote`(503)、`timerSvc`
 - Produces:
   - `WRITE_TOOL_NAMES = ['write', 'edit']`（精确工具名）+ `DESTRUCTIVE_BASH_RE`（bash 破坏性命令启发式）
   - `async consensusSummary(exec): Promise<string>`（一句话摘要：目标路径 + 操作类型 + 片段）
-  - `async announceAndWait(sid, text): Promise<'proceed'|'aborted'>`（播报摘要 → 3s 窗口 → 监听 `callActive` 标志 → 定案）
-  - `callActiveFlags: Map<sessionId, boolean>` + RPC `guide-dog/call-active`（`{sessionId, active}`）
-  - `tools/pre-execute` 拦截器（仅通话/a11y 生效）：无 consent → `deny {reason:'needs_voice_confirmation'}`；有 consent → 摘要 + 窗口 → `allow` 或 `deny {reason:'aborted_by_user'}`
+  - `async announceAndWait(sid, text): Promise<'proceed'|'aborted'>`（播报摘要 → 3s 窗口 → 监听 speaking 标志 → 定案；C5 修复：快照在窗口开始后取）
+  - `callActiveFlags: Map<sessionId, boolean>`（瞬时 speaking）+ RPC `guide-dog/call-active`（`{sessionId, active, kind:'session'|'speaking'}`；C4 修复：kind 分流持久激活/瞬时发声）
+  - user 确认词监听器（C1 修复）：`session/event` 的 `user/message` 分支 → `CONSENT_YES_RE`/`CONSENT_NO_RE` 匹配 → `markConsentPending`/`clearConsent`
+  - `tools/pre-execute` 拦截器（仅通话/a11y 生效）：无 consent 且无 pending → `deny {reason:'needs_voice_confirmation'}`；pending 消费后 grantConsent；有 consent → 摘要 + 窗口 → `allow` 或 `deny {reason:'aborted_by_user'}`
   - `guide_dog_call_consensus` systemPrompt variable（聊天感措辞，spec §6.7）
   - `guide_dog_a11y_constraints` systemPrompt variable（仅 a11y，Phase 3 预置；本任务先注册空实现，Task 15 验收联动）
 
@@ -1023,6 +1082,9 @@ git commit -m "feat(phase2): call capture state machine — MediaRecorder + Anal
 
 ```js
 // repro/repro-consensus.js：摘要生成与 consent 判定
+// M9 修订（2026-08-16 审稿）：repro 用与实现完全相同的 DESTRUCTIVE_BASH_RE（实现见 Step 3），
+// 避免测试与实现正则漂移。
+const DESTRUCTIVE_BASH_RE = /(^|\s|\||;|&&)(rm|mv|cp|truncate|dd|mkfs|git\s+push)\b|>>?[\s\S]*$/m
 function consensusSummary(name, args) {
   if (name === 'write') {
     const p = args && args.file_path ? String(args.file_path) : ''
@@ -1036,7 +1098,7 @@ function consensusSummary(name, args) {
   }
   if (name === 'bash') {
     const cmd = args && args.command ? String(args.command) : ''
-    if (/rm\s+-rf?\s|mv\s|cp\s|truncate\s|dd\s|>\s|git\s+push/.test(cmd)) return '执行命令：' + cmd.slice(0, 80)
+    if (DESTRUCTIVE_BASH_RE.test(cmd)) return '执行命令：' + cmd.slice(0, 80)
     return ''
   }
   return ''
@@ -1044,6 +1106,7 @@ function consensusSummary(name, args) {
 console.assert(consensusSummary('write', { file_path: 'README.md', content: 'abc' }) === '写入文件 README.md（3 字符）', 'FAIL: write summary')
 console.assert(consensusSummary('bash', { command: 'rm -rf dist' }) !== '', 'FAIL: destructive bash detected')
 console.assert(consensusSummary('bash', { command: 'ls -la' }) === '', 'FAIL: benign bash must not block')
+console.assert(consensusSummary('bash', { command: 'echo "a > b"' }) !== '', 'FAIL: redirect-overwrite must block') // >>?[\s\S]*$ 对含 > 的命令保守拦截
 console.log('PASS: consensus summary + destructive heuristic')
 ```
 
@@ -1080,28 +1143,58 @@ Expected: `PASS: consensus summary + destructive heuristic`。
         return ''
       } catch (e) { return '' }
     }
-    const callActiveFlags = new Map() // sessionId -> boolean
+    const callActiveFlags = new Map() // sessionId -> boolean（瞬时：用户正在发声，Task 9 窗口期高灵敏上报）
     ctx.effect(function () {
       try {
+        // C4 修复（2026-08-16 审稿）：call-active RPC 拆两用——
+        //   {active:true, kind:'session'} → callActiveSessions.add（持久激活，Task 7 startCall/stopCall 上报）
+        //   {active:true/false, kind:'speaking'} → callActiveFlags.set（瞬时发声，Task 9 共识窗口上报）
         return harness.handle('guide-dog/call-active', async function (args) {
           const sid = args && args.sessionId ? String(args.sessionId) : ''
           if (!sid) return { ok: false, error: 'bad_args' }
-          callActiveFlags.set(sid, !!(args && args.active))
+          const kind = args && args.kind === 'session' ? 'session' : 'speaking'
+          const active = !!(args && args.active)
+          if (kind === 'session') {
+            if (active) callActiveSessions.add(String(sid))
+            else callActiveSessions.delete(String(sid))
+          } else {
+            callActiveFlags.set(String(sid), active)
+          }
           return { ok: true }
         })
       } catch (e) { return function () {} }
     })
     async function announceAndWait(sid, text) {
-      // 播报摘要（走同一 TTS 管线，source:'consensus'）；等待窗口；期间用户发声（callActive 置位）→ aborted
-      const before = callActiveFlags.get(String(sid)) || false
+      // 播报摘要（走同一 TTS 管线，source:'consensus'）；等待窗口；期间用户发声（speaking 置位）→ aborted
+      // C5 修复（2026-08-16 审稿）：① 摘要必须入 voiceQueue 且**带 consensus 标记**（speakImpl 只生成 mp3
+      //   不排队，旧代码直接 speakImpl → client 轮询取不到 → 用户听不到摘要、窗口永不开启）；
+      //   ② 只在生成完成后推最终条目（占位条目会被 client 先弹出——队列是 shift 语义）；
+      //   ③ 窗口在**摘要生成完成**后开始计时（client 播放到它需要 ~1-2s，窗口覆盖播放尾声与之后）；
+      //   ④ 窗口期监听 speaking 标志从 false 变 true（Task 9 开窗即上报的旧语义自噬，已改为仅真实发声上报）。
       await serialSpeak(function () {
-        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'consensus' }).catch(function () { return null })
+        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'consensus' }).then(function (r) {
+          const q2 = voiceQueue.get(String(sid)) || []
+          if (r && r.ok && r.url) {
+            q2.push({ url: r.url, key: 'consensus:' + sid + ':' + Date.now(), consensus: true })
+          } else {
+            q2.push({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          }
+          if (q2.length > VOICE_QUEUE_MAX) q2.shift()
+          voiceQueue.set(String(sid), q2)
+        }).catch(function (e) {
+          const q3 = voiceQueue.get(String(sid)) || []
+          q3.push({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.shift()
+          voiceQueue.set(String(sid), q3)
+        })
       })
       const cfg = loadConfig()
       const winMs = (cfg.call && cfg.call.consensus && cfg.call.consensus.summaryWindowMs) || 3000
       const start = Date.now()
+      // 窗口开始：清瞬时标志，之后任何发声都会置 true → aborted
+      callActiveFlags.set(String(sid), false)
       while (Date.now() - start < winMs) {
-        if ((callActiveFlags.get(String(sid)) || false) !== before) return 'aborted'
+        if (callActiveFlags.get(String(sid)) === true) return 'aborted'
         await sleep(100)
       }
       return 'proceed'
@@ -1112,6 +1205,25 @@ Expected: `PASS: consensus summary + destructive heuristic`。
       const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
       return !!(a11yOn || callOn)
     }
+    // C1 修复（2026-08-16 审稿）：user 确认词监听器——用户回复"确定/确认/可以/好"（普通回合内容）
+    // → markConsentPending(sid)；下一次 pre-execute 消费该 pending 并 grantConsent。
+    // 注意：监听 user 消息事件（Phase 1 的 session/event 监听的是 assistant/message，此处是 user 消息分支）。
+    const CONSENT_YES_RE = /^(确定|确认|可以|好的?|行|就这么办|继续)$/
+    const CONSENT_NO_RE = /^(取消|不行|不要|算了|停)$/
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'user/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid || !consensusEnabled(sid)) return
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join(' ').trim()
+        if (!text) return
+        const t = text.replace(/[，。！？\s]/g, '')
+        if (CONSENT_YES_RE.test(t)) markConsentPending(sid)
+        else if (CONSENT_NO_RE.test(t)) { clearConsent(sid); callActiveFlags.set(String(sid), false) }
+      } catch (e) { /* best effort */ }
+    })
     ctx.on('tools/pre-execute', async function (exec, next) {
       try {
         // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
@@ -1127,6 +1239,10 @@ Expected: `PASS: consensus summary + destructive heuristic`。
         const summary = consensusSummary(name, args)
         if (!summary) return next()
         const turnSeq = exec.agent ? exec.agent.turn : null
+        // C1 修复：未共识但用户刚说过确认词 → 消费 pending 并授予本轮 consent（不拦截）
+        if (!hasConsent(sid, turnSeq) && consumeConsentPending(sid)) {
+          grantConsent(sid, turnSeq) // 原样存储：null → hasConsent 退化为"已授予"；数字 → 精确匹配
+        }
         if (hasConsent(sid, turnSeq)) {
           // 已共识：执行前摘要 + 打断窗口
           const verdict = await announceAndWait(sid, '接下来' + summary)
@@ -1140,6 +1256,8 @@ Expected: `PASS: consensus summary + destructive heuristic`。
       }
     })
 ```
+
+> **窗口时序说明（C5 补充）**：host 在**摘要生成完成**后开始计时窗口（约覆盖播放尾声 + 完整 3s 窗口）。用户若在摘要播放期间发声（barge-in 已停播）→ speaking 标志置 true → 同样 `aborted`——语义一致（"摘要期间说话即中止"）。若需更精确的"播完才开始窗口"，可升级为 client 播完回调 RPC（backlog，v1 不实现——当前重叠语义已满足 spec §6.9 验收 7）。
 
 > ⚠️ **spec §6.8 裁决冲突修正**：spec 写"拦截器自身失败→拒绝并口播"，但本任务 Step 3 的 catch 为 `return next()` 放行。**以 spec §6.8 为准（拒绝并口播）**——catch 分支改为：
 
@@ -1199,8 +1317,8 @@ git commit -m "feat(phase2): consensus-first interceptor — pre-execute deny, s
 - Modify: `guide-dog-dsh/plugin-client.js`（CALL PANEL 节内）
 
 **Interfaces:**
-- Consumes: Task 7 的 `callActiveRpc(active)`、`callMic`/`analyser`（RMS 检测）、Task 8 的 host `guide-dog/call-active` RPC
-- Produces: `setConsensusWindow(on: boolean)`——窗口开启时 VAD 轮询改为高灵敏度（threshold × 0.6）并立即上报 `callActiveRpc(true)`；窗口关闭恢复
+- Consumes: Task 7 的 `callActiveRpc(kind, active)`（`'speaking'` 通道）、`callMic`/`analyser`（RMS 检测）、Task 8 的 host `guide-dog/call-active` RPC
+- Produces: `setConsensusWindow(on: boolean)`——窗口开启时 VAD 轮询改为高灵敏度（threshold × 0.6），**真实发声才上报** `callActiveRpc('speaking', true)`（C5 修复：开窗不立即上报，防 host 自噬）；窗口关闭恢复并上报 false
 
 **背景**：host 的 3s 窗口靠 `callActiveFlags` 判断用户是否发声（Task 8）。client 需在**摘要播报期间**保证：用户一开口（哪怕短音）就置位标志。默认 VAD 轮询有 `minSpeechMs` 过滤——窗口期要更敏感。
 
@@ -1213,8 +1331,8 @@ git commit -m "feat(phase2): consensus-first interceptor — pre-execute deny, s
     function setConsensusWindow(on) {
       consensusWindow = !!on
       if (on && callMic) {
-        // 窗口开启：立即上报一次，并用高灵敏度轮询 100ms 间隔
-        callActiveRpc(true)
+        // 窗口开启：**不**立即上报（C5 修复：host 端 announceAndWait 在窗口开始后清标志并监听
+        // false→true 跳变；开窗即上报会自噬——host 会把"开窗瞬间的 true"当成用户发声）
         const threshold = ((voiceState.cfg || {}).call && voiceState.cfg.call.vad && voiceState.cfg.call.vad.threshold) || 0.02
         const sampleBuf = new Uint8Array(callMic.analyser.fftSize)
         const probe = function () {
@@ -1223,17 +1341,17 @@ git commit -m "feat(phase2): consensus-first interceptor — pre-execute deny, s
           let sum = 0
           for (let i = 0; i < sampleBuf.length; i++) { const v = (sampleBuf[i] - 128) / 128; sum += v * v }
           const rms = Math.sqrt(sum / sampleBuf.length)
-          if (rms >= threshold * 0.6) { callActiveRpc(true) } // 短音即上报（host 端靠差值判定 aborted）
+          if (rms >= threshold * 0.6) { callActiveRpc('speaking', true) } // 真实发声才上报（高灵敏，短音即报）
           setTimeout(probe, 100)
         }
         setTimeout(probe, 100)
       } else if (!on) {
-        callActiveRpc(false)
+        callActiveRpc('speaking', false)
       }
     }
 ```
 
-> 注意：窗口期上报的是**瞬时标志**，host 端 `announceAndWait` 用"窗口开始前后标志差"判定（Task 8 `before` 快照）。用户窗口内发声 → client 置 true → host 见差 → `aborted`。窗口结束后 host 会放行；若用户恰在窗口末发声，host 已放行——可接受（窗口语义是"给打断机会"，不是绝对闸门）。
+> 注意（2026-08-16 审稿修订）：窗口期上报的是**瞬时 speaking 标志**，host 端 `announceAndWait` 在窗口开始时 `callActiveFlags.set(sid, false)` 清零，之后任何真实发声（RMS ≥ 阈值×0.6）→ client 置 true → host 见 true → `aborted`。**开窗瞬间不上报**是防自噬的关键（旧语义"开窗即上报一次"会被 host 误判为发声）。窗口结束后 host 放行；若用户恰在窗口末发声，host 已放行——可接受（窗口语义是"给打断机会"，不是绝对闸门）。
 
 - [ ] **Step 2: 接入播放器与摘要播报**
 
@@ -1300,28 +1418,24 @@ Expected: `PASS: progress phrase mapping`。
     function shouldAnnounce(name) { return !PROGRESS_SILENT[name] }
     function callOrA11yActive(sid) {
       const cfg = loadConfig()
-      return !!((cfg.call && cfg.call.progress && (callActiveFlags.get(String(sid)) || false)) || (cfg.a11y && cfg.a11y.enabled))
+      // C4 修复：读持久 callActiveSessions（isCallActive），不再读瞬时 callActiveFlags
+      return !!((cfg.call && cfg.call.progress && isCallActive(sid)) || (cfg.a11y && cfg.a11y.enabled))
     }
     function announce(sid, text) {
-      const q = voiceQueue.get(String(sid)) || []
-      // 播报优先：插到队首
-      q.unshift({ url: null, phrase: text, priority: true })
-      if (q.length > VOICE_QUEUE_MAX) q.pop()
-      voiceQueue.set(String(sid), q)
-      // 后台合成（不阻塞事件循环）
+      // 播报优先：生成完成后才入队（C5 同款修复——占位条目 {url:null, phrase} 会被 client 轮询
+      // shift 弹出后丢弃，旧代码先 unshift 占位再回填 → 播报大概率丢失）
       serialSpeak(function () {
         return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'progress' }).then(function (r) {
           const q2 = voiceQueue.get(String(sid)) || []
-          const i = q2.findIndex(function (e) { return e.phrase === text })
-          if (i >= 0) {
-            if (r && r.ok && r.url) q2[i] = { url: r.url, key: 'progress:' + sid + ':' + text }
-            else q2[i] = { error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' }
-            voiceQueue.set(String(sid), q2)
-          }
+          if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'progress:' + sid + ':' + text })
+          else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+          voiceQueue.set(String(sid), q2)
         }).catch(function (e) {
           const q3 = voiceQueue.get(String(sid)) || []
-          const i = q3.findIndex(function (e2) { return e2.phrase === text })
-          if (i >= 0) { q3[i] = { error: 'tts_failed', message: String(e).slice(0, 200) }; voiceQueue.set(String(sid), q3) }
+          q3.unshift({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.pop()
+          voiceQueue.set(String(sid), q3)
         })
       })
     }
@@ -1501,7 +1615,7 @@ Expected: `PASS: sentence splitting + maxChars truncation`。
         const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
         if (!sid) return
         const cfg = loadConfig()
-        const callActive = callActiveFlags.get(sid) || false
+        const callActive = isCallActive(sid) // C4 修复：持久激活（Task 7 startCall/stopCall 上报）
         const a11yOn = cfg.a11y && cfg.a11y.enabled
         if (!callActive && !a11yOn) return // 仅通话/a11y 会话走流式；语音模式走 Phase 1 队列
         const data = event.data || {}
@@ -1518,7 +1632,7 @@ Expected: `PASS: sentence splitting + maxChars truncation`。
     })
 ```
 
-> ⚠️ **与 Phase 1 voice-mode 监听器共存（2026-08-16 新增注意）**：Phase 1 的 `session/event` 监听器（行 1415，VOICE MODE 节）在语音模式生效时也会为同一消息入队 mp3 条目——**通话激活 + 语音模式开启同时成立时会双播**。本 Task 的监听器需在 Phase 1 监听器内加互斥：语音模式监听器入口处，若 `callActiveFlags.get(sid)` 为真（或 a11y 开启）则跳过（流式通道接管）。实现时改 VOICE MODE 节的 listener 首部（行 1415-1421），加一行：`if ((callActiveFlags.get(sid) || false) || (loadConfig().a11y && loadConfig().a11y.enabled)) return`——注意 `callActiveFlags` 在 Task 3 定义（本监听器先注册但回调运行时 Task 3 已执行，模块级 Map 引用安全）。
+> ⚠️ **与 Phase 1 voice-mode 监听器共存（2026-08-16 新增注意）**：Phase 1 的 `session/event` 监听器（行 1415，VOICE MODE 节）在语音模式生效时也会为同一消息入队 mp3 条目——**通话激活 + 语音模式开启同时成立时会双播**。本 Task 的监听器需在 Phase 1 监听器内加互斥：语音模式监听器入口处，若 `isCallActive(sid)` 为真（或 a11y 开启）则跳过（流式通道接管）。实现时改 VOICE MODE 节的 listener 首部（行 1415-1421），加一行：`if (isCallActive(sid) || (loadConfig().a11y && loadConfig().a11y.enabled)) return`——注意 `callActiveSessions`/`isCallActive` 在 **Task 8** 定义（本监听器先注册但回调运行时 Task 8 已执行，模块级引用安全）。
 
 > ✅ **2026-08-16 修订（静态 bundle）**：host 半跑在 DSH host Node 进程，**`URL`/`URLSearchParams` 全局可用**——直接 `new URL(req.url, 'http://local')` + `searchParams`，无需手写解析。以标准 URL 为准：
 
@@ -1599,7 +1713,7 @@ Expected: `PASS: PCM→WAV wrapper (24kHz s16le mono)`。
 
 ```js
     // ============ STREAM PLAYER 节（Phase 2，client） ============
-    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, token: '', tokenAt: 0 }
+    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null }
     function getTtsToken(sid) {
       return host.call('guide-dog/tts-token', { sessionId: sid }).then(function (r) {
         return (r && r.ok && r.token) ? r.token : ''
@@ -1645,7 +1759,9 @@ Expected: `PASS: PCM→WAV wrapper (24kHz s16le mono)`。
     }
     async function playStreamEntry(entry, sid) {
       if (streamPlayer.active) { stopStreamPlayback() } // 新任务覆盖（v2.1 语义）
-      if (!streamPlayer.token) streamPlayer.token = await getTtsToken(sid)
+      // C3 修复（2026-08-16 审稿）：token 为**单次消费**（consumeTtsToken 即删）——每句都必须重新签发，
+      // 不得缓存复用（旧代码 `if (!streamPlayer.token)` 只取一次 → 第二句起 403）。
+      streamPlayer.token = await getTtsToken(sid)
       if (!streamPlayer.token) { showToast('流式播放失败：无 token'); return }
       const cfg = voiceState.cfg || {}
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
@@ -1703,14 +1819,37 @@ Expected: `PASS: PCM→WAV wrapper (24kHz s16le mono)`。
     }
 ```
 
-- [ ] **Step 4: 轮询消费识别 stream 条目**
+- [ ] **Step 4: 轮询消费识别 stream 条目（新增通话专用轮询，I1 修复）**
 
-修改 Phase 1 轮询（行 400-410）：`r.entry.url` 分支保留；新增 `r.entry.stream` 分支：
+Phase 1 轮询（行 400-410）被 `effective`（语音模式生效）门控——**通话模式下语音模式可能关闭，stream 条目无人消费**（I1，2026-08-16 审稿）。修复：在 CALL PANEL 节新增**通话专用轮询**（`callActive` 为真时运行），与 Phase 1 轮询并存；Phase 1 轮询的 `r.entry.url` 分支保留：
 
 ```js
-                if (r.entry.url) playEntry(r.entry.url)
-                else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; playStreamEntry(r.entry, sid) }
-                else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
+    // ---- 通话轮询（CALL PANEL 节内；I1：不受语音模式门控） ----
+    let callPollBusy = false
+    const callPoll = function () {
+      if (!callState.active || callPollBusy) return
+      callPollBusy = true
+      host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
+        if (r && r.ok && r.entry) {
+          // C5 修复：consensus 摘要条目（mp3 url + consensus 标记）→ 播放前开共识窗口
+          if (r.entry.consensus) { notifyConsensusSpeech(true); playEntryConsensus(r.entry.url) }
+          else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; playStreamEntry(r.entry, callSessionId || '') }
+          else if (r.entry.url) playEntry(r.entry.url)
+          else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
+        }
+      }).catch(function () {}).then(function () { callPollBusy = false })
+    }
+    // C5：共识 mp3 播放（window 关闭由 onended 触发；与 playEntry 同机制，附加回调）
+    function playEntryConsensus(url) {
+      stopCurrent()
+      const a = new Audio(String(url))
+      curAudio = a
+      a.onended = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false) }
+      a.onerror = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false); showToast('播放失败') }
+      const p = a.play()
+      if (p && typeof p.catch === 'function') p.catch(function () { if (curAudio === a) { curAudio = null; notifyConsensusSpeech(false) } })
+    }
+    // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）或 Task 7 startCall 内 timerSvc.interval
 ```
 
 > `lastSpokenSentence` 变量定义于 Task 13 命令节（`let lastSpokenSentence = null`）——模块级执行顺序安全（赋值发生在用户操作时，晚于模块全部初始化）；若实现时调整了声明位置，确保声明在任何赋值前。
@@ -1878,20 +2017,19 @@ git commit -m "feat(phase2): barge-in wiring + voice commands (pause/resume/repe
     const heartbeatTimer = timerSvc && typeof timerSvc.interval === 'function'
       ? timerSvc.interval(function () {
           const now = Date.now()
-          callActiveFlags.forEach(function (active, sid) {
-            if (!active) return
-            const last = lastAgentEvent.get(sid) || now
+          // C4 修复：遍历持久激活集合（callActiveSessions），不再读瞬时 callActiveFlags
+          callActiveSessions.forEach(function (sid) {
+            const last = lastAgentEvent.get(String(sid)) || now
             if (now - last > 120000) {
-              lastAgentEvent.set(sid, now) // 防重复轰炸
-              const q = voiceQueue.get(sid) || []
-              q.unshift({ url: null, phrase: '仍在处理，请稍候', priority: true })
-              if (q.length > VOICE_QUEUE_MAX) q.pop()
-              voiceQueue.set(sid, q)
+              lastAgentEvent.set(String(sid), now) // 防重复轰炸
+              // C5 同款：生成完成后才入队（占位条目会被 client 先弹出）
               serialSpeak(function () {
-                return speakImpl({ text: '仍在处理，请稍候', sessionId: sid, turnSeq: null, source: 'progress' }).then(function (r) {
-                  const q2 = voiceQueue.get(sid) || []
-                  const i = q2.findIndex(function (e) { return e.phrase === '仍在处理，请稍候' })
-                  if (i >= 0) { if (r && r.ok && r.url) q2[i] = { url: r.url, key: 'hb:' + sid } }
+                return speakImpl({ text: '仍在处理，请稍候', sessionId: String(sid), turnSeq: null, source: 'progress' }).then(function (r) {
+                  const q2 = voiceQueue.get(String(sid)) || []
+                  if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'hb:' + String(sid) })
+                  else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+                  if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+                  voiceQueue.set(String(sid), q2)
                 }).catch(function () {})
               })
             }
@@ -1921,10 +2059,9 @@ git commit -m "feat(phase2): barge-in wiring + voice commands (pause/resume/repe
         if (streamPlayer.active) {
           streamPlayer.active = false
           setCallState({ phase: 'listening', error: '播放中断' })
-          // 重连一次（重新取 token + GET）
+          // 重连一次（C3：每句已重新取 token，playStreamEntry 内部即新 token + GET）
           if (!playStreamEntry._retried) {
             playStreamEntry._retried = true
-            streamPlayer.token = ''
             playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
             setTimeout(function () { playStreamEntry._retried = false }, 5000)
           } else {
@@ -1962,9 +2099,17 @@ cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh
 node --check plugin-host.js && node --check plugin-client.js
 python3 deploy/convert_bundle.py   # 重生成 bundle/lib/index.js + bundle/lib/client.js
 node --check bundle/lib/index.js && node --check bundle/lib/client.js
-# 一致性校验（publish.py verify_sources）：模板与产物应同步
 ```
-Expected: convert 成功 + 双侧语法通过 + 一致性校验通过（`verify_sources` 无 diff）。
+Expected: convert 成功 + 双侧语法通过。
+
+- [ ] **Step 1b: publish.py 一致性校验（M2 修订）**
+
+`deploy/publish.py` 的 `verify_sources()` 现已**不校验 plugin-source.js**（2026-08-16 审稿 C2 修复）：它检查 ① WHISPER_SCRIPT 模板与 `scripts/whisper_transcribe.py` 全等；② `bundle/lib/index.js` 与 `client.js` 的 mtime 不早于两份真源（防止漏跑 convert_bundle.py）。运行确认通过：
+
+```bash
+cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && python3 -c "import ast; ast.parse(open('deploy/publish.py').read()); print('publish.py syntax OK')"
+```
+Expected: 语法 OK；`publish.py` 实际运行时 `verify_sources()` 打印 "sources verified: whisper template consistent; bundle/lib newer than sources"。
 
 - [ ] **Step 2: README Phase 2 章节**
 

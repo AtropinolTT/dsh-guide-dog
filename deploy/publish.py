@@ -60,17 +60,20 @@ def verify_sources():
     script = open(os.path.join(REPO, 'scripts', 'whisper_transcribe.py'), encoding='utf-8').read()
     if tpl != script:
         fail('plugin-host.js WHISPER_SCRIPT template != scripts/whisper_transcribe.py — re-sync first')
-    # 2) Deploy bundle must match the two sources exactly.
-    bundle = open(os.path.join(REPO, 'plugin-source.js'), encoding='utf-8').read()
-    nl = bundle.find('\n')
-    sep = bundle.find('\n// ==== CLIENT HALF ====\n')
-    if nl < 0 or sep <= nl:
-        fail('plugin-source.js separator not found — regenerate the bundle')
-    if bundle[nl + 1:sep] != host.rstrip('\n'):
-        fail('plugin-source.js host part != plugin-host.js — regenerate the bundle')
-    if bundle[sep + len('\n// ==== CLIENT HALF ====\n'):] != client:
-        fail('plugin-source.js client part != plugin-client.js — regenerate the bundle')
-    print('sources verified: template + bundle parts all consistent')
+    # 2) The static bundle (the active delivery) must be regenerated from the
+    #    current sources. convert_bundle.py transforms the halves (compat layer,
+    #    GLOBAL_ROOT, ModuleLoader wrapper), so exact-match is impossible here;
+    #    instead require bundle/lib to be newer than both sources. The legacy
+    #    plugin-source.js concatenation is NOT the deploy artifact anymore and
+    #    is deliberately not compared (2026-08-16 static-bundle migration).
+    src_mtime = max(os.path.getmtime(os.path.join(REPO, s)) for s in SOURCES)
+    for rel in ('lib/index.js', 'lib/client.js'):
+        p = os.path.join(REPO, 'bundle', rel)
+        if not os.path.isfile(p):
+            fail('bundle/' + rel + ' missing — run python3 deploy/convert_bundle.py first')
+        if os.path.getmtime(p) < src_mtime:
+            fail('bundle/' + rel + ' older than sources — run python3 deploy/convert_bundle.py first')
+    print('sources verified: whisper template consistent; bundle/lib newer than sources')
 
 
 def sha256(path):
