@@ -878,6 +878,30 @@ return {
       host.call('guide-dog/call-active', { sessionId: callSessionId || '', kind: kind, active: active }).catch(function () {})
     }
 
+    let consensusWindow = false
+    function setConsensusWindow(on) {
+      consensusWindow = !!on
+      if (on && callMic) {
+        // 窗口开启：**不**立即上报（C5 修复：host 端 announceAndWait 在窗口开始后清标志并监听
+        // false→true 跳变；开窗即上报会自噬——host 会把"开窗瞬间的 true"当成用户发声）
+        const threshold = ((voiceState.cfg || {}).call && voiceState.cfg.call.vad && voiceState.cfg.call.vad.threshold) || 0.02
+        const sampleBuf = new Uint8Array(callMic.analyser.fftSize)
+        const probe = function () {
+          if (!consensusWindow || !callMic) return
+          callMic.analyser.getByteTimeDomainData(sampleBuf)
+          let sum = 0
+          for (let i = 0; i < sampleBuf.length; i++) { const v = (sampleBuf[i] - 128) / 128; sum += v * v }
+          const rms = Math.sqrt(sum / sampleBuf.length)
+          if (rms >= threshold * 0.6) { callActiveRpc('speaking', true) } // 真实发声才上报（高灵敏，短音即报）
+          setTimeout(probe, 100)
+        }
+        setTimeout(probe, 100)
+      } else if (!on) {
+        callActiveRpc('speaking', false)
+      }
+    }
+    function notifyConsensusSpeech(started) { setConsensusWindow(started) }
+
     // 供 Task 8/9 共识窗口查询（brief Interfaces 产物）：当前 RMS 是否达到语音阈值
     function isUserSpeaking() {
       const cfg = voiceState.cfg || {}
