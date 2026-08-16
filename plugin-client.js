@@ -772,9 +772,16 @@ return {
             for (let i = 0; i < sampleBuf.length; i++) { const v = (sampleBuf[i] - 128) / 128; sum += v * v }
             const rms = Math.sqrt(sum / sampleBuf.length)
             callRms = rms // isUserSpeaking 查询用
-            if (!callSegmentActive) { callMic.raf = requestAnimationFrame(tick); return }
-            const now = Date.now()
             const voiced = rms >= threshold
+            if (!callSegmentActive) {
+              // VAD 自动起段（spec 6.9.1：说话-停顿-说话 两段成回合，无需点击）：
+              // 无活动段且检测到语音 → 自动 startSegment；PTT 模式由 mode 门控排除；
+              // barge-in 在段内路径（下方），auto-start 仅在 !callSegmentActive 时触发，互不冲突
+              if (callState.mode === 'vad' && voiced) startSegment()
+              callMic.raf = requestAnimationFrame(tick)
+              return
+            }
+            const now = Date.now()
             if (voiced) { voicedSince = now; lastVoiced = true }
             else if (lastVoiced) { silentSince = now; lastVoiced = false }
             const isSpeaking = voiced || (now - voicedSince < silenceMs)
