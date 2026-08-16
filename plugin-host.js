@@ -1761,6 +1761,102 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         announce(sid, '处理出错：' + String((err && err.message) || err).slice(0, 60))
       } catch (e) { /* best effort */ }
     })
+    // ---- 下行流式 TTS（spec §6.5，零 WebSocket） ----
+    function splitSentences(text, splitChars, maxChars) {
+      if (!text) return []
+      const chars = splitChars || '。！？.!?\n'
+      const esc = chars.replace(/[\\\]]/g, '\\$&')
+      const re = new RegExp('[' + esc + ']', 'g')
+      const out = []
+      let last = 0, m
+      while ((m = re.exec(text)) !== null) {
+        const seg = text.slice(last, m.index + 1).trim()
+        if (seg) out.push(seg)
+        last = m.index + 1
+      }
+      const tail = text.slice(last).trim()
+      if (tail) out.push(tail)
+      const res = []
+      for (const s of out) {
+        if (s.length <= maxChars) res.push(s)
+        else for (let i = 0; i < s.length; i += maxChars) res.push(s.slice(i, i + maxChars))
+      }
+      return res
+    }
+    const speechStreamBusy = new Map() // sessionId -> bool
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact',
+          path: '/guide-dog/tts-stream',
+          handler: async function (req, res) {
+            try {
+              if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+              const url = new URL(String(req.url || '/'), 'http://local')
+              const token = url.searchParams.get('token') || ''
+              const sid = url.searchParams.get('sid') || ''
+              const text = url.searchParams.get('text') || ''
+              if (!sid || !text || !consumeTtsToken(token, sid)) { res.writeHead(403); res.end(); return }
+              if (speechStreamBusy.get(sid)) { res.writeHead(429); res.end(); return }
+              speechStreamBusy.set(sid, true)
+              const cfg = loadConfig()
+              const streamCfg = (cfg.call && cfg.call.stream) || {}
+              const format = streamCfg.format || 'pcm'
+              const sampleRate = streamCfg.sampleRate || 24000
+              const voice = (cfg.call && cfg.call.voice) || 'English_expressive_narrator'
+              const speed = (cfg.call && cfg.call.speed) || 1.0
+              res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' })
+              let handle = null
+              try {
+                handle = subprocess.spawn({
+                  argv: ['mmx', 'speech', 'synthesize', '--stream', '--text', text, '--format', format, '--sample-rate', String(sampleRate), '--voice', voice, '--speed', String(speed)],
+                  cwd: (await guideDogRoot()) + '/.guide-dog',
+                  stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 1024 * 1024 } },
+                  graceMs: 3000,
+                })
+                let first = true
+                handle.stdout.on('data', function (chunk) {
+                  if (first) { first = false; if (req.method === 'HEAD') { try { handle.terminate() } catch (e) { /* ignore */ } } }
+                  if (req.method === 'HEAD') return
+                  try { res.write(chunk) } catch (e) { try { handle.terminate() } catch (e2) { /* ignore */ } }
+                })
+                await handle.done
+                try { res.end() } catch (e) { /* ignore */ }
+              } catch (e) {
+                try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+              } finally {
+                speechStreamBusy.delete(sid)
+              }
+            } catch (e) {
+              try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+    // 下行主通道：assistant 消息 → 分句 → 流条目入队列（client 播放器识别 stream 条目走 GET）
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'assistant/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const callActive = isCallActive(sid) // C4 修复：持久激活（Task 7 startCall/stopCall 上报）
+        const a11yOn = cfg.a11y && cfg.a11y.enabled
+        if (!callActive && !a11yOn) return // 仅通话/a11y 会话走流式；语音模式走 Phase 1 队列
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
+        if (!text) return
+        const streamCfg = (cfg.call && cfg.call.stream) || {}
+        const sentences = splitSentences(text, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const q = voiceQueue.get(sid) || []
+        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) }) })
+        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        voiceQueue.set(sid, q)
+      } catch (e) { /* best effort */ }
+    })
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
@@ -1778,6 +1874,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const vm = cfg.voiceMode || {}
         const effective = vm.sessions && vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
         if (!effective) return
+        if (isCallActive(sid) || (loadConfig().a11y && loadConfig().a11y.enabled)) return // Phase 2：通话/a11y 由流式通道接管，防双播
         const seq = (typeof event.seq === 'number') ? event.seq : null // M11：缺失时不参与去重（speakImpl 对 null 不去重）
         const data = event.data || {}
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
