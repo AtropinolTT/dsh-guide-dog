@@ -1698,6 +1698,69 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         return { kind: 'deny', reason: 'consensus_failed' }
       }
     })
+    // ---- 进度播报（spec §6.4） ----
+    function progressPhrase(name) {
+      const map = { bash: '正在执行命令', read: '正在查找文件', grep: '正在查找文件', glob: '正在查找文件',
+        write: '正在修改文件', edit: '正在修改文件', web_search: '正在搜索网页',
+        guide_dog_image: '正在生成媒体', guide_dog_video: '正在生成媒体', guide_dog_music: '正在生成媒体', guide_dog_speak: '正在生成媒体',
+        skill: '正在调用技能' }
+      return map[name] || '正在执行操作'
+    }
+    const PROGRESS_SILENT = { read: 1, grep: 1, glob: 1, skill: 1 } // 静默类（Phase 3 自动播报同白名单基础）
+    function shouldAnnounce(name) { return !PROGRESS_SILENT[name] }
+    function callOrA11yActive(sid) {
+      const cfg = loadConfig()
+      // C4 修复：读持久 callActiveSessions（isCallActive），不再读瞬时 callActiveFlags
+      return !!((cfg.call && cfg.call.progress && isCallActive(sid)) || (cfg.a11y && cfg.a11y.enabled))
+    }
+    function announce(sid, text) {
+      // 播报优先：生成完成后才入队（C5 同款修复——占位条目 {url:null, phrase} 会被 client 轮询
+      // shift 弹出后丢弃，旧代码先 unshift 占位再回填 → 播报大概率丢失）
+      serialSpeak(function () {
+        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'progress' }).then(function (r) {
+          const q2 = voiceQueue.get(String(sid)) || []
+          if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'progress:' + sid + ':' + text })
+          else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+          voiceQueue.set(String(sid), q2)
+        }).catch(function (e) {
+          const q3 = voiceQueue.get(String(sid)) || []
+          q3.unshift({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.pop()
+          voiceQueue.set(String(sid), q3)
+        })
+      })
+    }
+    // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
+    // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
+    // sessionId 推导：agent.session.id（T4 探针实证待确认；若证伪改为 agents 服务推导）
+    ctx.on('agent/status', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (!sid || !callOrA11yActive(sid)) return
+        if (payload.status === 'running') announce(sid, '正在处理')
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('tools/result', function (exec, result) {
+      try {
+        const agent = exec && exec.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        const name = exec && exec.name ? String(exec.name) : ''
+        if (!sid || !callOrA11yActive(sid) || !shouldAnnounce(name)) return
+        const phrase = progressPhrase(name)
+        announce(sid, phrase)
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('agent/error', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (!sid || !callOrA11yActive(sid)) return
+        const err = payload.error || {}
+        announce(sid, '处理出错：' + String((err && err.message) || err).slice(0, 60))
+      } catch (e) { /* best effort */ }
+    })
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
