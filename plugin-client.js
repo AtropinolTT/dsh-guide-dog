@@ -54,6 +54,8 @@ return {
     }
     // ---- 模块级播放器：会话切换不中断；新播放任务覆盖旧任务 ----
     let curAudio = null
+    // ---- M9：录音归属会话（修复：卸载后 onstop 校验归属，丢弃陈旧提交） ----
+    let recSessionRef = null // { sid, alive }：录音归属；卸载置 alive=false → onstop 丢弃
     function stopCurrent() {
       if (curAudio) {
         try { curAudio.pause() } catch (e) { /* ignore */ }
@@ -379,6 +381,7 @@ return {
             React.useEffect(function () {
               // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
               return function () {
+                if (recSessionRef) recSessionRef.alive = false // M9：标记录音已死 → 迟到的 onstop 丢弃
                 if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
                 if (micRec) {
                   try { micRec.rec.stop() } catch (e) { /* ignore */ }
@@ -479,9 +482,14 @@ return {
                   rec.onstop = function () {
                     if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
                     if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
+                    // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，而闭包里的 sid/inputActions
+                    // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交。
+                    // 不能以 micRec==null 判陈旧：正常停止路径（toggleMic）也是先置 micRec=null 再 stop。
+                    if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return // M9：丢弃陈旧提交
                     partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
                     transcribe(sid, props.inputActions, set)
                   }
+                  recSessionRef = { sid: sid, alive: true } // M9：录音归属当前会话（onstop 提交前校验）
                   rec.start(1000)
                   micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
                   set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
