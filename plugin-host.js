@@ -1005,6 +1005,47 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       } catch (e) { return function () {} }
     })
 
+    // ============ CALL 上行（Phase 2，host） ============
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact',
+          path: '/guide-dog/call-transcribe',
+          handler: async function (req, res) {
+            try {
+              if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+              // 同源校验（M5 修订 2026-08-16）：Origin 必须等于 GUI 来源——按 Host 头推导
+              // （'http://' + req.headers.host，GUI 由 dsh web 同源托管）；无 Origin 头（curl）放行，
+              // 便于本地验收。不再用 guideDogRoot() 作 truthy 占位。
+              const origin = req.headers && req.headers.origin ? String(req.headers.origin) : ''
+              const hostHdr = req.headers && req.headers.host ? String(req.headers.host) : ''
+              if (origin && hostHdr && origin !== 'http://' + hostHdr) { res.writeHead(403); res.end(); return }
+              // 收集 body（≤20MB 硬上限）
+              const chunks = []
+              let total = 0
+              for await (const chunk of req) {
+                chunks.push(chunk)
+                total += chunk.length
+                if (total > 20 * 1024 * 1024) { res.writeHead(413); res.end(); return }
+              }
+              const b64 = Buffer.concat(chunks).toString('base64')
+              const r = await transcribeImpl({ audioB64: b64, mime: 'audio/webm', sessionId: req.headers && req.headers['x-session-id'] ? String(req.headers['x-session-id']) : '' })
+              if (r.ok) {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: true, text: r.text, language: r.language, durationMs: r.durationMs }))
+              } else {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: r.error, message: r.message || '' }))
+              }
+            } catch (e) {
+              try { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: 'stt_failed', message: String(e).slice(0, 200) })) } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+
     // ---------- prompt section: automatic invocation ----------
     ctx.effect(function () {
       if (!systemPrompt) return function () {}
