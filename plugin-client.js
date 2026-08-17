@@ -20,7 +20,118 @@ return {
 
     // RC14 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc19-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc20-20260817') } catch (e) { /* ignore */ }
+
+    // ============ RC20 i18n：简体中文/英文（跟随 DSH 应用语言设置） ============
+    // locale 服务（client runner 提供）：register(ns, locale, dict) 单语未类型化注册；
+    // bind(ns) → t 翻译函数（读取活动 locale；缺失回退 zh → key 本身 fail loud）；
+    // subscribe 响应语言切换（组件 force 重渲染）。无 locale 服务时 t 原样返回 key。
+    let localeSvc = null
+    try { localeSvc = ctx.get('locale') } catch (e) { localeSvc = null }
+    let t = function (key) { return String(key) }
+    if (localeSvc && typeof localeSvc.register === 'function' && typeof localeSvc.bind === 'function') {
+      const zh = {
+        // 通话 pill / 面板
+        'call.idle': '就绪', 'call.listening': '收听中…', 'call.processing': '处理中…', 'call.speaking': '播报中…',
+        'call.muted': '· 静音',
+        'call.start': '发起语音通话', 'call.stop': '挂断通话', 'call.open': '通话设置', 'call.close': '收起',
+        'call.title': '语音通话',
+        'call.mode': '模式', 'call.modeVad': 'VAD 自动', 'call.modePtt': '按住说话',
+        'call.segPtt': '按住说话', 'call.segVad': '点击手动结束/开始一段',
+        'call.speak': '说话', 'call.recording': '录音中', 'call.mute': '静音', 'call.unmute': '取消静音', 'call.speed': '语速',
+        'call.errStreamToken': '流式播放失败：无 token',
+        // 语音 pill / 面板
+        'voice.title': '语音模式', 'voice.open': '语音设置', 'voice.close': '收起',
+        'voice.tip': '语音模式提示：', 'voice.tipMid': ' · 全局默认：', 'voice.tipEnd': '（点击切换）', 'voice.on': '开', 'voice.off': '关',
+        'voice.stopRec': '停止录音', 'voice.transcribing': '转写中…', 'voice.input': '语音输入',
+        'voice.lang': '识别语言检测', 'voice.auto': '自动', 'voice.zh': '中文', 'voice.en': '英文',
+        'voice.volVoice': '检测到声音输入', 'voice.volNoana': '音量检测不可用（AudioContext 受限）', 'voice.volSilent': '未检测到声音输入（请检查麦克风/远程音频）',
+        'voice.volOn': '●声', 'voice.volNoanaShort': '检测不可用', 'voice.volSilentShort': '○静音',
+        'voice.browserBlock': '浏览器限制：录音需在独立页面进行',
+        'voice.errMicDenied': '麦克风权限被拒绝', 'voice.errNoDevice': '未检测到麦克风设备',
+        'voice.errNoData': '没听清（录音未收到数据，', 'voice.errEmptySpeech': '没听清，请再说一次',
+        'voice.errSttFailed': '转写失败', 'voice.errSttTimeout': '转写超时', 'voice.errEngine': 'STT 引擎不可用（见设置页）',
+        'voice.insertFailed': '无法插入输入框', 'voice.transcribeFailed': '转写失败',
+        // toast
+        'toast.playFailed': '播放失败', 'toast.speakFailed': '朗读失败', 'toast.callTranscribeFailed': '通话转写失败',
+        'toast.callUploadFailed': '通话上传失败', 'toast.playerUnavailable': '播放器不可用',
+        'toast.playInterrupted': '播放中断', 'toast.playInterruptedRetry': '播放中断，已尝试重连',
+        'toast.unlockHint': '点击页面任意位置开启语音播报',
+        // 设置页
+        'settings.title': 'Guide Dog for DSH — MiniMax multimodal',
+        'settings.voiceMode': '语音模式', 'settings.vmDefaultOn': '全局默认开', 'settings.vmDefaultOff': '全局默认关',
+        'settings.vmOverride': '会话 override：输入框左侧悬浮小喇叭按钮点击切换（当前会话生效值以小喇叭为准）。',
+        'settings.voiceInput': '语音输入', 'settings.engine': '引擎', 'settings.engineWhisper': 'whisper（本地）',
+        'settings.engineSherpa': 'sherpa（增强，待装）', 'settings.engineMinimax': 'minimax（保留位）',
+        'settings.language': '语言', 'settings.device': '设备', 'settings.deviceDefault': '默认',
+        'settings.autoSend': '识别后自动发送（误识别内容会直接发出，请谨慎开启）',
+        'settings.noInputDevices': '未枚举到输入设备（远程/无头环境可能需 RDP 音频重定向）',
+        'settings.stt': 'STT', 'settings.whisper': 'faster-whisper', 'settings.whisperAvailable': '可用',
+        'settings.whisperUnavailable': '不可用 — 需 pip install faster-whisper',
+        'settings.model': '模型', 'settings.modelBase': 'base（快）', 'settings.modelSmall': 'small（准）',
+        'settings.speakTester': 'Speak tester', 'settings.textToSpeak': 'Text to speak…',
+        'settings.generating': 'Generating…', 'settings.speakPlay': 'Speak & play',
+        'settings.authCheck': 'Checking mmx auth…', 'settings.authProblem': 'mmx auth problem:',
+        'settings.authOk': 'mmx auth:', 'settings.authKeySet': 'set',
+      }
+      const en = {
+        'call.idle': 'Ready', 'call.listening': 'Listening…', 'call.processing': 'Processing…', 'call.speaking': 'Speaking…',
+        'call.muted': '· muted',
+        'call.start': 'Start voice call', 'call.stop': 'End call', 'call.open': 'Call settings', 'call.close': 'Collapse',
+        'call.title': 'Voice call',
+        'call.mode': 'Mode', 'call.modeVad': 'VAD auto', 'call.modePtt': 'Push to talk',
+        'call.segPtt': 'Push to talk', 'call.segVad': 'Click to end/start a segment manually',
+        'call.speak': 'Speak', 'call.recording': 'Recording', 'call.mute': 'Mute', 'call.unmute': 'Unmute', 'call.speed': 'Speed',
+        'call.errStreamToken': 'Stream playback failed: no token',
+        'voice.tip': 'Voice mode: ', 'voice.tipMid': ' · Global default: ', 'voice.tipEnd': ' (click to toggle)', 'voice.on': 'on', 'voice.off': 'off',
+        'voice.title': 'Voice mode', 'voice.open': 'Voice settings', 'voice.close': 'Collapse',
+        'voice.stopRec': 'Stop recording', 'voice.transcribing': 'Transcribing…', 'voice.input': 'Voice input',
+        'voice.lang': 'Recognition language', 'voice.auto': 'Auto', 'voice.zh': 'Chinese', 'voice.en': 'English',
+        'voice.volVoice': 'Voice detected', 'voice.volNoana': 'Level detection unavailable (AudioContext restricted)', 'voice.volSilent': 'No voice detected (check microphone / remote audio)',
+        'voice.volOn': '●on', 'voice.volNoanaShort': 'n/a', 'voice.volSilentShort': '○mute',
+        'voice.browserBlock': 'Browser restriction: recording must run in a separate page',
+        'voice.errMicDenied': 'Microphone permission denied', 'voice.errNoDevice': 'No microphone device detected',
+        'voice.errNoData': 'No audio received (recording data missing, ', 'voice.errEmptySpeech': 'Could not hear you, please say it again',
+        'voice.errSttFailed': 'Transcription failed', 'voice.errSttTimeout': 'Transcription timed out', 'voice.errEngine': 'STT engine unavailable (see settings)',
+        'voice.insertFailed': 'Failed to insert into input', 'voice.transcribeFailed': 'Transcription failed',
+        'toast.playFailed': 'Playback failed', 'toast.speakFailed': 'Read-aloud failed', 'toast.callTranscribeFailed': 'Call transcription failed',
+        'toast.callUploadFailed': 'Call upload failed', 'toast.playerUnavailable': 'Player unavailable',
+        'toast.playInterrupted': 'Playback interrupted', 'toast.playInterruptedRetry': 'Playback interrupted, retrying',
+        'toast.unlockHint': 'Click anywhere on the page to enable voice playback',
+        'settings.title': 'Guide Dog for DSH — MiniMax multimodal',
+        'settings.voiceMode': 'Voice mode', 'settings.vmDefaultOn': 'Default on', 'settings.vmDefaultOff': 'Default off',
+        'settings.vmOverride': 'Session override: toggle via the floating speaker button beside the input (session value wins).',
+        'settings.voiceInput': 'Voice input', 'settings.engine': 'Engine', 'settings.engineWhisper': 'whisper (local)',
+        'settings.engineSherpa': 'sherpa (enhanced, pending)', 'settings.engineMinimax': 'minimax (reserved)',
+        'settings.language': 'Language', 'settings.device': 'Device', 'settings.deviceDefault': 'Default',
+        'settings.autoSend': 'Auto-send after recognition (mis-transcriptions are sent directly; enable with care)',
+        'settings.noInputDevices': 'No input devices enumerated (remote/headless setups may need RDP audio redirection)',
+        'settings.stt': 'STT', 'settings.whisper': 'faster-whisper', 'settings.whisperAvailable': 'available',
+        'settings.whisperUnavailable': 'unavailable — run pip install faster-whisper',
+        'settings.model': 'Model', 'settings.modelBase': 'base (fast)', 'settings.modelSmall': 'small (accurate)',
+        'settings.speakTester': 'Speak tester', 'settings.textToSpeak': 'Text to speak…',
+        'settings.generating': 'Generating…', 'settings.speakPlay': 'Speak & play',
+        'settings.authCheck': 'Checking mmx auth…', 'settings.authProblem': 'mmx auth problem:',
+        'settings.authOk': 'mmx auth:', 'settings.authKeySet': 'set',
+      }
+      const dispZh = localeSvc.register('guide-dog', 'zh', zh)
+      const dispEn = localeSvc.register('guide-dog', 'en', en)
+      ctx.effect(function () {
+        return function () {
+          try { if (dispZh) dispZh() } catch (e) { /* ignore */ }
+          try { if (dispEn) dispEn() } catch (e) { /* ignore */ }
+        }
+      })
+      t = localeSvc.bind('guide-dog')
+    }
+    // 语言切换响应：locale 快照变更（切语言/字典注册）→ bump tick，各组件 force 重渲染
+    let localeTick = 0
+    if (localeSvc && typeof localeSvc.subscribe === 'function') {
+      ctx.effect(function () {
+        const stop = localeSvc.subscribe(function () { localeTick += 1 })
+        return function () { try { if (stop) stop() } catch (e) { /* ignore */ } }
+      })
+    }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -151,7 +262,7 @@ return {
         if (attempts > 3) {
           voicePlayer.busy = false
           voicePlayer.attempts.delete(key)
-          showToast('播放失败：' + String(entry.text || entry.url || '').slice(0, 24))
+          showToast(t('toast.playFailed') + ': ' + String(entry.text || entry.url || '').slice(0, 24))
           return Promise.resolve()
         }
         const ac = new AbortController()
@@ -188,7 +299,7 @@ return {
             // 自动播放策略拦截：不丢条目，挂起等待用户手势（unlockVoiceAudio 触发重播）
             voicePlayer.busy = false
             voicePlayer.pending.push({ entry: entry, sid: sid })
-            if (!voicePlayer.banner) { voicePlayer.banner = true; showToast('点击页面任意位置开启语音播报') }
+            if (!voicePlayer.banner) { voicePlayer.banner = true; showToast(t('toast.unlockHint')) }
           })
           return Promise.resolve()
         }).catch(function (e) {
@@ -492,232 +603,16 @@ return {
           '.gd-select:hover{background:var(--dsw-alias-bg-layer-2)}' +
           '.gd-sec{font-size:11px;color:var(--dsw-alias-state-error-primary);font-variant-numeric:tabular-nums}' +
           '.gd-err{font-size:11px;color:var(--dsw-alias-state-error-primary);white-space:nowrap}' +
+          '.gd-float-dock{position:fixed;z-index:50;display:flex;align-items:center;gap:6px;flex-direction:row}' +
+          '.gd-float-pill{display:inline-flex;align-items:center;gap:4px;height:34px;padding:0 10px;border-radius:100px;border:1px solid var(--dsw-alias-border-l2,#ccc);background:var(--dsw-alias-button-floating-fill,#fff);box-shadow:var(--dsw-shadow-lv2,0 2px 8px rgba(0,0,0,.12));font-family:inherit;font-size:12px;color:var(--dsw-alias-label-primary,#333);cursor:pointer;white-space:nowrap}' +
+          '.gd-float-icon{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:none;border-radius:50%;background:transparent;cursor:pointer;font-family:inherit;font-size:14px}' +
+          '.gd-panel-up{position:absolute;bottom:calc(100% + 8px);left:0;width:260px;z-index:1000;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l1,#ddd);border-radius:10px;padding:12px;box-shadow:0 4px 16px rgba(0,0,0,.15);font-family:inherit;font-size:13px;color:var(--dsw-alias-label-secondary,#333)}' +
           '.gd-toast{position:fixed;right:16px;bottom:16px;max-width:380px;display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-primary);font-size:12px;line-height:1.5;box-shadow:0 4px 16px rgba(0,0,0,.18);pointer-events:auto;animation:gd-toast-in .18s ease-out}' +
           '.gd-toast-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-error-primary);flex:none}' +
           '.gd-toast-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
           '@keyframes gd-toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}'
         )
       } catch (e) { return function () {} }
-    })
-    ctx.effect(function () {
-      loadVoiceCfg()
-      host.call('guide-dog/beep', {}).then(function (r) { if (r && r.ok) voiceState.beepUri = r.dataUri }).catch(function () {})
-      return slots.inject('conversation.input.left', function () {
-        return slots.register(
-          { name: 'conversation.input.left', id: 'guide-dog-voice', order: 30, label: function () { return 'Voice' } },
-          function (props) {
-            const sid = props.sessionId
-            const effective = voiceEffective(sid)
-            const state = React.useState({ phase: 0, seconds: 0, lang: micLang, error: null }) // mic: 0 idle / 1 recording / 2 transcribing
-            const s = state[0]; const set = state[1]
-            const [tick, setTick] = React.useState(0)
-            React.useEffect(function () {
-              // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
-              return function () {
-                if (recSessionRef) recSessionRef.alive = false // M9：标记录音已死 → 迟到的 onstop 丢弃
-                if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
-                if (micRec) {
-                  try { micRec.rec.stop() } catch (e) { /* ignore */ }
-                  try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
-                  micRec = null
-                }
-              }
-            }, [])
-            React.useEffect(function () {
-              if (!timerSvc || typeof timerSvc.interval !== 'function') return
-              let tickCount = 0
-              const stop = timerSvc.interval(function () {
-                tickCount += 1
-                setTick(tickCount)
-                if (tickCount % 10 === 0) loadVoiceCfg() // 约每 10s 刷新配置（设置页改全局默认后同步）
-              }, 1000)
-              return function () { try { stop() } catch (e) { /* ignore */ } }
-            }, [])
-            React.useEffect(function () {
-              // 语音模式生效时每秒轮询本会话队列；播放本身在模块级，不受会话切换影响
-              // I1（2026-08-16 审稿）：通话期间 stream 条目由通话专用轮询（callPoll）独家消费
-              // ——本轮询停用，保证队列单消费者（Phase 1 的 pop 语义会丢弃无 url 的 stream 条目）
-              if (!effective || callState.active || !sid || pollBusy) return
-              pollBusy = true
-              host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
-                if (r && r.ok && r.entry) {
-                  // RC15：持久播放器（fetch+Blob）；错误条目照旧提示
-                  if (r.entry.url) return playVoiceEntry(r.entry, sid)
-                  else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
-                } else if (r && r.ok && !r.entry) {
-                  // RC15：与 callPoll 同款播放汇总埋点（语音模式 mp3 计数；!r.ok 跳过防跨回合误归零）
-                  if (playCounts.size) {
-                    const summary = Array.from(playCounts.entries()).map(function (e) { return e[0] + '=' + e[1] }).join(' | ')
-                    gdLog('PLAY-SUMMARY ' + summary)
-                    playCounts.clear()
-                  }
-                }
-              }).catch(function () {}).then(function () { pollBusy = false })
-            }, [effective, sid, tick])
-            const startRec = function () {
-              try {
-                // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认（RC16：micAudioReq 单一来源）
-                navigator.mediaDevices.getUserMedia(micAudioReq()).then(function (stream) {
-                  // 音量检测：MediaRecorder 之外并行接 AnalyserNode（2026-08-15 诊断：浏览器录 RDP 虚拟麦克风静音）
-                  let analyser = null
-                  let volTimer = null
-                  try {
-                    // AC 获取修复（2026-08-15）：沙箱里 AudioContext 以全局暴露，window.AudioContext 可能为
-                    // undefined → 先前写法静默跳过音量检测（●声/○静音 永不显示）。全局优先，window 兜底。
-                    var AC = null
-                    try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
-                    if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
-                    if (AC) {
-                      const actx = new AC()
-                      const src = actx.createMediaStreamSource(stream)
-                      analyser = actx.createAnalyser()
-                      analyser.fftSize = 1024
-                      src.connect(analyser)
-                      if (typeof actx.resume === 'function') { try { actx.resume() } catch (e) { /* ignore */ } }
-                      // 每 500ms 读 RMS：UI 显示"检测到声音/未检测到"；持续静音 2.5s 提示。
-                      // 2026-08-15 修复：client 沙箱无全局 setInterval（Builtin 仅 ctx/React/host/styles/console，
-                      // React 也仅暴露 createElement/useState/useEffect），必须用 timer Service 的 interval
-                      // （返回 disposer）。旧代码 setInterval 抛 ReferenceError：volTimer 的被 try 吞掉 →
-                      // 指示永不显示；partial 的 setInterval 在 try 外 → 误报 mic_denied（录音仍在跑）。
-                      const buf = new Uint8Array(analyser.fftSize)
-                      let silentMs = 0
-                      if (timerSvc && typeof timerSvc.interval === 'function') {
-                        volTimer = timerSvc.interval(function () {
-                          try {
-                            analyser.getByteTimeDomainData(buf)
-                            let sum = 0
-                            for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
-                            const rms = Math.sqrt(sum / buf.length)
-                            if (rms >= 0.008) {
-                              silentMs = 0
-                              set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
-                            } else {
-                              silentMs += 500
-                              set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
-                            }
-                          } catch (e) { /* ignore */ }
-                        }, 500)
-                      }
-                    }
-                  } catch (e) { analyser = null }
-                  // 2026-08-15 修复：优先 audio/wav（PCM 增量切片可解码）；webm 增量切片实测无法解码。
-                  // isTypeSupported 检测失败或构造失败 → 回退默认（Chrome 返回 webm/opus）。
-                  micMime = 'audio/wav'
-                  let rec = null
-                  try {
-                    if (typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/wav')) {
-                      rec = new MediaRecorder(stream, { mimeType: 'audio/wav' })
-                    }
-                  } catch (e) { rec = null }
-                  if (!rec) {
-                    micMime = 'audio/webm'
-                    try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
-                  }
-                  micChunks = []; micSeconds = 0
-                  rec.ondataavailable = function (ev) {
-                    if (ev.data && ev.data.size > 0) micChunks.push(ev.data)
-                    micSeconds += 1
-                    set(function (prev) { return Object.assign({}, prev, { seconds: micSeconds }) })
-                    const max = (voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.maxSeconds) || 60
-                    if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
-                  }
-                  rec.onstop = function () {
-                    if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
-                    if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
-                    partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写（须在守卫之前：陈旧路径上迟到的 partial 也不得 ghost 插入旧会话草稿）
-                    // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，而闭包里的 sid/inputActions
-                    // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交。
-                    // 不能以 micRec==null 判陈旧：正常停止路径（toggleMic）也是先置 micRec=null 再 stop。
-                    if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return // M9：丢弃陈旧提交
-                    transcribe(sid, props.inputActions, set)
-                  }
-                  recSessionRef = { sid: sid, alive: true } // M9：录音归属当前会话（onstop 提交前校验）
-                  rec.start(1000)
-                  micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
-                  set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
-                  // 音量检测不可用（AC 获取失败）：phase:1 之后再设 noana（避免被上面的 vol:null 覆盖），
-                  // UI 显示"检测不可用"而非完全不显示（诊断可见）
-                  if (!analyser) {
-                    set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
-                  }
-                  // 实时预览：每 3s 把"上次 partial 之后"的新增音频送去转写（WAV 增量可解码，host 常驻 worker
-                  // 单次 ~0.8s），结果累积进输入框 draft（预览）。webm fallback（不支持 wav 时）退化为
-                  // 全量重传（chunks[0] 起，可解码）+ 覆盖显示。partialBusy 跳过保证不并发堆积。
-                  // timer Service interval（沙箱无 setInterval）；disposer 存 partialTimer 供清理。
-                  partialBusy = false; partialIdx = 0; partialStale = false; partialAcc = ''
-                  if (timerSvc && typeof timerSvc.interval === 'function') {
-                    partialTimer = timerSvc.interval(function () {
-                      if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
-                      partialBusy = true
-                      const isWav = micMime.indexOf('wav') >= 0
-                      // wav：增量（新 chunks）；webm fallback：全量（chunks[0] 起，含头可解码）
-                      const parts = isWav ? micChunks.slice(partialIdx) : micChunks.slice(0)
-                      partialIdx = micChunks.length
-                      const build = isWav ? buildWavBlob(parts) : Promise.resolve(new Blob(parts, { type: micMime }))
-                      build.then(function (blob) {
-                        if (!blob) { partialBusy = false; return }
-                        return blob.arrayBuffer().then(function (buf) {
-                          const bytes = new Uint8Array(buf)
-                          let bin = ''
-                          for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
-                          return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: micMime, sessionId: sid, language: micLang, partial: true })
-                        })
-                      }).then(function (r) {
-                        partialBusy = false
-                        if (!partialStale && r && r.ok && r.text) {
-                          if (isWav) { partialAcc += (partialAcc ? ' ' : '') + r.text; insertText(inputActions, partialAcc) }
-                          else { insertText(inputActions, r.text) } // webm fallback：全量重传，覆盖显示
-                        }
-                      }).catch(function () { partialBusy = false })
-                    }, 3000)
-                  }
-                  playStartTone() // 录音开始提示音：确认录音通道已真正启动
-                }).catch(function (err) {
-                  // 防御：若 micRec 已建立（录音已在运行），说明异常发生在启动后（不应误报权限错误）
-                  if (micRec) return
-                  const name = err && err.name
-                  set(function (prev) { return Object.assign({}, prev, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }) })
-                })
-              } catch (e) { set(function (prev) { return Object.assign({}, prev, { error: 'mic_denied' }) }) }
-            }
-            const toggleMic = function () {
-              if (s.phase === 1) {
-                const r = micRec
-                micRec = null
-                if (r) {
-                  if (r.volTimer) { try { r.volTimer() } catch (e) { /* ignore */ } }
-                  try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
-                }
-                return
-              }
-              if (s.phase === 2) return
-              startRec()
-            }
-            const micErrText = {
-              mic_denied: '麦克风权限被拒绝', no_device: '未检测到麦克风设备',
-              empty_speech: s.diag && s.diag.indexOf('no-data') === 0 ? '没听清（录音未收到数据，' + s.diag.slice(7) + '）' : '没听清，请再说一次',
-              stt_failed: '转写失败', stt_timeout: '转写超时', engine_unavailable: 'STT 引擎不可用（见设置页）',
-              insert_failed: '无法插入输入框',
-            }[s.error] || (s.error ? '转写失败（' + s.error + '）' : null)
-            const vm = (voiceState.cfg && voiceState.cfg.voiceMode) || {}
-            const voiceTip = '语音模式提示：' + (effective ? '开' : '关') + ' · 全局默认：' + (vm.default ? '开' : '关') + '（点击切换）'
-            const micTip = s.phase === 1 ? '停止录音' : (s.phase === 2 ? '转写中…' : '语音输入')
-            return h('div', { className: 'gd-voice' },
-              h('button', { className: 'gd-btn' + (effective ? ' gd-on' : ''), title: voiceTip, onClick: function () { setVoiceOverride(sid, !effective) } }, speakerIcon(effective)),
-              h('select', { className: 'gd-select', value: s.lang, title: '识别语言检测', onChange: function (e) { micLang = e.target.value; set(function (prev) { return Object.assign({}, prev, { lang: e.target.value }) }) } },
-                h('option', { value: 'auto' }, '自动'), h('option', { value: 'zh' }, '中文'), h('option', { value: 'en' }, '英文')),
-              windowCannotRecord()
-                ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', rel: 'noreferrer', title: '浏览器限制：录音需在独立页面进行' }, micIcon(false))
-                : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
-              s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
-              s.phase === 1 && s.vol ? h('span', {
-                className: 'gd-vol',
-                title: s.vol === 'voice' ? '检测到声音输入' : (s.vol === 'noana' ? '音量检测不可用（AudioContext 受限）' : '未检测到声音输入（请检查麦克风/远程音频）'),
-                style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : (s.vol === 'noana' ? '#888' : 'var(--dsw-alias-state-error-primary, #c62828)') },
-              }, s.vol === 'voice' ? '●声' : (s.vol === 'noana' ? '检测不可用' : '○静音')) : null,
-              micErrText ? h('span', { className: 'gd-err', title: micErrText }, micErrText) : null)
-          })
-      })
     })
     // ---- 右下角 toast（shell.overlay，root 级：切换会话也可见） ----
     ctx.effect(function () {
@@ -757,119 +652,310 @@ return {
     function callSid() { return (callSessionRef && callSessionRef.sid) || '' }
     function callActions() { return (callSessionRef && callSessionRef.actions) || null }
 
-    // ---- 会话 header 发起/挂断按钮（conversation.session.header.actions，order 30） ----
+    // ============ 统一悬浮通话/语音 dock（RC20：输入框正左侧悬浮、双折叠向上展开） ============
+    // 挂载 conversation.input.dock（会话级座位：新会话即渲染——解决"新对话无法从通话模式开始"）。
+    // 部件本体 position:fixed 悬浮于输入卡片正左侧（垂直对齐工具行）：量取官方 [data-composer-seat]
+    // （ui-conversation 自身也用它定位 composer）→ 按列内居中公式推出卡片左缘；测量失败 → 隐藏不错位。
+    // 交互：点话筒 = 开始/挂断通话（单键切换）；点喇叭 = 切换语音模式；各自 chevron 向上展开面板
+    // （同时只开一个）。原四处 UI（header 按钮 / dock 状态条 / 右侧面板 / input.left 语音行）并入此处。
+    function toggleCall(sid, actions) {
+      if (callState.active && callSessionRef && callSessionRef.sid === sid) { stopCall(); return }
+      if (callState.active && callSessionRef) stopCall() // 旧通话归属他会话 → 先挂断再开新通话
+      setCallState({ active: true, phase: 'listening', recording: false })
+      startCall(sid, actions) // RC13：归属（sid + inputActions）开播时刻捕获
+    }
     ctx.effect(function () {
       try {
-        return slots.inject('conversation.session.header.actions', function () {
-          return slots.register(
-            { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
-            function (props) {
-              // RC13：渲染期只读——任何会话的 header 渲染都不再写模块级全局（旧代码在渲染期
-              // 覆盖全局 inputActions 与会话归属 → 多会话互相串台；渲染期自动挂断 → 切会话即误挂）
-              const sid = props.sessionId || (callSessionRef && callSessionRef.sid) || ''
-              // 激活态按"通话归属会话"判定：只有归属会话的按钮显示"通话中"
-              const myCall = callState.active && callSessionRef && callSessionRef.sid === sid
-              const [, force] = React.useState(0)
-              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-              const style = {
-                display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
-                borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
-                background: myCall ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
-                color: myCall ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
-                fontFamily: 'inherit', fontSize: '12px',
-              }
-              return React.createElement('button', {
-                style: style, title: myCall ? '挂断通话' : '发起语音通话',
-                onClick: function () {
-                  if (!myCall) {
-                    // RC13：仅在用户点击时切换通话会话——先挂断旧通话再开新通话（挂断动作
-                    // 不再由渲染期触发）。通话跨会话切换继续存活（浮动面板可挂断）。
-                    if (callState.active && callSessionRef) stopCall()
-                    setCallState({ active: true, phase: 'listening', recording: false })
-                    startCall(sid, props.inputActions) // RC13：归属（sid + inputActions）开播时刻捕获
-                  } else {
-                    stopCall()
-                  }
-                },
-              }, myCall ? '📞 通话中' : '📞 通话')
-            })
-        })
-      } catch (e) { return function () {} }
-    })
-
-    // ---- 输入框 dock 状态条（conversation.input.dock，order 31） ----
-    ctx.effect(function () {
-      try {
+        loadVoiceCfg()
+        host.call('guide-dog/beep', {}).then(function (r) { if (r && r.ok) voiceState.beepUri = r.dataUri }).catch(function () {})
         return slots.inject('conversation.input.dock', function () {
           return slots.register(
-            { name: 'conversation.input.dock', id: 'guide-dog-call-status', order: 31, label: function () { return 'Call status' } },
+            { name: 'conversation.input.dock', id: 'guide-dog-call-dock', order: 31, label: function () { return 'Guide Dog dock' } },
             function (props) {
+              const sid = props.sessionId || ''
+              const effective = voiceEffective(sid)
+              const myCall = callState.active && callSessionRef && callSessionRef.sid === sid
+              const state = React.useState({ phase: 0, seconds: 0, lang: micLang, error: null }) // mic: 0 idle / 1 recording / 2 transcribing
+              const s = state[0]; const set = state[1]
+              const [pos, setPos] = React.useState(null) // {left, top}：悬浮 pill 定位（视口坐标）
+              const [callOpen, setCallOpen] = React.useState(false)
+              const [voiceOpen, setVoiceOpen] = React.useState(false)
+              const [tick, setTick] = React.useState(0) // 1s tick：驱动语音队列轮询 effect 每秒重跑
               const [, force] = React.useState(0)
+              const [locTick, setLocTick] = React.useState(0)
               React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-              if (!callState.active) return null
-              const text = { listening: '收听中…', processing: '处理中…', speaking: '播报中…', idle: '就绪' }[callState.phase] || ''
-              const style = { fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #666)', padding: '0 4px', fontFamily: 'inherit' }
-              return React.createElement('span', { style: style }, text + (callState.muted ? ' · 静音' : ''))
-            })
-        })
-      } catch (e) { return function () {} }
-    })
-
-    // ---- 通话面板（shell.overlay，order 40：模式切换/录音/静音/语速） ----
-    ctx.effect(function () {
-      try {
-        return slots.inject('shell.overlay', function () {
-          return slots.register(
-            { name: 'shell.overlay', id: 'guide-dog-call-panel', order: 40, label: function () { return 'Call panel' } },
-            function () {
-              const [, force] = React.useState(0)
-              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-              // Task 12：通话专用下行轮询（I1：stream 条目仅由 callPoll 消费；timerSvc 可选）
+              // RC20：语言切换即时刷新（locale 快照变更 → 重渲染）
               React.useEffect(function () {
-                if (!timerSvc || typeof timerSvc.interval !== 'function') return
-                const stop = timerSvc.interval(function () { callPoll() }, 1000)
-                return function () { try { stop() } catch (e) { /* ignore */ } }
+                if (!localeSvc || typeof localeSvc.subscribe !== 'function') return
+                return localeSvc.subscribe(function () { setLocTick(function (v) { return v + 1 }) })
               }, [])
-              if (!callState.active) return null
-              const panelStyle = {
-                position: 'fixed', right: '16px', bottom: '64px', width: '260px', zIndex: 1000,
-                background: 'var(--dsw-alias-bg-layer-2, #fff)', border: '1px solid var(--dsw-alias-border-l1, #ddd)',
-                borderRadius: '10px', padding: '12px', boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
-                fontFamily: 'inherit', fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #333)',
+              // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
+              React.useEffect(function () {
+                return function () {
+                  if (recSessionRef) recSessionRef.alive = false // M9：标记录音已死 → 迟到的 onstop 丢弃
+                  if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
+                  if (micRec) {
+                    try { micRec.rec.stop() } catch (e) { /* ignore */ }
+                    try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                    micRec = null
+                  }
+                }
+              }, [])
+              // 1s 循环：位置测量 + callPoll（I1：stream 条目仅由 callPoll 消费）+ 配置刷新（每 10s）
+              React.useEffect(function () {
+                const measure = function () {
+                  try {
+                    const wdoc = window && window.document
+                    if (!wdoc || typeof wdoc.querySelector !== 'function') { setPos(null); return }
+                    const seat = wdoc.querySelector('[data-composer-seat]')
+                    if (!seat) { setPos(null); return }
+                    const r = seat.getBoundingClientRect()
+                    if (!r || !r.width || !r.height) { setPos(null); return }
+                    const cardW = Math.min(r.width - 32, 780) // --dsh-composer-card-max-width=748+32；side-clearance 16
+                    const cardLeft = r.left + Math.max(0, (r.width - cardW) / 2)
+                    const toolY = r.bottom - 24 // 工具行垂直中心（卡片底内收约 24px）
+                    setPos({ left: cardLeft - 10 - 34, top: toolY - 17 }) // 34px 高 pill，卡片左缘外 10px
+                  } catch (e) { setPos(null) }
+                }
+                measure()
+                let tickCount = 0
+                const stop = timerSvc && typeof timerSvc.interval === 'function'
+                  ? timerSvc.interval(function () {
+                    measure(); callPoll()
+                    tickCount += 1
+                    setTick(tickCount) // 驱动语音队列轮询（下方 effect 以 tick 为依赖每秒重跑）
+                    if (tickCount % 10 === 0) loadVoiceCfg() // 约每 10s 刷新配置（设置页改全局默认后同步）
+                  }, 1000) : null
+                const onResize = function () { measure() }
+                if (window && typeof window.addEventListener === 'function') window.addEventListener('resize', onResize)
+                return function () {
+                  if (stop) { try { stop() } catch (e) { /* ignore */ } }
+                  if (window && typeof window.removeEventListener === 'function') window.removeEventListener('resize', onResize)
+                }
+              }, [])
+              // 语音模式生效时轮询本会话队列；播放本身在模块级，不受会话切换影响
+              // I1（2026-08-16 审稿）：通话期间 stream 条目由通话专用轮询（callPoll）独家消费
+              // ——本轮询停用，保证队列单消费者（Phase 1 的 pop 语义会丢弃无 url 的 stream 条目）
+              React.useEffect(function () {
+                if (!effective || callState.active || !sid || pollBusy) return
+                pollBusy = true
+                host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
+                  if (r && r.ok && r.entry) {
+                    // RC15：持久播放器（fetch+Blob）；错误条目照旧提示
+                    if (r.entry.url) return playVoiceEntry(r.entry, sid)
+                    else if (r.entry.error) { showToast(t('toast.speakFailed') + ': ' + (r.entry.message || r.entry.error)); playBeep() }
+                  } else if (r && r.ok && !r.entry) {
+                    // RC15：与 callPoll 同款播放汇总埋点（语音模式 mp3 计数；!r.ok 跳过防跨回合误归零）
+                    if (playCounts.size) {
+                      const summary = Array.from(playCounts.entries()).map(function (e) { return e[0] + '=' + e[1] }).join(' | ')
+                      gdLog('PLAY-SUMMARY ' + summary)
+                      playCounts.clear()
+                    }
+                  }
+                }).catch(function () {}).then(function () { pollBusy = false })
+              }, [effective, sid, tick, locTick])
+              // ---- 单次录音（语音面板）：与原 input.left 语音行同款逻辑（M9 归属 / partial 预览 / vol 检测） ----
+              const startRec = function () {
+                try {
+                  // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认（RC16：micAudioReq 单一来源）
+                  navigator.mediaDevices.getUserMedia(micAudioReq()).then(function (stream) {
+                    // 音量检测：MediaRecorder 之外并行接 AnalyserNode（2026-08-15 诊断：浏览器录 RDP 虚拟麦克风静音）
+                    let analyser = null
+                    let volTimer = null
+                    try {
+                      // AC 获取修复（2026-08-15）：沙箱里 AudioContext 以全局暴露，window.AudioContext 可能为
+                      // undefined → 先前写法静默跳过音量检测（●声/○静音 永不显示）。全局优先，window 兜底。
+                      var AC = null
+                      try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
+                      if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
+                      if (AC) {
+                        const actx = new AC()
+                        const src = actx.createMediaStreamSource(stream)
+                        analyser = actx.createAnalyser()
+                        analyser.fftSize = 1024
+                        src.connect(analyser)
+                        if (typeof actx.resume === 'function') { try { actx.resume() } catch (e) { /* ignore */ } }
+                        // 每 500ms 读 RMS：UI 显示"检测到声音/未检测到"；持续静音 2.5s 提示
+                        const buf = new Uint8Array(analyser.fftSize)
+                        let silentMs = 0
+                        if (timerSvc && typeof timerSvc.interval === 'function') {
+                          volTimer = timerSvc.interval(function () {
+                            try {
+                              analyser.getByteTimeDomainData(buf)
+                              let sum = 0
+                              for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
+                              const rms = Math.sqrt(sum / buf.length)
+                              if (rms >= 0.008) {
+                                silentMs = 0
+                                set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
+                              } else {
+                                silentMs += 500
+                                set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
+                              }
+                            } catch (e) { /* ignore */ }
+                          }, 500)
+                        }
+                      }
+                    } catch (e) { analyser = null }
+                    // 2026-08-15：优先 audio/wav（PCM 增量切片可解码）；webm 增量切片实测无法解码
+                    micMime = 'audio/wav'
+                    let rec = null
+                    try {
+                      if (typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/wav')) {
+                        rec = new MediaRecorder(stream, { mimeType: 'audio/wav' })
+                      }
+                    } catch (e) { rec = null }
+                    if (!rec) {
+                      micMime = 'audio/webm'
+                      try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+                    }
+                    micChunks = []; micSeconds = 0
+                    rec.ondataavailable = function (ev) {
+                      if (ev.data && ev.data.size > 0) micChunks.push(ev.data)
+                      micSeconds += 1
+                      set(function (prev) { return Object.assign({}, prev, { seconds: micSeconds }) })
+                      const max = (voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.maxSeconds) || 60
+                      if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
+                    }
+                    rec.onstop = function () {
+                      if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
+                      if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
+                      partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
+                      // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，闭包里的 sid/inputActions
+                      // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交
+                      if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return // M9：丢弃陈旧提交
+                      transcribe(sid, props.inputActions, set)
+                    }
+                    recSessionRef = { sid: sid, alive: true } // M9：录音归属当前会话（onstop 提交前校验）
+                    rec.start(1000)
+                    micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
+                    set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
+                    // 音量检测不可用（AC 获取失败）：phase:1 之后再设 noana（避免被上面的 vol:null 覆盖）
+                    if (!analyser) {
+                      set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
+                    }
+                    // 实时预览：每 3s 把"上次 partial 之后"的新增音频送去转写（WAV 增量可解码，host 常驻 worker
+                    // 单次 ~0.8s），结果累积进输入框 draft（预览）。webm fallback 退化为全量重传 + 覆盖显示。
+                    partialBusy = false; partialIdx = 0; partialStale = false; partialAcc = ''
+                    if (timerSvc && typeof timerSvc.interval === 'function') {
+                      partialTimer = timerSvc.interval(function () {
+                        if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
+                        partialBusy = true
+                        const isWav = micMime.indexOf('wav') >= 0
+                        const parts = isWav ? micChunks.slice(partialIdx) : micChunks.slice(0)
+                        partialIdx = micChunks.length
+                        const build = isWav ? buildWavBlob(parts) : Promise.resolve(new Blob(parts, { type: micMime }))
+                        build.then(function (blob) {
+                          if (!blob) { partialBusy = false; return }
+                          return blob.arrayBuffer().then(function (buf) {
+                            const bytes = new Uint8Array(buf)
+                            let bin = ''
+                            for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+                            return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: micMime, sessionId: sid, language: micLang, partial: true })
+                          })
+                        }).then(function (r) {
+                          partialBusy = false
+                          // RC20：partial 预览插入修正——原 input.left 版本引用未声明的 inputActions（ReferenceError
+                          // 被 catch 吞掉 → 预览从不生效），搬迁时改用 props.inputActions
+                          if (!partialStale && r && r.ok && r.text) {
+                            if (isWav) { partialAcc += (partialAcc ? ' ' : '') + r.text; insertText(props.inputActions, partialAcc) }
+                            else { insertText(props.inputActions, r.text) } // webm fallback：全量重传，覆盖显示
+                          }
+                        }).catch(function () { partialBusy = false })
+                      }, 3000)
+                    }
+                    playStartTone() // 录音开始提示音：确认录音通道已真正启动
+                  }).catch(function (err) {
+                    // 防御：若 micRec 已建立（录音已在运行），说明异常发生在启动后（不应误报权限错误）
+                    if (micRec) return
+                    const name = err && err.name
+                    set(function (prev) { return Object.assign({}, prev, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }) })
+                  })
+                } catch (e) { set(function (prev) { return Object.assign({}, prev, { error: 'mic_denied' }) }) }
               }
+              const toggleMic = function () {
+                if (s.phase === 1) {
+                  const r = micRec
+                  micRec = null
+                  if (r) {
+                    if (r.volTimer) { try { r.volTimer() } catch (e) { /* ignore */ } }
+                    try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                  }
+                  return
+                }
+                if (s.phase === 2) return
+                startRec()
+              }
+              const micErrText = {
+                mic_denied: t('voice.errMicDenied'), no_device: t('voice.errNoDevice'),
+                empty_speech: s.diag && s.diag.indexOf('no-data') === 0 ? t('voice.errNoData') + '（' + s.diag.slice(7) + '）' : t('voice.errEmptySpeech'),
+                stt_failed: t('voice.errSttFailed'), stt_timeout: t('voice.errSttTimeout'), engine_unavailable: t('voice.errEngine'),
+                insert_failed: t('voice.insertFailed'),
+              }[s.error] || (s.error ? t('voice.transcribeFailed') + '（' + s.error + '）' : null)
+              const vm = (voiceState.cfg && voiceState.cfg.voiceMode) || {}
+              const voiceTip = t('voice.tip') + (effective ? t('voice.on') : t('voice.off')) + t('voice.tipMid') + (vm.default ? t('voice.on') : t('voice.off')) + t('voice.tipEnd')
+              const micTip = s.phase === 1 ? t('voice.stopRec') : (s.phase === 2 ? t('voice.transcribing') : t('voice.input'))
+              const phaseText = { listening: t('call.listening'), processing: t('call.processing'), speaking: t('call.speaking'), idle: t('call.idle') }[callState.phase] || ''
+              if (!pos) return null // 测量失败（无会话等）→ 隐藏，不错位
+              const pillStyle = { display: 'inline-flex', alignItems: 'center', gap: '4px', height: '34px', padding: '0 10px', borderRadius: '100px', border: '1px solid var(--dsw-alias-border-l2, #ccc)', background: 'var(--dsw-alias-button-floating-fill, #fff)', boxShadow: 'var(--dsw-shadow-lv2, 0 2px 8px rgba(0,0,0,0.12))', fontFamily: 'inherit', fontSize: '12px', color: 'var(--dsw-alias-label-primary, #333)', cursor: 'pointer', whiteSpace: 'nowrap' }
+              const iconBtn = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '24px', height: '24px', padding: 0, border: 'none', borderRadius: '50%', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '14px' }
               const rowStyle = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '6px 0' }
               const btnStyle = { padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--dsw-alias-border-l1, #ccc)', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '12px' }
+              const micPillBorder = myCall ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : (callState.recording ? { borderColor: '#c62828' } : {})
+              const micColor = myCall ? { color: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : (callState.recording ? { color: '#c62828' } : {})
+              const segTitle = callState.mode === 'ptt' ? t('call.segPtt') : t('call.segVad')
               const micBtnStyle = Object.assign({}, btnStyle, callState.recording ? { background: '#c62828', color: '#fff' } : {})
-              return React.createElement('div', { style: panelStyle },
-                React.createElement('div', { style: rowStyle },
-                  React.createElement('span', null, '语音通话'),
-                  React.createElement('button', { style: btnStyle, onClick: function () { stopCall() } }, '挂断')),
-                React.createElement('div', { style: rowStyle },
-                  React.createElement('span', null, '模式'),
-                  React.createElement('select', {
-                    style: btnStyle, value: callState.mode,
-                    onChange: function (ev) { setCallState({ mode: ev.target.value }) },
-                  },
-                    React.createElement('option', { value: 'vad' }, 'VAD 自动'),
-                    React.createElement('option', { value: 'ptt' }, '按住说话'))),
-                React.createElement('div', { style: rowStyle },
-                  React.createElement('button', { style: micBtnStyle, title: callState.mode === 'ptt' ? '按住说话' : '点击手动结束/开始一段',
-                    onPointerDown: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); startSegment() } },
-                    onPointerUp: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); stopSegment() } },
-                    onClick: function () { if (callState.mode !== 'ptt' && !callState.recording) startSegment(); else if (callState.mode !== 'ptt' && callState.recording) stopSegment() },
-                  }, callState.recording ? '■ 录音中' : '🎤 说话'),
-                  React.createElement('span', null, callState.mode === 'ptt' ? '按住说话' : 'VAD 自动')),
-                React.createElement('div', { style: rowStyle },
-                  React.createElement('button', { style: btnStyle, onClick: function () { setCallState({ muted: !callState.muted }) } }, callState.muted ? '🔇 取消静音' : '🔊 静音'),
-                  React.createElement('span', null, '语速 '),
-                  React.createElement('select', {
-                    style: btnStyle, value: String(callState.speed),
-                    onChange: function (ev) { setCallState({ speed: parseFloat(ev.target.value) }) },
-                  },
-                    React.createElement('option', { value: '0.8' }, '0.8x'),
-                    React.createElement('option', { value: '1' }, '1x'),
-                    React.createElement('option', { value: '1.2' }, '1.2x'))),
-                callState.error ? React.createElement('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: '6px' } }, callState.error) : null)
+              return h('div', { className: 'gd-float-dock', style: { left: pos.left, top: pos.top } },
+                // ---- 通话 pill：点话筒 = 开始/挂断 ----
+                h('div', { className: 'gd-float-pill', style: micPillBorder, title: myCall ? t('call.stop') : t('call.start') },
+                  h('button', { className: 'gd-float-icon', style: micColor, onClick: function () { toggleCall(sid, props.inputActions) } }, myCall ? '🎙' : '🎤'),
+                  myCall ? h('span', null, phaseText + (callState.muted ? t('call.muted') : '')) : null,
+                  h('button', { className: 'gd-float-icon', title: callOpen ? t('call.close') : t('call.open'), onClick: function () { setCallOpen(!callOpen); if (voiceOpen) setVoiceOpen(false) } }, callOpen ? '▾' : '▴')),
+                callOpen ? h('div', { className: 'gd-panel-up' },
+                  h('div', { style: rowStyle },
+                    h('span', null, t('call.title')),
+                    h('button', { style: btnStyle, onClick: function () { stopCall() } }, t('call.stop'))),
+                  h('div', { style: rowStyle },
+                    h('span', null, t('call.mode')),
+                    h('select', { style: btnStyle, value: callState.mode, onChange: function (ev) { setCallState({ mode: ev.target.value }) } },
+                      h('option', { value: 'vad' }, t('call.modeVad')),
+                      h('option', { value: 'ptt' }, t('call.modePtt')))),
+                  h('div', { style: rowStyle },
+                    h('button', { style: micBtnStyle, title: segTitle,
+                      onPointerDown: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); startSegment() } },
+                      onPointerUp: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); stopSegment() } },
+                      onClick: function () { if (callState.mode !== 'ptt' && !callState.recording) startSegment(); else if (callState.mode !== 'ptt' && callState.recording) stopSegment() },
+                    }, callState.recording ? '■ ' + t('call.recording') : '🎤 ' + t('call.speak')),
+                    h('span', null, callState.mode === 'ptt' ? t('call.modePtt') : t('call.modeVad'))),
+                  h('div', { style: rowStyle },
+                    h('button', { style: btnStyle, onClick: function () { setCallState({ muted: !callState.muted }) } }, callState.muted ? '🔇 ' + t('call.unmute') : '🔊 ' + t('call.mute')),
+                    h('span', null, t('call.speed') + ' '),
+                    h('select', { style: btnStyle, value: String(callState.speed), onChange: function (ev) { setCallState({ speed: parseFloat(ev.target.value) }) } },
+                      h('option', { value: '0.8' }, '0.8x'),
+                      h('option', { value: '1' }, '1x'),
+                      h('option', { value: '1.2' }, '1.2x'))),
+                  callState.error ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: 6 } }, callState.error) : null) : null,
+                // ---- 语音 pill：点喇叭 = 切换语音模式 ----
+                h('div', { className: 'gd-float-pill', style: effective ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}, title: voiceTip },
+                  h('button', { className: 'gd-float-icon', style: effective ? { color: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}, onClick: function () { setVoiceOverride(sid, !effective) } }, speakerIcon(effective)),
+                  h('span', null, effective ? t('voice.on') : t('voice.off')),
+                  h('button', { className: 'gd-float-icon', title: voiceOpen ? t('voice.close') : t('voice.open'), onClick: function () { setVoiceOpen(!voiceOpen); if (callOpen) setCallOpen(false) } }, voiceOpen ? '▾' : '▴')),
+                voiceOpen ? h('div', { className: 'gd-panel-up' },
+                  h('div', { style: rowStyle },
+                    h('span', null, t('voice.title')),
+                    h('select', { className: 'gd-select', value: s.lang, title: t('voice.lang'), onChange: function (e) { micLang = e.target.value; set(function (prev) { return Object.assign({}, prev, { lang: e.target.value }) }) } },
+                      h('option', { value: 'auto' }, t('voice.auto')), h('option', { value: 'zh' }, t('voice.zh')), h('option', { value: 'en' }, t('voice.en')))),
+                  h('div', { style: rowStyle },
+                    windowCannotRecord()
+                      ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', rel: 'noreferrer', title: t('voice.browserBlock') }, micIcon(false))
+                      : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
+                    s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
+                    s.phase === 1 && s.vol ? h('span', {
+                      className: 'gd-vol',
+                      title: s.vol === 'voice' ? t('voice.volVoice') : (s.vol === 'noana' ? t('voice.volNoana') : t('voice.volSilent')),
+                      style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : (s.vol === 'noana' ? '#888' : 'var(--dsw-alias-state-error-primary, #c62828)') },
+                    }, s.vol === 'voice' ? t('voice.volOn') : (s.vol === 'noana' ? t('voice.volNoanaShort') : t('voice.volSilentShort'))) : null),
+                  micErrText ? h('div', { className: 'gd-err', style: { marginTop: 4 }, title: micErrText }, micErrText) : null) : null)
             })
         })
       } catch (e) { return function () {} }
@@ -1164,12 +1250,12 @@ return {
             const msg = (r && r.message) || '转写失败'
             setCallState({ phase: 'listening', error: msg })
             playBeep()
-            showToast('通话转写失败：' + msg)
+            showToast(t('toast.callTranscribeFailed') + ': ' + msg)
           }
         }
       }).catch(function (e) {
         setCallState({ phase: 'listening', error: '上传失败：' + String(e) })
-        showToast('通话上传失败')
+        showToast(t('toast.callUploadFailed'))
       })
     }
 
@@ -1232,7 +1318,7 @@ return {
             return playStreamEntry(r.entry, callSid())
           }
           else if (r.entry.url) { consumed = true; return playVoiceEntry(r.entry, callSid()) }
-          else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
+          else if (r.entry.error) { showToast(t('toast.speakFailed') + ': ' + (r.entry.message || r.entry.error)); playBeep() }
         }
         // RC14：仅在确认本轮播放窗口结束（r.ok && !r.entry，队列空）时落汇总埋点——按 key 列出本轮播放次数
         // !r.ok 时跳过（RPC 失败/异常时跳过，避免把跨回合累积误归零）
@@ -1257,7 +1343,7 @@ return {
       stopStreamPlayback() // 内部 notify(false)，随后重开窗口保持 3s 窗
       notifyConsensusSpeech(true)
       stopCurrent()
-      if (typeof Audio !== 'function') { showToast('播放器不可用'); return Promise.resolve() }
+      if (typeof Audio !== 'function') { showToast(t('toast.playerUnavailable')); return Promise.resolve() }
       return new Promise(function (resolve) {
         let settled = false
         const timer = setTimeout(function () { if (!settled) { settled = true; notifyConsensusSpeech(false); resolve() } }, 30000)
@@ -1266,10 +1352,10 @@ return {
           const a = new Audio(String(url))
           curAudio = a
           a.onended = function () { if (curAudio === a) curAudio = null; done() }
-          a.onerror = function () { if (curAudio === a) { curAudio = null; showToast('播放失败') } done() }
+          a.onerror = function () { if (curAudio === a) { curAudio = null; showToast(t('toast.playFailed')) } done() }
           const p = a.play()
           if (p && typeof p.catch === 'function') p.catch(function () { if (curAudio === a) { curAudio = null } done() })
-        } catch (e) { curAudio = null; showToast('播放失败'); done() }
+        } catch (e) { curAudio = null; showToast(t('toast.playFailed')); done() }
       })
     }
     // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
@@ -1367,7 +1453,7 @@ return {
       // C3 修复（2026-08-16 审稿）：token 为**单次消费**（consumeTtsToken 即删）——每句都必须重新签发，
       // 不得缓存复用（旧代码 `if (!streamPlayer.token)` 只取一次 → 第二句起 403）。
       streamPlayer.token = await getTtsToken(sid)
-      if (!streamPlayer.token) { setCallState({ phase: 'listening', error: '流式播放失败：无 token' }); showToast('流式播放失败：无 token'); return }
+      if (!streamPlayer.token) { setCallState({ phase: 'listening', error: t('call.errStreamToken') }); showToast(t('call.errStreamToken')); return }
       const cfg = voiceState.cfg || {}
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
       const firstSentence = !streamPlayer.active // C2：仅在链空闲时走完整起播路径
@@ -1435,11 +1521,11 @@ return {
           if (!noRetry && !retryKeys.has(rkey)) {
             retryKeys.set(rkey, true)
             setTimeout(function () { retryKeys.delete(rkey) }, 5000)
-            showToast('播放中断，已尝试重连')
+            showToast(t('toast.playInterruptedRetry'))
             const retried = playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
             return retried
           } else {
-            showToast('播放中断')
+            showToast(t('toast.playInterrupted'))
           }
         }
       } finally {
@@ -1460,7 +1546,7 @@ return {
         streamPlayer.active = false
         playbackEndedAt = Date.now()
         setCallState({ phase: 'listening' })
-        showToast('播放器不可用')
+        showToast(t('toast.playerUnavailable'))
         return
       }
       const blob = new Blob([wav], { type: 'audio/wav' })
@@ -1495,7 +1581,7 @@ return {
         const blocked = err && (err.name === 'NotAllowedError' || (err.code !== undefined && err.code === 20))
         if (blocked) {
           gdLog('streamAudio block playId=' + playId + ' err=' + String((err && err.message) || err).slice(0, 40))
-          showToast('点击页面任意位置开启语音播报')
+          showToast(t('toast.unlockHint'))
         } else {
           gdLog('streamAudio play-err playId=' + playId + ' err=' + String((err && err.message) || err).slice(0, 40))
           handleStreamAudioError(a, objUrl, playId)
@@ -1706,14 +1792,14 @@ return {
     })
 
     function AuthCard(auth) {
-      if (!auth) return h('div', { style: mutedStyle }, 'Checking mmx auth…')
-      if (!auth.ok) return h('div', { style: { border: '1px solid rgba(200,60,50,.4)', borderRadius: 10, padding: 12 } }, 'mmx auth problem: ' + String(auth.error || 'unknown'))
+      if (!auth) return h('div', { style: mutedStyle }, t('settings.authCheck'))
+      if (!auth.ok) return h('div', { style: { border: '1px solid rgba(200,60,50,.4)', borderRadius: 10, padding: 12 } }, t('settings.authProblem') + ' ' + String(auth.error || 'unknown'))
       return h('div', { style: { border: '1px solid rgba(128,128,128,.3)', borderRadius: 10, padding: 12 } },
-        'mmx auth: ' + String(auth.method || '?') + ' (' + String(auth.source || '?') + ') — key ' + String(auth.keyMasked || 'set'))
+        t('settings.authOk') + ' ' + String(auth.method || '?') + ' (' + String(auth.source || '?') + ') — key ' + String(auth.keyMasked || t('settings.authKeySet')))
     }
 
     function SettingsPage(props) {
-      const state = React.useState({ auth: null, voices: [], media: [], text: '', voice: 'auto', busy: false, playUrl: null, error: null, cfg: null, status: null, audioInputs: [] })
+      const state = React.useState({ auth: null, voices: [], text: '', voice: 'auto', busy: false, playUrl: null, error: null, cfg: null, status: null, audioInputs: [] })
       const s = state[0]
       const set = state[1]
       React.useEffect(function () {
@@ -1721,7 +1807,6 @@ return {
         // 函数式 updater：5 个异步结果各自合并，避免基于初始闭包 s 的 last-wins 全量覆盖
         host.call('guide-dog/auth-status', {}).then(function (r) { if (alive) set(function (prev) { return Object.assign({}, prev, { auth: r }) }) }).catch(function () {})
         host.call('guide-dog/voices', {}).then(function (r) { if (alive && r && r.ok && Array.isArray(r.voices)) set(function (prev) { return Object.assign({}, prev, { voices: r.voices }) }) }).catch(function () {})
-        host.call('guide-dog/list-media', { limit: 30 }).then(function (r) { if (alive && Array.isArray(r)) set(function (prev) { return Object.assign({}, prev, { media: r }) }) }).catch(function () {})
         host.call('guide-dog/get-config', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { cfg: r.config }) }) }).catch(function () {})
         host.call('guide-dog/status', {}).then(function (r) { if (alive && r && r.ok) set(function (prev) { return Object.assign({}, prev, { status: r.status }) }) }).catch(function () {})
         // 输入设备枚举（2026-08-15：远程 RDP 场景需显式选择麦克风）
@@ -1729,7 +1814,7 @@ return {
           navigator.mediaDevices.enumerateDevices().then(function (devices) {
             if (!alive) return
             const inputs = (devices || []).filter(function (d) { return d.kind === 'audioinput' })
-              .map(function (d) { return { id: d.deviceId, label: d.label || ('输入设备 ' + d.deviceId.slice(0, 8)) } })
+              .map(function (d) { return { id: d.deviceId, label: d.label || (t('settings.device') + ' ' + d.deviceId.slice(0, 8)) } })
             set(function (prev) { return Object.assign({}, prev, { audioInputs: inputs }) })
           }).catch(function () {})
         } catch (e) { /* ignore */ }
@@ -1757,61 +1842,42 @@ return {
       }
       const cfgBlock = s.cfg ? h('div', { style: preStyle }, [
         h('div', { style: rowStyle },
-          h('span', { style: badgeStyle }, '语音模式'),
-          h('label', null, h('input', { type: 'radio', name: 'vm-global', checked: !!s.cfg.voiceMode.default, onChange: function () { setCfg({ voiceMode: { default: true } }) } }), ' 全局默认开'),
-          h('label', null, h('input', { type: 'radio', name: 'vm-global', checked: !s.cfg.voiceMode.default, onChange: function () { setCfg({ voiceMode: { default: false } }) } }), ' 全局默认关')),
-        h('div', { style: mutedStyle }, '会话 override：输入框左下角小喇叭按钮点击切换（当前会话生效值以小喇叭为准）。'),
+          h('span', { style: badgeStyle }, t('settings.voiceMode')),
+          h('label', null, h('input', { type: 'radio', name: 'vm-global', checked: !!s.cfg.voiceMode.default, onChange: function () { setCfg({ voiceMode: { default: true } }) } }), ' ' + t('settings.vmDefaultOn')),
+          h('label', null, h('input', { type: 'radio', name: 'vm-global', checked: !s.cfg.voiceMode.default, onChange: function () { setCfg({ voiceMode: { default: false } }) } }), ' ' + t('settings.vmDefaultOff'))),
+        h('div', { style: mutedStyle }, t('settings.vmOverride')),
         h('div', { style: rowStyle },
-          h('span', { style: badgeStyle }, '语音输入'),
-          h('label', null, '引擎：', h('select', { value: s.cfg.voiceInput.engine, onChange: function (e) { setCfg({ voiceInput: { engine: e.target.value } }) } },
-            h('option', { value: 'whisper' }, 'whisper（本地）'), h('option', { value: 'sherpa' }, 'sherpa（增强，待装）'), h('option', { value: 'minimax' }, 'minimax（保留位）'))),
-          h('label', null, ' 语言：', h('select', { value: s.cfg.voiceInput.language, onChange: function (e) { setCfg({ voiceInput: { language: e.target.value } }) } },
-            h('option', { value: 'auto' }, '自动'), h('option', { value: 'zh' }, '中文'), h('option', { value: 'en' }, '英文'))),
-          h('label', null, ' 设备：', h('select', {
+          h('span', { style: badgeStyle }, t('settings.voiceInput')),
+          h('label', null, t('settings.engine') + '：', h('select', { value: s.cfg.voiceInput.engine, onChange: function (e) { setCfg({ voiceInput: { engine: e.target.value } }) } },
+            h('option', { value: 'whisper' }, t('settings.engineWhisper')), h('option', { value: 'sherpa' }, t('settings.engineSherpa')), h('option', { value: 'minimax' }, t('settings.engineMinimax')))),
+          h('label', null, ' ' + t('settings.language') + '：', h('select', { value: s.cfg.voiceInput.language, onChange: function (e) { setCfg({ voiceInput: { language: e.target.value } }) } },
+            h('option', { value: 'auto' }, t('voice.auto')), h('option', { value: 'zh' }, t('voice.zh')), h('option', { value: 'en' }, t('voice.en')))),
+          h('label', null, ' ' + t('settings.device') + '：', h('select', {
             value: (s.cfg.voiceInput.deviceId) || '',
             onChange: function (e) { setCfg({ voiceInput: { deviceId: e.target.value } }) },
-          }, [h('option', { key: '', value: '' }, '默认')].concat((s.audioInputs || []).map(function (d) {
+          }, [h('option', { key: '', value: '' }, t('settings.deviceDefault'))].concat((s.audioInputs || []).map(function (d) {
             return h('option', { key: d.id, value: d.id }, d.label)
           })))),
-          h('label', null, h('input', { type: 'checkbox', checked: !!s.cfg.voiceInput.autoSend, onChange: function (e) { setCfg({ voiceInput: { autoSend: e.target.checked } }) } }), ' 识别后自动发送（误识别内容会直接发出，请谨慎开启）')),
-        s.audioInputs && s.audioInputs.length === 0 ? h('div', { style: mutedStyle }, '未枚举到输入设备（远程/无头环境可能需 RDP 音频重定向）') : null,
+          h('label', null, h('input', { type: 'checkbox', checked: !!s.cfg.voiceInput.autoSend, onChange: function (e) { setCfg({ voiceInput: { autoSend: e.target.checked } }) } }), ' ' + t('settings.autoSend'))),
+        s.audioInputs && s.audioInputs.length === 0 ? h('div', { style: mutedStyle }, t('settings.noInputDevices')) : null,
         h('div', { style: rowStyle },
-          h('span', { style: badgeStyle }, 'STT'),
-          s.status ? h('span', { style: mutedStyle }, 'faster-whisper: ' + (s.status.whisperAvailable ? '可用 ' + ((s.status.whisperVersion || '') + ' / ' + (s.status.whisperPython || '')) : '不可用 — 需 pip install faster-whisper')) : null,
-          h('label', null, ' 模型：', h('select', { value: s.cfg.voiceInput.whisper.model, onChange: function (e) { setCfg({ voiceInput: { whisper: { model: e.target.value } } }) } },
-            h('option', { value: 'base' }, 'base（快）'), h('option', { value: 'small' }, 'small（准）')))),
+          h('span', { style: badgeStyle }, t('settings.stt')),
+          s.status ? h('span', { style: mutedStyle }, t('settings.whisper') + ': ' + (s.status.whisperAvailable ? t('settings.whisperAvailable') + ' ' + ((s.status.whisperVersion || '') + ' / ' + (s.status.whisperPython || '')) : t('settings.whisperUnavailable'))) : null,
+          h('label', null, ' ' + t('settings.model') + '：', h('select', { value: s.cfg.voiceInput.whisper.model, onChange: function (e) { setCfg({ voiceInput: { whisper: { model: e.target.value } } }) } },
+            h('option', { value: 'base' }, t('settings.modelBase')), h('option', { value: 'small' }, t('settings.modelSmall'))))),
       ]) : null
-      const mediaCells = s.media.map(function (m, i) {
-        if (m.kind === 'image') {
-          const src = safeMedia(m.url)
-          return src ? h('a', { key: i, href: safeHref(m.url), target: '_blank', rel: 'noreferrer', title: m.name },
-            h('img', { src: src, style: { width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(128,128,128,.3)' } })) : null
-        }
-        if (m.kind === 'video') {
-          const src = safeMedia(m.url)
-          return src ? h('video', { key: i, src: src, muted: true, preload: 'metadata', style: { width: 96, height: 72, objectFit: 'cover', borderRadius: 6, border: '1px solid rgba(128,128,128,.3)' } }) : null
-        }
-        if (m.kind === 'audio') {
-          const src = safeMedia(m.url)
-          return src ? h('audio', { key: i, src: src, controls: true, preload: 'none', style: { width: 150 } }) : null
-        }
-        return h('a', { key: i, href: safeHref(m.url), target: '_blank', rel: 'noreferrer', style: { fontSize: 12 } }, m.name)
-      }).filter(Boolean)
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, padding: '0 4px', maxWidth: 720 } },
-        h('h2', null, 'Guide Dog for DSH — MiniMax multimodal'),
+        h('h2', null, t('settings.title')),
         cfgBlock,
         AuthCard(s.auth),
         h('div', { style: { border: '1px solid rgba(128,128,128,.3)', borderRadius: 10, padding: 12 } },
-          h('div', { style: { fontWeight: 600, marginBottom: 8 } }, 'Speak tester'),
+          h('div', { style: { fontWeight: 600, marginBottom: 8 } }, t('settings.speakTester')),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h('input', { value: s.text, onChange: function (e) { set(Object.assign({}, s, { text: e.target.value })) }, placeholder: 'Text to speak…', style: { flex: 1, minWidth: 220 } }),
+            h('input', { value: s.text, onChange: function (e) { set(Object.assign({}, s, { text: e.target.value })) }, placeholder: t('settings.textToSpeak'), style: { flex: 1, minWidth: 220 } }),
             h('select', { value: s.voice, onChange: function (e) { set(Object.assign({}, s, { voice: e.target.value })) } }, voiceOptions),
-            h('button', { onClick: speak, disabled: s.busy }, s.busy ? 'Generating…' : 'Speak & play')),
+            h('button', { onClick: speak, disabled: s.busy }, s.busy ? t('settings.generating') : t('settings.speakPlay'))),
           s.error ? h('div', { style: { color: '#c0392b', fontSize: 12, marginTop: 8 } }, String(s.error)) : null,
-          s.playUrl ? h('audio', { src: safeMedia(s.playUrl), controls: true, autoPlay: true, style: { width: '100%', marginTop: 8 } }) : null),
-        h('div', { style: { border: '1px solid rgba(128,128,128,.3)', borderRadius: 10, padding: 12 } },
-          h('div', { style: { fontWeight: 600, marginBottom: 8 } }, 'Recent media (' + s.media.length + ')'),
-          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } }, mediaCells)))
+          s.playUrl ? h('audio', { src: safeMedia(s.playUrl), controls: true, autoPlay: true, style: { width: '100%', marginTop: 8 } }) : null))
     }
 
     ctx.effect(function () {

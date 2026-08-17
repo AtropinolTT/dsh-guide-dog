@@ -1092,7 +1092,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
             '- GENERATION: use guide_dog_image (images), guide_dog_video (video), guide_dog_music (music), guide_dog_speak (speech).',
             '- All generated media is also visible to the user in the web UI at /guide-dog/media/<file>; always include the returned url fields in your reply so the user can preview.',
             '- When the user asks to hear text spoken aloud, use guide_dog_speak.',
-            '- VOICE (TTS/播报): 语音播报由本插件在浏览器端自动完成——你的回复文本会自动合成并朗读（语音模式/通话模式/无障碍模式），你不需要也不应该调用 audio-conversation、speech-mmx、mmx 等任何技能或其脚本来"启用/修复"语音，也不要为语音功能请求沙箱权限扩展或运行本地脚本。用户反馈听不到声音时，这是浏览器/系统音频输出问题：请用户检查浏览器标签页音量、系统输出设备与通话/语音模式的播报开关即可，不要尝试在沙箱内修复。若用户明确要求朗读某段具体文字，用 guide_dog_speak 工具。',
+            '- VOICE (TTS/播报): 语音播报由插件自动完成（语音/通话/无障碍模式）。不要调用 audio-conversation、speech-mmx、mmx 等技能来"启用/修复"语音。用户反馈听不到声音 = 浏览器/系统音频问题：让用户检查标签页音量与输出设备即可。用户明确要求朗读某段具体文字时用 guide_dog_speak 工具。',
           ].join('\n'),
         })
       } catch (e) {
@@ -1130,7 +1130,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           // C3（最终审稿）：与 consensusEnabled 同门——仅通话激活中的会话注入语音聊天措辞
           if (!((callOn && isCallActive(sid)) || a11yOn)) return undefined
           const a11yExtra = a11yOn ? '无障碍模式已开启：所有可能改变状态的操作（发送、删除、覆盖等）执行前都必须先简短说明并得到你的语音确认。' : ''
-          return '用户正通过语音和你对话，像和合作伙伴讨论一样：先理解意图，不清楚就问（问多少看实际情况，语音通道保持简洁）；主动说明关键信息；写入/修改前先简短说明要做什么，等用户点头；用户随时可能提问或插话，认真回应。' + a11yExtra
+          return '用户正通过语音和你对话。回复要简短、口语化，一句话一个意思；避免表格、代码块、标题符号和长列表，需要列举时说"第一…第二…"；先给结论再给细节；不清楚就问一句。写入/修改前先简短说明要做什么，等用户点头；用户随时可能提问或插话，认真回应。' + a11yExtra
         })
         if (typeof disp1 === 'function') ctx.effect(function () { return disp1 })
       } catch (e) { /* ignore */ }

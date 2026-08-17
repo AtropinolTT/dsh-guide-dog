@@ -130,7 +130,7 @@ if (echoSrc) {
 }
 
 // ---- 静态契约（RC18：流播放 HTMLAudio 直出——RDP/Chrome 环境 WebAudio AudioContext 输出无声） ----
-ok(client.includes('client build rc19-20260817'), 'client build tag rc19')
+ok(client.includes('client build rc20-20260817'), 'client build tag rc20')
 ok(client.includes('function ensureStreamAudio('), 'client stream audio element')
 ok(client.includes('function playStreamWav('), 'client stream wav player')
 ok(client.includes('function waitStreamFree('), 'client stream serial wait')
