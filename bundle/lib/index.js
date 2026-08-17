@@ -1655,7 +1655,10 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     }
     // ---- 共识优先（spec §6.7） ----
     const WRITE_TOOL_NAMES = ['write', 'edit']
-    const DESTRUCTIVE_BASH_RE = /(^|\s|\||;|&&)(rm|mv|cp|truncate|dd|mkfs|git\s+push)\b|>>?[\s\S]*$/m
+    // RC5（2026-08-17 验收）：`>>?` 分支误伤无害重定向——`2>/dev/null`、`>&`（2>&1 等）也被判为
+    // 破坏性写入 → 只读命令（如 cat /etc/timezone 2>/dev/null）被 needs_voice_confirmation 拦截。
+    // 排除 /dev/null 目标与 & 合并重定向；`echo x > file`、`>> file` 等真实写入仍拦截。
+    const DESTRUCTIVE_BASH_RE = /(^|\s|\||;|&&)(rm|mv|cp|truncate|dd|mkfs|git\s+push)\b|>>?(?!\s*(?:\/dev\/null\b|&))[\s\S]*$/m
     function consensusSummary(name, args) {
       try {
         if (name === 'write') {
@@ -1902,7 +1905,11 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
               const streamCfg = (cfg.call && cfg.call.stream) || {}
               const format = streamCfg.format || 'pcm'
               const sampleRate = streamCfg.sampleRate || 24000
-              const voice = (cfg.call && cfg.call.voice) || 'English_expressive_narrator'
+              // RC7（2026-08-17 验收）：默认 call.voice 为英文音色——中文文本用英文音色输出近削波
+              // 爆音（实测 peak 31358/rms 6006 vs 中文音色 5609/928）。与 speakImpl 同款 CJK 判定：
+              // 中文走 voiceZh，非中文走 call.voice。
+              const ttsCfg = loadConfig().tts || {}
+              const voice = hasCJK(text) ? (ttsCfg.voiceZh || 'Chinese (Mandarin)_Gentle_Youth') : ((cfg.call && cfg.call.voice) || 'English_expressive_narrator')
               const speed = (cfg.call && cfg.call.speed) || 1.0
               res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' })
               let handle = null

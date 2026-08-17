@@ -1015,18 +1015,32 @@ return {
     const callPoll = function () {
       if (!callState.active || callPollBusy) return
       callPollBusy = true
+      let consumed = false
       host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
         if (r && r.ok && r.entry) {
           // C5 修复：consensus 摘要条目（mp3 url + consensus 标记）→ 播放前开共识窗口
           if (r.entry.consensus) { notifyConsensusSpeech(true); playEntryConsensus(r.entry.url) }
-          else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; playStreamEntry(r.entry, callSessionId || '') }
+          // RC6（2026-08-17 验收）：流条目必须串行——host tts-stream 每会话 busy 门
+          // （speechStreamBusy）拒绝并发合成；预合成重叠 fetch 实测第二请求 1.8ms 即 429 →
+          // '播放中断' + 句子丢失 + 重试 nextTime=0 与在播帧重叠（噪声）。await 本句播放
+          // 结束再取下句：句 N 合成（~1-2s）通常短于播放时长，链仍无缝续接。
+          else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; consumed = true; return playStreamEntry(r.entry, callSessionId || '') }
           else if (r.entry.url) playEntry(r.entry.url)
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
         }
-      }).catch(function () {}).then(function () { callPollBusy = false })
+      }).catch(function () {}).then(function () {
+        callPollBusy = false
+        // RC6：流条目播放完成立即续取下句（不等 1s tick）；队列空（consumed=false）时停止，
+        // 由 interval tick 恢复轮询——避免空队列自旋
+        if (consumed && callState.active) callPoll()
+      })
     }
     // C5：共识 mp3 播放（window 关闭由 onended 触发；与 playEntry 同机制，附加回调）
     function playEntryConsensus(url) {
+      // RC7b（2026-08-17 验收）：摘要必须抢占流播放——拦截发生在回复播放中时，摘要与在播帧
+      // 叠加 → 噪声 + 听不清确认。stopStreamPlayback 会 notify(false)，随后重新开窗保持 3s 窗口
+      stopStreamPlayback()
+      notifyConsensusSpeech(true)
       stopCurrent()
       const a = new Audio(String(url))
       curAudio = a
