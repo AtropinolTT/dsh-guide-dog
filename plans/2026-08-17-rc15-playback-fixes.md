@@ -561,3 +561,16 @@ git commit -m "docs(phase2): RC15 — 部署记录回填"
 - [ ] 关掉其他会话的通话面板/语音模式后，不再出现男声重复播报
 - [ ] 播放失败（如临时断网）后条目不丢失（回队自动重试）
 - [ ] 无爆音、无 URL/`**`/📢 碎片（RC14 回归项）
+
+---
+
+## 部署记录（RC15-T5，2026-08-17 20:33 CST）
+
+- **发布时刻：** 2026-08-17 20:33 CST（`python3 deploy/publish.py`，danger-full-access 审批通过）
+- **sha256（部署 = 仓库，四处两两一致）：**
+  - `~/.dsh/dsh-guide-dog/lib/index.js` = `bundle/lib/index.js` = `4b55d8f3ec2613666f12a6ad64ce55d7c1e3d2c4f4574b7fef9ffd1a45b36280`
+  - `~/.dsh/dsh-guide-dog/lib/client.js` = `bundle/lib/client.js` = `6340dde616f40467400ea75f933b04e14924f32d19cc79ef72e58e19ff94631e`
+  - 服务端 `http://127.0.0.1:3080/plugins/dsh-guide-dog/client.js` = `6340dde6…`（与部署/仓库一致）
+- **标记核验（部署目录）：** voice-requeue（index 1 / client 1）、playVoiceEntry（client 5）、skip replay text=（index 1）、skip voice-dup text=（index 1）、`rc15-20260817`（client 1）；`rc14-20260817` 残留 0。
+- **提交：** 本部署记录回填 commit `docs(phase2): RC15 — 部署记录回填`（见 git log；SDD 台账在 `.superpowers/` gitignored 范围内保存完整明细）。
+- **下一步（用户侧验收）：** 重启 DSH + 硬刷新（Ctrl+Shift+R）→ 控制台确认 `[guide-dog] client build rc15-20260817` → 按上方「验收清单」逐项复测。
