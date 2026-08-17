@@ -867,6 +867,9 @@ return {
         return r.json()
       }).then(function (r) {
         if (r && r.ok && r.text) {
+          // Task 13：语音命令拦截——命中命令则执行且不提交到对话
+          const cmd = matchCallCommand(r.text)
+          if (cmd) { runCallCommand(cmd); setCallState({ phase: 'listening' }); return }
           const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
           if (actions) { insertText(actions, r.text); submitInput(actions) }
           setCallState({ phase: 'listening' })
@@ -1049,6 +1052,47 @@ return {
       streamPlayer.nodes = []
       streamPlayer.nextTime = 0
       notifyConsensusSpeech(false)
+    }
+    // Task 13：打断接线（spec §6.6）——Task 7 VAD 轮询在 phase==='speaking' 且发声时调用本回调
+    callBargeCb = function () {
+      // 打断（spec §6.6）：停播 + 清缓冲（abort fetch 由 stopStreamPlayback 完成）
+      stopStreamPlayback()
+      setCallState({ phase: 'listening' })
+    }
+
+    // ============ 语音命令节（Phase 2） ============
+    function matchCallCommand(text) {
+      const t = String(text || '').replace(/[，。！？\s]/g, '')
+      const table = [
+        { re: /^(停|暂停)$/, cmd: 'pause' },
+        { re: /^(继续|恢复)$/, cmd: 'resume' },
+        { re: /^(重复|再说一遍)$/, cmd: 'repeat' },
+        { re: /^(慢一点|慢些)$/, cmd: 'slower' },
+        { re: /^(快一点|快点)$/, cmd: 'faster' },
+        { re: /^(看看屏幕|看一下屏幕)$/, cmd: 'see_screen' },
+      ]
+      for (const row of table) { if (row.re.test(t)) return row.cmd }
+      return null
+    }
+    let lastSpokenSentence = null // repeat 用
+    function runCallCommand(cmd) {
+      switch (cmd) {
+        case 'pause':
+          if (streamPlayer.active) { stopStreamPlayback(); setCallState({ phase: 'listening' }) }
+          // 清 host 待播队列（防停播后下一句仍到）
+          host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+          break
+        case 'resume':
+          setCallState({ phase: 'listening' }) // 恢复=回到收听（无缓冲重播；Task 14 增强：恢复未播队列）
+          break
+        case 'repeat':
+          if (lastSpokenSentence) { playStreamEntry({ stream: true, text: lastSpokenSentence, consensus: false }, callSessionId || '') }
+          break
+        case 'slower': { const s = Math.min(1.2, callState.speed + 0.2); setCallState({ speed: s }) } break
+        case 'faster': { const s = Math.max(0.8, callState.speed - 0.2); setCallState({ speed: s }) } break
+        case 'see_screen': /* Phase 3 桩 */ break
+        default: break
+      }
     }
 
     const cardStyle = { border: '1px solid rgba(128,128,128,.35)', borderRadius: 10, padding: 10, marginTop: 6, maxWidth: 640 }
