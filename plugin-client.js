@@ -20,7 +20,7 @@ return {
 
     // RC9 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc11-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc12-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -944,34 +944,46 @@ return {
         return r.json()
       }).then(function (r) {
         if (r && r.ok && r.text) {
+          gdLog('transcribe ok text=' + String(r.text).slice(0, 30))
           // Task 13：语音命令拦截——命中命令则执行且不提交到对话
           const cmd = matchCallCommand(r.text)
-          if (cmd) { runCallCommand(cmd); setCallState({ phase: 'listening' }); return }
+          if (cmd) { gdLog('segment route=command'); runCallCommand(cmd); setCallState({ phase: 'listening' }); return }
           // RC11：打断直达 agent——打断后 10s 内的首个转写段走 interrupt RPC（host 侧
           // agent.steer 注入当前回合，下一个 step 边界消费），不再 submitInput 排队成新回合；
           // agent 不可用时回退原路径（插入 + 提交）。
           if (bargedAt && Date.now() - bargedAt < 10000) {
             bargedAt = 0
+            gdLog('segment route=interrupt')
             host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'interrupt', text: r.text }).then(function (rr) {
               if (!(rr && rr.ok)) {
+                gdLog('interrupt fallback -> submit')
                 const actions = gdInputActions
                 if (actions) { insertText(actions, r.text); submitInput(actions) }
               }
             }).catch(function () {
+              gdLog('interrupt fallback -> submit (err)')
               const actions = gdInputActions
               if (actions) { insertText(actions, r.text); submitInput(actions) }
             })
             setCallState({ phase: 'listening' })
             return
           }
+          gdLog('segment route=submit')
           const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
           if (actions) { insertText(actions, r.text); submitInput(actions) }
           setCallState({ phase: 'listening' })
         } else {
-          const msg = (r && r.message) || '转写失败'
-          setCallState({ phase: 'listening', error: msg })
-          playBeep()
-          showToast('通话转写失败：' + msg)
+          // RC12：空语音静默——VAD 误开段（环境声/回声）转写为空，不再报错打扰（无 toast/beep）
+          gdLog('transcribe fail error=' + (r && r.error) + ' msg=' + String((r && r.message) || ''))
+          const isEmpty = r && r.error === 'empty_speech'
+          if (isEmpty) {
+            setCallState({ phase: 'listening' })
+          } else {
+            const msg = (r && r.message) || '转写失败'
+            setCallState({ phase: 'listening', error: msg })
+            playBeep()
+            showToast('通话转写失败：' + msg)
+          }
         }
       }).catch(function (e) {
         setCallState({ phase: 'listening', error: '上传失败：' + String(e) })
@@ -1023,6 +1035,7 @@ return {
       let consumed = false
       host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
         if (r && r.ok && r.entry) {
+          gdLog('poll ' + (r.entry.consensus ? 'consensus' : r.entry.stream ? 'stream' : r.entry.url ? 'url' : 'error') + ' key=' + (r.entry.key || '?') + ' text=' + String(r.entry.text || '').slice(0, 16))
           // RC8：全部条目类型都串行等待（consumed=true + return Promise）——进度播报 mp3 未播完
           // 不得播下一条（旧代码 url 分支不 await → 播报与回复流重叠 → "同时播报多条" + 噪声）
           if (r.entry.consensus) { consumed = true; return playEntryConsensus(r.entry.url) }
@@ -1072,6 +1085,8 @@ return {
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
     const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, fetching: false }
+    // RC12 诊断日志：浏览器控制台打点（[gd] 前缀）——一次复测即可定位播放管线问题（爆音/重复/中断）
+    function gdLog(msg) { try { console.log('[gd] ' + msg) } catch (e) { /* ignore */ } }
     // RC9（2026-08-17 验收）：流链排空等待——playStreamEntry 在 fetch 结束即 resolve（C2 预取
     // 语义），其调度音频仍可能在播；mp3 条目（进度播报/语音模式）开播前必须等链排空
     // （nodes 清空且 active 落回 false），否则播报与仍响的句子叠加。链空闲时立即通过。
@@ -1116,11 +1131,21 @@ return {
         if (!streamPlayer.active) return
         const src = audioCtx.createBufferSource()
         src.buffer = buf
-        src.connect(audioCtx.destination)
         const when = Math.max(audioCtx.currentTime + 0.05, streamPlayer.nextTime)
+        // RC12：断链后淡入（5ms）——链排空后新块从全幅起播会咔哒一声（"句子被切断时爆"候选）
+        const gapMs = Math.round((when - streamPlayer.nextTime) * 1000)
+        if (gapMs > 20) {
+          const g = audioCtx.createGain()
+          g.gain.setValueAtTime(0.0001, when)
+          g.gain.linearRampToValueAtTime(1, when + 0.005)
+          src.connect(g); g.connect(audioCtx.destination)
+        } else {
+          src.connect(audioCtx.destination)
+        }
         src.start(when)
         streamPlayer.nextTime = when + buf.duration
         streamPlayer.nodes.push(src)
+        gdLog('chunk when=' + when.toFixed(3) + ' now=' + audioCtx.currentTime.toFixed(3) + ' gap=' + gapMs + 'ms dur=' + buf.duration.toFixed(3) + ' nodes=' + streamPlayer.nodes.length)
         src.onended = function () {
           const i = streamPlayer.nodes.indexOf(src)
           if (i >= 0) streamPlayer.nodes.splice(i, 1)
@@ -1129,10 +1154,11 @@ return {
           // 该句被静默丢弃（如先于下一句首帧解码就排空的短句"好的/收到"）
           if (!streamPlayer.nodes.length && !streamPlayer.fetching && streamPlayer.active) {
             streamPlayer.active = false
+            gdLog('chain drained -> listening')
             setCallState({ phase: 'listening' })
           }
         }
-      }).catch(function () { /* 解码失败：跳过该块 */ })
+      }).catch(function (e) { gdLog('chunk DECODE-FAIL ' + String((e && e.message) || e).slice(0, 60)) })
     }
     async function playStreamEntry(entry, sid) {
       // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
@@ -1149,6 +1175,7 @@ return {
       const cfg = voiceState.cfg || {}
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
       const firstSentence = !streamPlayer.active // C2：仅在链空闲时走完整起播路径
+      gdLog('playStreamEntry playId=' + playId + ' first=' + firstSentence + ' key=' + (entry.key || '?') + ' text=' + String(entry.text || '').slice(0, 16))
       if (firstSentence) {
         stopCurrent() // RC9：反向防叠——起播新链时终止仍在播的 mp3（如 repeat 命令直接调用时）
         streamPlayer.active = true
@@ -1166,30 +1193,42 @@ return {
       const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
       try {
         const resp = await fetch(url, { signal: controller.signal })
+        gdLog('fetch status=' + resp.status + ' playId=' + playId)
         if (!resp.ok || !resp.body) { throw new Error('http ' + resp.status) }
         const reader = resp.body.getReader()
         let acc = new Uint8Array(0)
+        let totalBytes = 0
+        let frameCount = 0
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
           if (!streamPlayer.active) { try { controller.abort() } catch (e) { /* ignore */ } break }
           if (value && value.length) {
+            totalBytes += value.length
             const merged = new Uint8Array(acc.length + value.length)
             merged.set(acc); merged.set(value, acc.length)
             acc = merged
             // 每 ~0.5s 音频（24000*2*0.5=24000 字节）解码一帧，保持播放间隙 <400ms
             if (acc.length >= 24000) {
-              const frame = acc.subarray(0, acc.length)
+              // RC12：帧长取偶（16bit WAV 数据须为偶数；奇长帧可能解码失败 → 跳块 → 间隙+爆音）
+              const even = acc.length - (acc.length % 2)
+              const frame = acc.subarray(0, even)
+              acc = acc.subarray(even)
               const wav = pcmToWav(frame, sr)
               scheduleChunk(audioCtx, wav)
-              acc = new Uint8Array(0)
+              frameCount += 1
             }
           }
         }
-        if (acc.length > 0) { const wav = pcmToWav(acc, sr); scheduleChunk(audioCtx, wav) }
+        if (acc.length > 1) {
+          const even = acc.length - (acc.length % 2)
+          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav); frameCount += 1 }
+        }
+        gdLog('stream done playId=' + playId + ' bytes=' + totalBytes + ' frames=' + frameCount + ' nodes=' + streamPlayer.nodes.length)
       } catch (e) {
         // R15 修复：新播放已接管（playSeq 已递增）→ 旧 abort rejection 直接退出，不拆新播放状态
         if (playId !== streamPlayer.playSeq) return
+        gdLog('stream FAIL playId=' + playId + ' active=' + streamPlayer.active + ' retried=' + !!playStreamEntry._retried + ' nodes=' + streamPlayer.nodes.length + ' err=' + String((e && e.message) || e).slice(0, 60))
         if (streamPlayer.active) {
           // RC11（V4-Pro 诊断确认）：重试前**完整停链**——已 src.start 的旧帧仍在播放，
           // 仅置 active=false 会让重试以 firstSentence 另起新链（nextTime=0），同句在新旧
@@ -1211,6 +1250,7 @@ return {
         }
       } finally {
         // RC8：归属检查——重试已接管 controller/fetching 时，陈旧 finally 不得清除新状态
+        gdLog('stream finally playId=' + playId + ' owner=' + (streamPlayer.controller === controller) + ' fetching=' + streamPlayer.fetching)
         if (streamPlayer.controller === controller) {
           streamPlayer.fetching = false // C6：在 catch/重连之后清除（重连再入时看到 false）
           streamPlayer.controller = null
@@ -1229,6 +1269,8 @@ return {
     // Task 13：打断接线（spec §6.6）——Task 7 VAD 轮询在 phase==='speaking' 且发声时调用本回调
     let bargedAt = 0 // RC11：最近一次打断时刻——打断后窗口内的首个转写段路由到 agent 打断（steer），而非排队新回合
     callBargeCb = function () {
+      bargedAt = Date.now()
+      gdLog('BARGE')
       bargedAt = Date.now()
       // 打断（spec §6.6）：停播 + 清缓冲（abort fetch 由 stopStreamPlayback 完成）
       stopStreamPlayback()

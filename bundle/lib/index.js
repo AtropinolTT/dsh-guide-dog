@@ -1840,12 +1840,16 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     // 去重：同短语冷却窗口内跳过（出错文本唯一，天然不冲突）。
     function announce(sid, text) {
       const now = Date.now()
-      if (progressDedupe(lastProgress.get(String(sid)), text, now)) return
+      if (progressDedupe(lastProgress.get(String(sid)), text, now)) {
+        try { console.log('[gd-host] announce DEDUPE ' + text) } catch (e) { /* ignore */ }
+        return
+      }
       lastProgress.set(String(sid), { phrase: text, ts: now })
       const q2 = voiceQueue.get(String(sid)) || []
       q2.unshift({ stream: true, text: text, key: 'progress:' + String(sid) + ':' + text })
       if (q2.length > VOICE_QUEUE_MAX) q2.pop()
       voiceQueue.set(String(sid), q2)
+      try { console.log('[gd-host] announce ' + text + ' qlen=' + q2.length) } catch (e) { /* ignore */ }
     }
     // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
     // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
@@ -1986,6 +1990,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) }) })
         if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
         voiceQueue.set(sid, q)
+        // RC12 诊断日志（DSH 终端可见）
+        try { console.log('[gd-host] enqueue n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
     })
     // ---- 容错（spec §6.8） ----
@@ -2114,6 +2120,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const q = voiceQueue.get(sid) || []
           const entry = q.length ? q.shift() : null
           if (!q.length) voiceQueue.delete(sid)
+          if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?')) } catch (e) { /* ignore */ } }
           return { ok: true, entry: entry }
         })
       } catch (e) { return function () {} }
