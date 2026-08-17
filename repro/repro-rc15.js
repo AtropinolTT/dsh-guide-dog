@@ -4,8 +4,10 @@
 const fs = require('fs')
 const path = require('path')
 const host = fs.readFileSync(path.join(__dirname, '..', 'plugin-host.js'), 'utf8')
+const client = fs.readFileSync(path.join(__dirname, '..', 'plugin-client.js'), 'utf8')
 let fail = 0
 function ok(cond, msg) { if (cond) { console.log('PASS ' + msg) } else { fail++; console.log('FAIL ' + msg) } }
+function count(hay, needle) { return hay.split(needle).length - 1 }
 function extractFn(src, name) {
   const start = src.indexOf('function ' + name + '(')
   if (start < 0) return null
@@ -35,5 +37,22 @@ if (requeueSrc) {
   const r3 = requeueEntry([{ key: 'x' }, { key: 'y' }], { key: 'z' }, 2)
   ok(r3.q.length === 2 && r3.q[0].key === 'z' && r3.q[2] === undefined, 'requeue tail pop')
 }
+
+// ---- 静态契约（Task 2：持久播放器） ----
+ok(client.includes('function playVoiceEntry('), 'client playVoiceEntry')
+ok(client.includes('function unlockVoiceAudio('), 'client unlockVoiceAudio')
+ok(client.includes('function bindGestureUnlock('), 'client bindGestureUnlock')
+ok(client.includes("['click', 'keydown', 'touchstart']"), 'client gesture events')
+ok(client.includes('window.addEventListener(ev, unlockVoiceAudio, true)'), 'client gesture capture bind')
+ok(client.includes('URL.createObjectURL(blob)'), 'client blob object url')
+ok(client.includes('voicePlayer.attempts'), 'client attempts map')
+ok(client.includes('attempts > 3'), 'client attempt cap 3')
+ok(client.includes("'guide-dog/voice-requeue'"), 'client requeue rpc')
+ok(client.includes('waitStreamDrain()'), 'client drain wait')
+ok(client.includes('voice play key='), 'client voice play count log')
+ok(client.includes("else if (r && r.ok && !r.entry) {"), 'client poll summary branch')
+ok(count(client, 'function playEntry(') === 0, 'client playEntry removed')
+ok(count(client, 'function playEntryNow(') === 0, 'client playEntryNow removed')
+ok(count(client, 'new Audio(String(url))') === 1, 'client per-entry Audio only in playEntryConsensus')
 
 process.exit(fail === 0 ? 0 : 1)
