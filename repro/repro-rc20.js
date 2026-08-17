@@ -34,7 +34,7 @@ ok(client.includes('[effective, sid, tick, locTick]'), 'client voice poll re-tri
 ok(client.includes('toggleCall(sid, props.inputActions)'), 'client dock toggleCall with inputActions')
 ok(client.includes("'📞'"), 'client handset icon restored')
 ok(count(client, 'const PILL_W = 104') === 1, 'client pill shared width const')
-ok(client.includes('cardLeft - 21'), 'client pill right edge offset (7px + 14px left shift)')
+ok(client.includes('cardLeft - 28'), 'client pill right edge offset (7px + 14px + 7px left shift)')
 ok(client.includes('callTop: top'), 'client call pill top aligned to card top')
 ok(client.includes('voiceTop: bottom - PILL_H'), 'client voice pill bottom aligned to card bottom')
 ok(client.includes("'call.label'"), 'client idle call label dict key')
