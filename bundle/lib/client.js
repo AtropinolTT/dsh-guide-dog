@@ -913,6 +913,12 @@ return {
     let callSegmentActive = false
     let callBargeCb = null // Task 12 设置：用户发声回调（bargeIn 钩子）
     let callRms = 0 // 最新 RMS（isUserSpeaking 供 Task 8/9 共识窗口查询）
+    // RC17 回声防线（无 AEC 环境：麦克风拾取 agent 播报 → 自问自答死循环）：
+    let callVoiced = false // 最新 tick 的 voiced 结果（起播时刻回声地板采样用）
+    let echoFloor = false // 本通话检测到回声地板（speaking 期发声占比高）→ 禁用 barge-in（回声不可与真实打断区分）
+    let echoWinStart = 0, echoWinLast = 0, echoVoicedMs = 0 // 回声地板检测窗（时间累计）
+    let echoQuietStart = 0 // 持续安静计时（清除 echoFloor：agent 与用户都静音 ≥2s）
+    let playbackEndedAt = 0 // 最近一次下行播报结束时刻（回声尾抑制窗基准）
 
     function startCall(sid, inputActions) {
       if (callMic) return
@@ -948,6 +954,8 @@ return {
           const maxSeg = (cfg.call && cfg.call.vad && cfg.call.vad.maxSegmentSeconds) || 60
           // I4（最终审稿）：打断最小连续发声时长（spec §6.6 防误触）——与 threshold/silenceMs 同处读取
           const interruptMinMs = vad.interruptMinMs !== undefined ? vad.interruptMinMs : 300
+          // RC17：播报结束回声尾抑制窗（无 AEC 环境扬声器余响，防 VAD 把 agent 自己的话开段）
+          const echoTailMs = vad.echoTailMs !== undefined ? vad.echoTailMs : 1500
           let voicedSince = 0, silentSince = 0, lastVoiced = false, voicedStart = 0
           const sampleBuf = new Uint8Array(analyser.fftSize)
           const tick = function () {
@@ -960,17 +968,34 @@ return {
             const rms = Math.sqrt(sum / sampleBuf.length)
             callRms = rms // isUserSpeaking 查询用
             const voiced = rms >= threshold
+            callVoiced = voiced // RC17：回声地板采样（起播时刻）
             const now = Date.now()
+            // RC17：回声地板检测——speaking 周期内发声占比 >70%（1s 时间窗）→ 麦克风在拾取 agent 播报
+            if (callState.phase === 'speaking') {
+              if (!echoWinStart) { echoWinStart = now; echoWinLast = now }
+              if (voiced) echoVoicedMs += now - echoWinLast
+              echoWinLast = now
+              if ((now - echoWinStart) >= 1000 && (echoVoicedMs / (now - echoWinStart)) > 0.7) echoFloor = true
+            } else {
+              echoWinStart = 0; echoWinLast = 0; echoVoicedMs = 0
+            }
+            // RC17：回声地板清除——agent 与用户都静音 ≥2s → 恢复 barge-in 资格（下一周期重新检测）
+            if (echoFloor) {
+              if (!voiced) { if (!echoQuietStart) echoQuietStart = now; if ((now - echoQuietStart) >= 2000) echoFloor = false }
+              else echoQuietStart = 0
+            } else { echoQuietStart = 0 }
             // I4：unvoiced→voiced 跳变记时；连续发声 ≥ interruptMinMs 才允许打断（防瞬时误触）
             if (voiced && !lastVoiced) voicedStart = now
             // I7（最终审稿）：打断检查置于段空闲分支之前——PTT 无活动段时同样生效（spec §6.3）
-            if (callState.phase === 'speaking' && voiced && (now - voicedStart) >= interruptMinMs && callBargeCb) callBargeCb()
+            // RC17：回声地板存在时禁用 barge-in（麦克风听到的是 agent 自己的声音，无法与真实打断区分）
+            if (callState.phase === 'speaking' && voiced && (now - voicedStart) >= interruptMinMs && !echoFloor && callBargeCb) callBargeCb()
             if (!callSegmentActive) {
               // VAD 自动起段（spec 6.9.1：说话-停顿-说话 两段成回合，无需点击）：
               // 无活动段且检测到语音 → 自动 startSegment；PTT 模式由 mode 门控排除；
               // barge-in 已提前执行（I7），auto-start 仅在此分支触发，互不冲突
               // RC2：播放（speaking）期间禁止自动起段——TTS 输出/环境声不得开段（回声开环）；打断由 barge-in 独占
-              if (callState.mode === 'vad' && voiced && callState.phase !== 'speaking') startSegment()
+              // RC17：播报结束回声尾抑制窗（echoTailMs）内禁止自动起段——扬声器余响会开段录到 agent 自己的话
+              if (callState.mode === 'vad' && voiced && callState.phase !== 'speaking' && (now - playbackEndedAt) > echoTailMs) startSegment()
               callMic.raf = requestAnimationFrame(tick)
               return
             }
@@ -1023,6 +1048,8 @@ return {
       if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
       callSessionRef = null // RC13：最后清归属——clear-queue/停播已完成（其 callSid() 需在清空前有效）
       playCounts.clear() // RC14：挂断即清播放计数（防跨会话错位汇总）
+      // RC17：回声状态复位（下次通话重新检测）
+      echoFloor = false; echoWinStart = 0; echoWinLast = 0; echoVoicedMs = 0; echoQuietStart = 0; playbackEndedAt = 0
     }
 
     function resetSegment() {
@@ -1143,8 +1170,11 @@ return {
         } else {
           // RC12：空语音静默——VAD 误开段（环境声/回声）转写为空，不再报错打扰（无 toast/beep）
           gdLog('transcribe fail error=' + (r && r.error) + ' msg=' + String((r && r.message) || ''))
+          // RC17：回声拒收——转写文本是 agent 自己刚播报的话 → 静默丢弃（不自问自答；无 toast）
+          const isEcho = r && r.error === 'echo_reject'
           const isEmpty = r && r.error === 'empty_speech'
-          if (isEmpty) {
+          if (isEmpty || isEcho) {
+            if (isEcho) gdLog('segment echo_reject')
             setCallState({ phase: 'listening' })
           } else {
             const msg = (r && r.message) || '转写失败'
@@ -1341,6 +1371,7 @@ return {
           if (!streamPlayer.nodes.length && !streamPlayer.fetching && streamPlayer.active) {
             streamPlayer.active = false
             gdLog('chain drained -> listening')
+            playbackEndedAt = Date.now() // RC17：回声尾抑制窗基准
             setCallState({ phase: 'listening' })
           }
         }
@@ -1426,6 +1457,7 @@ return {
           // RC11（V4-Pro 诊断确认）：重试前完整停链——stopStreamPlayback 内部递增 playSeq，
           // 重试以新代际起播，旧帧（含已 src.start 的）全部作废
           stopStreamPlayback()
+          playbackEndedAt = Date.now() // RC17：回声尾抑制窗基准（中断/重试路径）
           setCallState({ phase: 'listening', error: '播放中断' })
           // RC13：429 不重试（host 忙门，立即重试必再 429）；同 (sid,text) 5s 内至多重试一次。
           // 重试必须并入串行链——return 让 callPoll 等到重试结束（RC8）。
@@ -1454,6 +1486,7 @@ return {
       // 在途 fetch 的解码帧/abort 回调全部作废（catch 的 playId 归属检查直接退出）
       streamPlayer.playSeq += 1
       streamPlayer.gen += 1 // RC13：解码代际递增——旧 decode 帧作废（fetch 归属仍看 playSeq）
+      playbackEndedAt = Date.now() // RC17：回声尾抑制窗基准（任何停播路径）
       if (streamPlayer.controller) { try { streamPlayer.controller.abort() } catch (e) { /* ignore */ } streamPlayer.controller = null }
       streamPlayer.active = false
       // RC13：淡出停播（10ms 线性落零再延时停源）——src.stop() 硬切在句切断处产生咔哒爆音
