@@ -129,4 +129,28 @@ if (echoSrc) {
   ok(echoMatch('今天上海有雨明天放晴', [{ t: '明天北京下雪', at: 0 }]) === false, 'echoMatch different text no hit')
 }
 
+// ---- 静态契约（RC18：流播放 HTMLAudio 直出——RDP/Chrome 环境 WebAudio AudioContext 输出无声） ----
+ok(client.includes('client build rc18-20260817'), 'client build tag rc18')
+ok(client.includes('function ensureStreamAudio('), 'client stream audio element')
+ok(client.includes('function playStreamWav('), 'client stream wav player')
+ok(client.includes('function waitStreamFree('), 'client stream serial wait')
+ok(client.includes('function settleStreamWaiters('), 'client stream waiter settle')
+ok(client.includes('streamAudio play playId='), 'client stream audio play log')
+ok(client.includes('streamAudio block playId='), 'client stream audio block log')
+ok(client.includes("err.name === 'NotAllowedError'"), 'client autoplay block detection')
+ok(client.includes('streamAudio play-err playId='), 'client play non-block error log')
+ok(client.includes('function handleStreamAudioError('), 'client stream error handler')
+ok(client.includes('Date.now() >= limit'), 'client stream wait timeout')
+ok(client.includes('playId === streamPlayer.playSeq) notifyConsensusSpeech(false)'), 'client consensus close ownership guard')
+ok(client.includes("type: 'audio/wav'"), 'client wav blob type')
+ok(client.includes('chain drained -> listening'), 'client chain drain log')
+ok(client.includes('audio outputs '), 'client output device diag')
+ok(count(client, 'createBufferSource(') === 0, 'client webaudio source removed')
+ok(count(client, 'decodeAudioData(') === 0, 'client webaudio decode removed')
+ok(count(client, 'scheduleChunk(') === 0, 'client scheduleChunk removed')
+ok(client.includes('streamAudio.el.src && streamAudio.el.paused'), 'client gesture resume stream')
+
+// ---- 静态契约（RC18：agent 不得自调音频技能——语音由插件自动播报） ----
+ok(host.includes('调用 audio-conversation、speech-mmx、mmx'), 'host voice auto guidance')
+
 process.exit(fail === 0 ? 0 : 1)

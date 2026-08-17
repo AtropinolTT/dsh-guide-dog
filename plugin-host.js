@@ -1092,6 +1092,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
             '- GENERATION: use guide_dog_image (images), guide_dog_video (video), guide_dog_music (music), guide_dog_speak (speech).',
             '- All generated media is also visible to the user in the web UI at /guide-dog/media/<file>; always include the returned url fields in your reply so the user can preview.',
             '- When the user asks to hear text spoken aloud, use guide_dog_speak.',
+            '- VOICE (TTS/播报): 语音播报由本插件在浏览器端自动完成——你的回复文本会自动合成并朗读（语音模式/通话模式/无障碍模式），你不需要也不应该调用 audio-conversation、speech-mmx、mmx 等任何技能或其脚本来"启用/修复"语音，也不要为语音功能请求沙箱权限扩展或运行本地脚本。用户反馈听不到声音时，这是浏览器/系统音频输出问题：请用户检查浏览器标签页音量、系统输出设备与通话/语音模式的播报开关即可，不要尝试在沙箱内修复。若用户明确要求朗读某段具体文字，用 guide_dog_speak 工具。',
           ].join('\n'),
         })
       } catch (e) {

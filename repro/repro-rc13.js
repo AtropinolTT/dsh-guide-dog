@@ -52,18 +52,18 @@ function check(cond, label) {
   check(w >= 2, 'host: 下行 + 语音模式（或 turn-end）两个监听按净化后文本匹配本机已播')
 }
 
-// ---- 4. 播放管线爆音（Task 4，client） ----
+// ---- 4. 播放管线（Task 4，client；RC18 改 HTMLAudio 直出后契约更新） ----
 {
-  check(/function scheduleChunk\(audioCtx, wavBytes, gen\)/.test(srcC), 'client: scheduleChunk 带 gen 代际参数')
-  check(/gen !== streamPlayer\.gen \|\| !streamPlayer\.active/.test(srcC), 'client: 解码帧代际守卫（旧 fetch 帧不加入新链）')
-  check(/const gen = streamPlayer\.gen/.test(srcC), 'client: playStreamEntry 捕获解码代际 gen')
-  check(/src\._gdGain = g/.test(srcC), 'client: 每帧恒接 GainNode（停播淡出需要）')
-  check(/gapMs > 3/.test(srcC), 'client: 淡入阈值收窄到 3ms')
+  check(/function playStreamWav\(/.test(srcC), 'client: 流播放 WAV→HTMLAudio（RC18 替代 WebAudio 链）')
+  check(/function ensureStreamAudio\(/.test(srcC), 'client: 持久流播放元素')
+  check(/const gen = streamPlayer\.gen/.test(srcC), 'client: playStreamEntry 捕获代际 gen')
+  check(/playId !== streamPlayer\.playSeq \|\| !streamPlayer\.active/.test(srcC), 'client: 等待元素空闲后归属检查（旧 fetch/等待者作废）')
   const m = srcC.match(/function stopStreamPlayback\(\) \{[\s\S]*?\n    \}/)
-  check(!!m && /playSeq \+= 1/.test(m[0]), 'client: stopStreamPlayback 递增代际（在途帧作废）')
-  check(!!m && /gen \+= 1/.test(m[0]), 'client: stopStreamPlayback 递增解码代际 gen（旧解码帧作废）')
-  check(!!m && /linearRampToValueAtTime\(0\.0001, now \+ 0\.01\)/.test(m[0]), 'client: 停播 10ms 淡出（防硬切咔哒）')
-  check(!!m && /src\.stop\(now \+ 0\.015\)/.test(m[0]), 'client: 淡出后延时停源')
+  check(!!m && /playSeq \+= 1/.test(m[0]), 'client: stopStreamPlayback 递增 playSeq（在途作废）')
+  check(!!m && /gen \+= 1/.test(m[0]), 'client: stopStreamPlayback 递增代际 gen')
+  check(!!m && /streamAudio\.el\.pause\(\)/.test(m[0]), 'client: 停播暂停流元素')
+  check(!!m && /removeAttribute\('src'\)/.test(m[0]), 'client: 停播清 src（防残留续播）')
+  check(!!m && /settleStreamWaiters\(\)/.test(m[0]), 'client: 停播放行链内等待者（归属检查自行作废）')
   check(!!m && /fetching = false/.test(m[0]), 'client: stopStreamPlayback 清在途标志')
   check(/const retryKeys = new Map\(\)/.test(srcC), 'client: 重试记账按 (sid,text) 维度')
   check(/noRetry = resp\.status === 429/.test(srcC), 'client: 429 标记不重试')
