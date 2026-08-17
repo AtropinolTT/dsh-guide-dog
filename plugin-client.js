@@ -70,12 +70,26 @@ return {
       if (voicePlayer.audio) {
         try { voicePlayer.audio.pause() } catch (e) { /* ignore */ }
       }
+      // RC15（F1）：中断时释放 busy 并回队——防 voicePlayer.busy 死锁吞条目（评审 Important）
+      if (voicePlayer.busy || voicePlayer.current || voicePlayer.pending) {
+        const a = voicePlayer.audio
+        if (a) { a.onended = null; a.onerror = null }
+        if (voicePlayer.ac) { try { voicePlayer.ac.abort() } catch (e) { /* ignore */ } voicePlayer.ac = null }
+        const cur = voicePlayer.current
+        if (cur && cur.objUrl) { try { URL.revokeObjectURL(cur.objUrl) } catch (e) { /* ignore */ } }
+        voicePlayer.current = null
+        voicePlayer.busy = false
+        voicePlayer.attempts.delete(String((cur && cur.entry && (cur.entry.key || cur.entry.url)) || ''))
+        if (cur) requeueVoiceEntry(cur.entry, cur.sid)
+        const pend = voicePlayer.pending
+        if (pend) { voicePlayer.pending = null; requeueVoiceEntry(pend.entry, pend.sid) }
+      }
     }
     // ============ RC15 播放器：语音模式/播报 mp3（持久元素 + fetch 全量下载） ============
     // 旧实现逐条目 new Audio(url)：自动播放被拦/元素被替换 → 浏览器中止下载 →
     // ERR_CONTENT_LENGTH_MISMATCH + Chrome 媒体重试风暴（同文件 10-30 次请求）。
     // 新实现：fetch 一次拿全量字节（AbortController 120s 超时）→ Blob URL → 单一持久 Audio 元素。
-    const voicePlayer = { audio: null, ctx: null, busy: false, pending: null, attempts: new Map(), banner: false }
+    const voicePlayer = { audio: null, ctx: null, busy: false, pending: null, attempts: new Map(), banner: false, current: null, ac: null }
     function ensureVoiceAudio() {
       if (!voicePlayer.audio) {
         try { voicePlayer.audio = new Audio() } catch (e) { voicePlayer.audio = null }
@@ -121,16 +135,22 @@ return {
         voicePlayer.busy = true
         voicePlayer.banner = false
         const ac = new AbortController()
+        voicePlayer.ac = ac
         const timer = setTimeout(function () { try { ac.abort() } catch (e) { /* ignore */ } }, 120000)
         return fetch(String(entry.url), { cache: 'no-store', signal: ac.signal }).then(function (r) {
           if (!r.ok) throw new Error('http ' + r.status)
           return r.blob()
         }).then(function (blob) {
           clearTimeout(timer)
+          voicePlayer.ac = null
           const a = ensureVoiceAudio()
           if (!a) throw new Error('no audio element')
           const objUrl = URL.createObjectURL(blob)
-          const cleanup = function () { try { URL.revokeObjectURL(objUrl) } catch (e) { /* ignore */ } }
+          voicePlayer.current = { entry: entry, sid: sid, objUrl: objUrl }
+          const cleanup = function () {
+            if (voicePlayer.current && voicePlayer.current.objUrl === objUrl) voicePlayer.current = null
+            try { URL.revokeObjectURL(objUrl) } catch (e) { /* ignore */ }
+          }
           a.onended = function () {
             cleanup(); a.onended = null; a.onerror = null
             voicePlayer.busy = false; voicePlayer.attempts.delete(key); nextVoiceEntry()
@@ -153,6 +173,7 @@ return {
           return Promise.resolve()
         }).catch(function (e) {
           clearTimeout(timer)
+          if (voicePlayer.ac === ac) voicePlayer.ac = null
           voicePlayer.busy = false
           gdLog('voice fail key=' + key + ' err=' + String((e && e.message) || e).slice(0, 60))
           requeueVoiceEntry(entry, sid)

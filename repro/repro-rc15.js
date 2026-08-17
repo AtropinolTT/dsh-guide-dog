@@ -55,4 +55,8 @@ ok(count(client, 'function playEntry(') === 0, 'client playEntry removed')
 ok(count(client, 'function playEntryNow(') === 0, 'client playEntryNow removed')
 ok(count(client, 'new Audio(String(url))') === 1, 'client per-entry Audio only in playEntryConsensus')
 
+// ---- 静态契约（Task 2 F1：stopCurrent 中断释放 busy 并回队） ----
+ok(client.includes('requeueVoiceEntry(cur.entry, cur.sid)'), 'client stop requeue current')
+ok(client.includes('requeueVoiceEntry(pend.entry, pend.sid)'), 'client stop requeue pending')
+
 process.exit(fail === 0 ? 0 : 1)
