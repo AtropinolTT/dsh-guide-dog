@@ -873,6 +873,7 @@ return {
       // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
       if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
       callSessionRef = null // RC13：最后清归属——clear-queue/停播已完成（其 callSid() 需在清空前有效）
+      playCounts.clear() // RC14：挂断即清播放计数（防跨会话错位汇总）
     }
 
     function resetSegment() {
@@ -1059,9 +1060,9 @@ return {
           else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
         }
-        // RC14：队列空（r.ok && !r.entry）或失败响应（!r.ok）时落汇总埋点——按 key 列出本轮播放次数
-        // !r.ok 时跳过（避免把跨回合累积误归零；只在确认本轮播放窗口结束才清）
-        else if (!r || !r.entry) {
+        // RC14：仅在确认本轮播放窗口结束（r.ok && !r.entry，队列空）时落汇总埋点——按 key 列出本轮播放次数
+        // !r.ok 时跳过（RPC 失败/异常时跳过，避免把跨回合累积误归零）
+        else if (r && r.ok && !r.entry) {
           if (playCounts.size) {
             const summary = Array.from(playCounts.entries()).map(function (e) { return e[0] + '=' + e[1] }).join(' | ')
             gdLog('PLAY-SUMMARY ' + summary)
