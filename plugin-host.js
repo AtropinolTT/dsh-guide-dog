@@ -55,7 +55,7 @@ return {
       tts: { voiceEn: 'English_expressive_narrator', voiceZh: 'Chinese (Mandarin)_Gentle_Youth', speed: 0.95, format: 'mp3' },
       call: {
         mode: 'vad',
-        vad: { method: 'energy', threshold: 0.02, silenceMs: 700, minSpeechMs: 300, maxSegmentSeconds: 60, interruptMinMs: 300 },
+        vad: { method: 'energy', threshold: 0.02, silenceMs: 700, minSpeechMs: 300, maxSegmentSeconds: 60, interruptMinMs: 300, echoTailMs: 1500 },
         stream: { format: 'pcm', sampleRate: 24000, sentenceSplit: '。！？.!?\n', maxSentenceChars: 200 },
         voice: 'English_expressive_narrator',
         speed: 1.0,
@@ -485,7 +485,7 @@ if __name__ == '__main__':
         try {
           const wr = await workerTranscribe(b64Path, model, lang, args.partial ? 20000 : 60000)
           if (wr && typeof wr.ok === 'boolean') {
-            return { ok: wr.ok === true, text: wr.text, language: wr.language, error: wr.error, message: wr.message, durationMs: wr.durationMs }
+            return echoGuard({ ok: wr.ok === true, text: wr.text, language: wr.language, error: wr.error, message: wr.message, durationMs: wr.durationMs }, args.sessionId || '')
           }
         } catch (e) {
           console.log('[guide-dog] whisper worker failed, fallback one-shot: ' + String((e && e.message) || e))
@@ -518,7 +518,7 @@ if __name__ == '__main__':
         if (!parsed || parsed.ok !== true) {
           return { ok: false, error: (parsed && parsed.error) || 'stt_failed', message: (parsed && parsed.message) || 'STT failed' }
         }
-        return { ok: true, text: parsed.text, language: parsed.language, durationMs: parsed.durationMs }
+        return echoGuard({ ok: true, text: parsed.text, language: parsed.language, durationMs: parsed.durationMs }, args.sessionId || '')
       } catch (e) {
         return { ok: false, error: 'stt_failed', message: String((e && e.message) || e).slice(0, 200) }
       } finally {
@@ -1981,6 +1981,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const dup = q.some(function (e) { return e.text === s })
           if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
           q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) })
+          // RC17：回声拒收缓冲——agent 即将播报的句子入缓冲（转写回声比对用）
+          pushAgentSpeech(sid, s, Date.now())
         })
         // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
         while (q.length > VOICE_QUEUE_MAX) q.pop()
@@ -2018,6 +2020,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const dup = q.some(function (e) { return e.text === s })
           if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
           q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) })
+          // RC17：回声拒收缓冲——agent 即将播报的句子入缓冲（转写回声比对用）
+          pushAgentSpeech(sid, s, Date.now())
         })
         // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
         while (q.length > VOICE_QUEUE_MAX) q.pop()
@@ -2121,6 +2125,38 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     // RC15：事件重放去重判定（纯函数，供两处监听与 repro 复用）——同文本且在窗口内 → true（应跳过）
     function replayDup(prev, text, now, windowMs) {
       return !!(prev && prev.text === text && (now - prev.at) < windowMs)
+    }
+    // RC17：回声拒收——agent 最近播报文本缓冲（sessionId -> [{t, at}]；每句入队时推送，≤8 条）
+    // 背景：无 AEC 环境（RDP 虚拟麦克风/立体声混音回环设备）下，麦克风拾取 agent 自己的播报，
+    // VAD 视为用户发声 → 转写出的正是 agent 自己的话 → 提交回去 → 自问自答死循环。
+    // 防线：转写文本与最近播报等长命中或 ≥6 字符包含命中 → 判为回声，拒绝提交。
+    const lastAgentSpeech = new Map() // sessionId -> Array<{t, at}>
+    function pushAgentSpeech(sid, text, now) {
+      if (!sid || !text) return
+      const arr = lastAgentSpeech.get(sid) || []
+      arr.push({ t: text, at: now })
+      while (arr.length > 8) arr.shift()
+      lastAgentSpeech.set(sid, arr)
+    }
+    function echoMatch(trans, recent) {
+      const t = String(trans || '').trim()
+      if (!t || !recent || !recent.length) return false
+      for (let i = 0; i < recent.length; i++) {
+        const r = String((recent[i] && recent[i].t) || '')
+        if (!r) continue
+        if (r === t) return true
+        if (t.length >= 6 && (r.indexOf(t) >= 0 || t.indexOf(r) >= 0)) return true
+      }
+      return false
+    }
+    function echoGuard(result, sid) {
+      if (result && result.ok && sid && lastAgentSpeech.has(sid)) {
+        if (echoMatch(result.text, lastAgentSpeech.get(sid))) {
+          try { console.log('[gd-host] echo_reject sid=' + sid + ' text=' + String(result.text).slice(0, 20)) } catch (e) { /* ignore */ }
+          return { ok: false, error: 'echo_reject', message: 'echo of agent speech' }
+        }
+      }
+      return result
     }
     ctx.on('session/event', function (session, event) {
       try {

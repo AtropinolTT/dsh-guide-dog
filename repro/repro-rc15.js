@@ -87,4 +87,32 @@ if (replaySrc) {
 ok(count(client, 'getUserMedia(micAudioReq())') === 2, 'voice + call share mic constraint')
 ok(count(client, 'getUserMedia({ audio: true })') === 0, 'no hardcoded audio-only gUM')
 
+// ---- 静态契约（RC17：回声拒收/回声尾抑制/回声地板） ----
+ok(host.includes('const lastAgentSpeech = new Map()'), 'host echo speech buffer')
+ok(host.includes('function pushAgentSpeech('), 'host push agent speech')
+ok(host.includes('function echoMatch('), 'host echoMatch pure fn')
+ok(host.includes('function echoGuard('), 'host echo guard fn')
+ok(host.includes("'echo_reject'"), 'host echo reject code')
+ok(host.includes("'[gd-host] echo_reject sid='"), 'host echo reject log')
+ok(client.includes('playbackEndedAt'), 'client echo tail window')
+ok(client.includes('echoFloor'), 'client echo floor')
+ok(client.includes('callVoiced'), 'client voiced flag')
+ok(client.includes('!echoFloor'), 'client barge-in echo guard')
+ok(client.includes('> echoTailMs'), 'client echo tail gate')
+ok(client.includes("r.error === 'echo_reject'"), 'client echo reject silent')
+ok(client.includes('segment echo_reject'), 'client echo reject log')
+
+// ---- 行为（RC17：回声匹配判定） ----
+const echoSrc = extractFn(host, 'echoMatch')
+ok(!!echoSrc, 'extract echoMatch')
+if (echoSrc) {
+  const echoMatch = new Function('return ' + echoSrc)()
+  ok(echoMatch('', []) === false, 'echoMatch empty')
+  ok(echoMatch('abcdef', []) === false, 'echoMatch no recent')
+  ok(echoMatch('abc', [{ t: 'xyz', at: 0 }]) === false, 'echoMatch short no hit')
+  ok(echoMatch('今天天气不错', [{ t: '今天天气不错', at: 0 }]) === true, 'echoMatch exact')
+  ok(echoMatch('abcdef', [{ t: 'xxabcdefyy', at: 0 }]) === true, 'echoMatch contain >=6')
+  ok(echoMatch('天气不错', [{ t: '今天天气不错', at: 0 }]) === false, 'echoMatch short contain no hit')
+}
+
 process.exit(fail === 0 ? 0 : 1)
