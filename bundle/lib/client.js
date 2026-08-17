@@ -1128,7 +1128,7 @@ return {
     // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
-    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, fetching: false }
+    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, gen: 0, fetching: false }
     // RC13（三路评审定案）：重试记账按 (sid,text) 维度——旧模块级单例记账：句 A 重试后
     // 5s 内句 B 失败不再重试（单例被 A 占用）。429（host 忙门）不重试（立即重试必再 429，
     // 且与在途合成并发；串行 poll 下一轮会取队列下一条）。
@@ -1174,11 +1174,12 @@ return {
       out.set(pcm, 44)
       return out
     }
-    function scheduleChunk(audioCtx, wavBytes, playId) {
+    function scheduleChunk(audioCtx, wavBytes, gen) {
       return audioCtx.decodeAudioData(wavBytes.buffer.slice(0)).then(function (buf) {
-        // RC13：代际守卫——重试/打断后旧 fetch 的解码帧（异步 decode）不得加入新链，
-        // 否则同句尾帧在新旧链上重叠 → 重复播放 + 同相叠加削波爆音
-        if (playId !== streamPlayer.playSeq || !streamPlayer.active) return
+        // RC13：解码代际守卫——`gen` 仅在 stopStreamPlayback 递增；句间同代际（前句尾帧
+        // 解码晚于后句入链也正常续接，不按句级 playSeq 误弃），重试/打断后旧 decode 帧
+        // （异步 decode）被代际守卫拒绝，不加入新链（防新旧链重叠重复播放 + 同相叠加削波）
+        if (gen !== streamPlayer.gen || !streamPlayer.active) return
         const src = audioCtx.createBufferSource()
         src.buffer = buf
         const when = Math.max(audioCtx.currentTime + 0.05, streamPlayer.nextTime)
@@ -1213,6 +1214,7 @@ return {
     async function playStreamEntry(entry, sid) {
       // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
       const playId = ++streamPlayer.playSeq
+      const gen = streamPlayer.gen // RC13：解码代际（仅 stopStreamPlayback 递增；句间保持同代际，前句尾帧可续接）
       const rkey = sid + '|' + entry.text // RC13：重试记账键（(sid,text) 维度）
       // C2（最终审稿）：句间预合成——前一句仍在播放/排队（active）时**不再**停播覆盖（v2.1
       // 语义仅保留给非流条目 playEntry/playEntryConsensus）；本句流取来后解码帧追加调度到
@@ -1267,14 +1269,14 @@ return {
               const frame = acc.subarray(0, even)
               acc = acc.subarray(even)
               const wav = pcmToWav(frame, sr)
-              scheduleChunk(audioCtx, wav, playId)
+              scheduleChunk(audioCtx, wav, gen)
               frameCount += 1
             }
           }
         }
         if (acc.length > 1) {
           const even = acc.length - (acc.length % 2)
-          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav, playId); frameCount += 1 }
+          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav, gen); frameCount += 1 }
         }
         gdLog('stream done playId=' + playId + ' bytes=' + totalBytes + ' frames=' + frameCount + ' nodes=' + streamPlayer.nodes.length)
       } catch (e) {
@@ -1309,8 +1311,10 @@ return {
       }
     }
     function stopStreamPlayback() {
-      // RC13：代际递增——在途 fetch 的解码帧/abort 回调全部作废（catch 的 playId 归属检查直接退出）
+      // RC13：双计数器递增——playSeq（fetch/abort 归属）与 gen（解码代际）都 +1，
+      // 在途 fetch 的解码帧/abort 回调全部作废（catch 的 playId 归属检查直接退出）
       streamPlayer.playSeq += 1
+      streamPlayer.gen += 1 // RC13：解码代际递增——旧 decode 帧作废（fetch 归属仍看 playSeq）
       if (streamPlayer.controller) { try { streamPlayer.controller.abort() } catch (e) { /* ignore */ } streamPlayer.controller = null }
       streamPlayer.active = false
       // RC13：淡出停播（10ms 线性落零再延时停源）——src.stop() 硬切在句切断处产生咔哒爆音
