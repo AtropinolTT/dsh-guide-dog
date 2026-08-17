@@ -1,5 +1,8 @@
 # Guide Dog for DSH, powered by MiniMax
 
+[![dsh-recommend](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.certified.json)](https://github.com/zp-home/dsh-recommend)
+[![dsh score](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.json)](https://github.com/zp-home/dsh-recommend)
+
 A dynamic Cordis plugin that gives DeepSeek Harness multimodal superpowers through
 the [mmx CLI](https://www.npmjs.com/package/mmx-cli) (MiniMax):
 
@@ -11,7 +14,7 @@ the [mmx CLI](https://www.npmjs.com/package/mmx-cli) (MiniMax):
 - **Web UI preview & playback** — every generated file is served same-origin at
   `/guide-dog/media/<file>` and rendered inline in the conversation tool cards
   (`<img>`, `<audio controls>`, `<video controls>`), plus a **Guide Dog**
-  settings page with auth status, a speak tester, and a recent-media gallery.
+  settings page with auth status and a speak tester.
 - **Skill integration** — `guide_dog_speak` reuses your existing
   [`audio-conversation`](https://github.com/your/audio-conversation) and
   [`speech-mmx`](https://github.com/your/speech-mmx) skill pipelines
@@ -21,6 +24,22 @@ the [mmx CLI](https://www.npmjs.com/package/mmx-cli) (MiniMax):
   (`guide-dog-vision`, order 110) tells the agent to auto-invoke the inspection
   tools for any job needing visual checks, especially when the active model
   cannot see images.
+- **Call mode (Phase 2, shipped)** — hands-free, real-time voice conversation
+  in the web UI: VAD / push-to-talk turn-taking, streaming sentence-level TTS
+  with barge-in, consensus-first protection for write commands, progress
+  announcements, and a unified floating dual-pill UI at the composer with
+  zh/en i18n (details in "Phase 2 — call mode" below).
+- **Accessibility mode (Phase 3, planned)** — an `a11y` config block is
+  reserved (auto-narration, vision-cloud, summary-first); accessibility
+  features are next on the roadmap and will be tested and rolled out after the
+  call-mode shakeout.
+
+## Featured
+
+Guide Dog is featured in [dsh-recommend](https://github.com/zp-home/dsh-recommend),
+a community-curated plugin directory for DSH. It passed the project's
+certification review and carries the gold **certified** badge at the top of
+this README; the score badge updates automatically on every registry sync.
 
 ## Files
 
@@ -133,13 +152,12 @@ Settings → **Guide Dog** (id `guide-dog`):
 - **语音模式（Voice mode）** — global default on/off radios (per-session
   override lives on the small speaker button at the input's bottom-left).
 - **语音输入（Voice input）** — STT engine select (whisper / sherpa / minimax),
-  recognition language (auto/zh/en), and auto-send-after-recognition checkbox.
+  recognition language (auto/zh/en), input device select (defaults to the
+  system default), and auto-send-after-recognition checkbox.
 - **STT** — faster-whisper availability + version/python, and the whisper model
   select (base/small).
 - **Speak tester** — text + voice selector (from `guide-dog/voices`), plays the
   mp3 in the browser.
-- **Recent media** — last 30 items from the index: image thumbnails (click to
-  open full size), video tiles, audio players.
 
 ## Phase 1 — voice mode & voice input
 
