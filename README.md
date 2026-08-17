@@ -3,7 +3,7 @@
 [![dsh-recommend](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.certified.json)](https://github.com/zp-home/dsh-recommend)
 [![dsh score](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.json)](https://github.com/zp-home/dsh-recommend)
 
-**English** | [简体中文](README.zh-CN.md)
+**English** | [简体中文](https://github.com/AtropinolTT/dsh-guide-dog/blob/main/README.zh-CN.md)
 
 A dynamic Cordis plugin that gives DeepSeek Harness multimodal superpowers through
 the [mmx CLI](https://www.npmjs.com/package/mmx-cli) (MiniMax):

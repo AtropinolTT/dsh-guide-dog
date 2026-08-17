@@ -3,7 +3,7 @@
 [![dsh-recommend](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.certified.json)](https://github.com/zp-home/dsh-recommend)
 [![dsh score](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.json)](https://github.com/zp-home/dsh-recommend)
 
-[English](README.md) | **简体中文**
+[English](https://github.com/AtropinolTT/dsh-guide-dog/blob/main/README.md) | **简体中文**
 
 一个动态 Cordis 插件，通过 [mmx CLI](https://www.npmjs.com/package/mmx-cli)（MiniMax）
 为 DeepSeek Harness 赋予多模态超能力：
