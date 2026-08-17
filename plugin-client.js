@@ -33,6 +33,7 @@ return {
       const zh = {
         // 通话 pill / 面板
         'call.idle': '就绪', 'call.listening': '收听中…', 'call.processing': '处理中…', 'call.speaking': '播报中…',
+        'call.label': '通话',
         'call.muted': '· 静音',
         'call.start': '发起语音通话', 'call.stop': '挂断通话', 'call.open': '通话设置', 'call.close': '收起',
         'call.title': '语音通话',
@@ -76,6 +77,7 @@ return {
       }
       const en = {
         'call.idle': 'Ready', 'call.listening': 'Listening…', 'call.processing': 'Processing…', 'call.speaking': 'Speaking…',
+        'call.label': 'Call',
         'call.muted': '· muted',
         'call.start': 'Start voice call', 'call.stop': 'End call', 'call.open': 'Call settings', 'call.close': 'Collapse',
         'call.title': 'Voice call',
@@ -887,19 +889,32 @@ return {
                   try {
                     const wdoc = window && window.document
                     if (!wdoc || typeof wdoc.querySelector !== 'function') { setPos(null); return }
-                    // 量取输入卡片。坑（RC20-F 实测）：slot outlet 包装是 display:contents（无几何盒，
-                    // getBoundingClientRect 全 0）——直接量 [data-slot=…] 会得到 0 尺寸并永远卡 null；
-                    // 必须先取其子元素（组件根，带 padding 的真实盒）再量。尺寸异常时逐级回退：
-                    // bar 组件根 → [data-composer-seat]（卡片上缘 ≈ top−3，下缘 = bottom−8）。
+                    // 量取输入卡片本体（uV2eYG_card）。坑：slot outlet 包装是 display:contents（无几何盒，
+                    // getBoundingClientRect 全 0）——必须量其子元素。bar 组件根（firstElementChild）还含
+                    // notice/footer，卡片 = 其中宽度≈max-width 的最高子元素；取不到卡片 → 回退 seat 估算。
                     const bar = wdoc.querySelector('[data-slot="conversation.composer.bar"]')
                     const barRoot = bar && bar.firstElementChild ? bar.firstElementChild : null
                     let top = 0, bottom = 0, width = 0, left = 0
+                    let cardFound = false
                     if (barRoot) {
                       const b = barRoot.getBoundingClientRect()
                       if (b && b.width && b.height) {
-                        top = b.top // 卡片上缘（bar 根无 padding-top；notice 场景近似）
-                        bottom = b.bottom - 8 // bar 根 padding-bottom 8px → 卡片下缘
-                        left = b.left; width = b.width
+                        const expectW = Math.min(b.width - 32, 780) // --dsh-composer-card-max-width=748+32
+                        let cardEl = null, bestH = 0
+                        const kids = barRoot.children || []
+                        for (let i = 0; i < kids.length; i++) {
+                          const el = kids[i]
+                          const rr = el.getBoundingClientRect()
+                          if (!rr || !rr.width || !rr.height) continue
+                          if (Math.abs(rr.width - expectW) <= 4 && rr.height > bestH) { bestH = rr.height; cardEl = el }
+                        }
+                        if (cardEl) {
+                          const t = cardEl.getBoundingClientRect()
+                          top = t.top; bottom = t.bottom; left = t.left; width = t.width
+                          cardFound = true
+                        } else {
+                          top = b.top; bottom = b.bottom - 8; left = b.left; width = b.width
+                        }
                       }
                     }
                     if (!width) {
@@ -914,11 +929,12 @@ return {
                       }
                     }
                     if (!width) {
-                      // 诊断（仅一次）：bar 根与 seat 均无几何盒时记录现场（F12 排查定位）
-                      if (!measureLogged) { measureLogged = true; try { gdLog('measure no-bar-root no-seat') } catch (e) { /* ignore */ } }
+                      // 诊断（仅一次）：彻底量不到时记录现场（F12 排查定位）
+                      if (!measureLogged) { measureLogged = true; try { gdLog('measure fail bar=' + !!barRoot + ' seat=' + !!wdoc.querySelector('[data-composer-seat]')) } catch (e) { /* ignore */ } }
                       setPos(null); return // 测量失败 → 本 tick 隐藏，下个 tick 重试
                     }
-                    const cardW = Math.min(width - 32, 780) // --dsh-composer-card-max-width=748+32；side-clearance 16
+                    if (!measureLogged) { measureLogged = true; try { gdLog('measure card=' + (cardFound ? 'found' : 'bar-root') + ' top=' + Math.round(top) + ' bottom=' + Math.round(bottom) + ' left=' + Math.round(left) + ' w=' + Math.round(width)) } catch (e) { /* ignore */ } }
+                    const cardW = Math.min(width - 32, 780)
                     const cardLeft = left + Math.max(0, (width - cardW) / 2)
                     const pillRight = cardLeft - 7 // RC20-F：两 pill 右缘距输入框 7px
                     setPos({
@@ -977,11 +993,12 @@ return {
               const segTitle = callState.mode === 'ptt' ? t('call.segPtt') : t('call.segVad')
               const micBtnStyle = Object.assign({}, btnStyle, callState.recording ? { background: '#c62828', color: '#fff' } : {})
               const statusText = myCall ? (phaseText + (callState.muted ? t('call.muted') : '')) : ''
+              const callLabel = myCall ? statusText : t('call.label') // 未激活时中间显示"通话"，与语音 pill 的"关"对应
               // ---- 通话 dock：固定于卡片左上方（上缘对齐卡片上缘），面板向上展开 ----
               const callDock = h('div', { className: 'gd-float-dock', style: { left: pos.callLeft, top: pos.callTop } },
                 h('div', { className: 'gd-float-pill', style: Object.assign({}, pillStyle, callBorder), title: myCall ? t('call.stop') : t('call.start') },
                   h('button', { className: 'gd-float-icon', style: callColor, onClick: function () { toggleCall(sid, props.inputActions) } }, '📞'),
-                  myCall ? h('span', { style: { flex: 'auto', textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis' } }, statusText) : null,
+                  h('span', { style: { flex: 'auto', textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis' } }, callLabel),
                   h('button', { className: 'gd-float-icon', title: callOpen ? t('call.close') : t('call.open'), onClick: function () { setCallOpen(!callOpen); if (voiceOpen) setVoiceOpen(false) } }, callOpen ? '▾' : '▴')),
                 callOpen ? h('div', { className: 'gd-panel-up' },
                   h('div', { style: rowStyle },
@@ -1009,7 +1026,7 @@ return {
                   callState.error ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: 6 } }, callState.error) : null) : null)
               // ---- 语音 dock：固定于卡片左下方（下缘对齐卡片下缘），面板向左展开（防与通话 pill 重叠） ----
               const voiceDock = h('div', { className: 'gd-float-dock', style: { left: pos.voiceLeft, top: pos.voiceTop } },
-                h('div', { className: 'gd-float-pill', style: effective ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}, title: voiceTip },
+                h('div', { className: 'gd-float-pill', style: Object.assign({}, pillStyle, effective ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}), title: voiceTip },
                   h('button', { className: 'gd-float-icon', style: effective ? { color: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}, onClick: function () { setVoiceOverride(sid, !effective) } }, speakerIcon(effective)),
                   h('span', { style: { flex: 'auto', textAlign: 'center' } }, effective ? t('voice.on') : t('voice.off')),
                   h('button', { className: 'gd-float-icon', title: voiceOpen ? t('voice.close') : t('voice.open'), onClick: function () { setVoiceOpen(!voiceOpen); if (callOpen) setCallOpen(false) } }, voiceOpen ? '▸' : '◂')),
