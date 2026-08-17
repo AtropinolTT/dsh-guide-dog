@@ -832,7 +832,8 @@ return {
               // VAD 自动起段（spec 6.9.1：说话-停顿-说话 两段成回合，无需点击）：
               // 无活动段且检测到语音 → 自动 startSegment；PTT 模式由 mode 门控排除；
               // barge-in 已提前执行（I7），auto-start 仅在此分支触发，互不冲突
-              if (callState.mode === 'vad' && voiced) startSegment()
+              // RC2：播放（speaking）期间禁止自动起段——TTS 输出/环境声不得开段（回声开环）；打断由 barge-in 独占
+              if (callState.mode === 'vad' && voiced && callState.phase !== 'speaking') startSegment()
               callMic.raf = requestAnimationFrame(tick)
               return
             }
@@ -1130,6 +1131,8 @@ return {
       // 打断（spec §6.6）：停播 + 清缓冲（abort fetch 由 stopStreamPlayback 完成）
       stopStreamPlayback()
       setCallState({ phase: 'listening' })
+      // RC3：打断须清 host 待播队列——否则下个 poll tick 又 shift 出下一句，打断被队列复活
+      host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
     }
 
     // ============ 语音命令节（Phase 2） ============

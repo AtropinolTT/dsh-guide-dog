@@ -467,6 +467,7 @@ if __name__ == '__main__':
     // 5s 间隔 + busy 串行 → 预览节奏远慢于实时。方案：常驻 --serve 进程（模型懒加载并缓存），
     // stdin 行 JSON 任务 → stdout 行 JSON 响应，单次增量转写 ~0.8s。
     let whisperWorker = null // { handle, dead, nextId, offset }
+    let workerChain = Promise.resolve() // RC1：whisper worker 总线单工 → 请求串行链
     async function ensureWhisperWorker() {
       if (whisperWorker && !whisperWorker.dead) return whisperWorker
       const root = await guideDogRoot()
@@ -486,6 +487,13 @@ if __name__ == '__main__':
       return w
     }
     async function workerTranscribe(b64Path, model, language, timeoutMs) {
+      // RC1：worker 总线单工（共享 stdin/stdout/offset）——并发请求必须串行，
+      // 否则败者的响应行被他人轮询消费 → 60s 超时 → worker 被杀 → exited 级联。
+      const run = workerChain.then(function () { return doWorkerRequest(b64Path, model, language, timeoutMs) })
+      workerChain = run.then(function () {}, function () {})
+      return run
+    }
+    async function doWorkerRequest(b64Path, model, language, timeoutMs) {
       const w = await ensureWhisperWorker()
       const id = w.nextId++
       try { w.handle.stdin.write(JSON.stringify({ id: id, b64Path: b64Path, model: model, language: language }) + '\n') } catch (e) { throw e }
