@@ -2212,11 +2212,11 @@ cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && git add -A && git commit -m 
 - T3 F5+host 埋点：`fix(phase2): RC14-T3 — 双通道互斥补全（净化文本匹配 + turn-end 检查）+ [gd-host] 诊断埋点`（1d6c72a）
 - T4 client 埋点：`fix(phase2): RC14-T4 — client 播放计数埋点（times/PLAY-SUMMARY，零行为变更）`（31d1e96）
 - T4-F1 评审 minor：`fix(phase2): RC14-T4-F1 — 修 PLAY-SUMMARY 条件注释矛盾 + stopCall 清播放计数`（ab6b6e0c）
-- T5 回归+bundle+台账：`docs(phase2): RC14-T5 — repro-rc14 + 全量回归 + bundle rc14 + README + 台账`（**`9fde092`**）
-- T5 bundle：`chore(phase2): rebuild bundle rc14-20260817 (generated)`（**`b7b6511`**）
+- T5 回归+bundle+台账：`docs(phase2): RC14-T5 — repro-rc14 + 全量回归 + bundle rc14 + README + 台账`（**`4913793`**）
+- T5 bundle：`chore(phase2): rebuild bundle rc14-20260817 (generated)`（**`a95a7a4`**）
 
 **部署说明**（提交完成）：
-- 提交链头 `9fde092`，bundle 提交 `b7b6511`
+- 提交链头 `4913793`，bundle 提交 `a95a7a4`
 - bundle rc14-20260817：`.superpowers/sdd/2026-08-17-rc14-call-fixes/progress.md` 部署记录节
 - 验收：重启 DSH + 硬刷新 → DevTools 控制台 `[guide-dog] client build rc14-20260817`
 
