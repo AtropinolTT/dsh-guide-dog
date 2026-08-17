@@ -2098,6 +2098,13 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
     const VOICE_QUEUE_MAX = 40 // RC14：40 上限（净化后句子数骤减；超长回复截尾不截头）
     const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
+    // RC15：回队核心（纯函数，供 RPC 与 repro 复用）——同 key 已在队则不重复插入；超出上限截尾
+    function requeueEntry(q, entry, max) {
+      const dup = q.some(function (e) { return e.key === entry.key })
+      if (!dup) q.unshift(entry)
+      while (q.length > max) q.pop()
+      return { q: q, dup: dup }
+    }
     ctx.on('session/event', function (session, event) {
       try {
         if (!event || event.type !== 'assistant/message') return
@@ -2146,7 +2153,19 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     })
     ctx.effect(function () {
       try {
-        return harness.handle('guide-dog/voice-queue', async function (args) {
+        const offRequeue = harness.handle('guide-dog/voice-requeue', async function (args) {
+          try {
+            const sid = args && args.sessionId ? String(args.sessionId) : ''
+            const entry = args && args.entry
+            if (!sid || !entry || !entry.key) return { ok: false, error: 'bad_args' }
+            const q = voiceQueue.get(sid) || []
+            const out = requeueEntry(q, entry, VOICE_QUEUE_MAX)
+            voiceQueue.set(sid, out.q)
+            try { console.log('[gd-host] requeue sid=' + sid + ' key=' + String(entry.key).slice(0, 24) + ' dup=' + out.dup) } catch (e) { /* ignore */ }
+            return { ok: true, dup: out.dup }
+          } catch (e) { return { ok: false, error: String((e && e.message) || e) } }
+        })
+        const offQueue = harness.handle('guide-dog/voice-queue', async function (args) {
           const sid = args && args.sessionId ? String(args.sessionId) : ''
           if (!sid) return { ok: true, entry: null }
           const q = voiceQueue.get(sid) || []
@@ -2155,6 +2174,10 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?') + ' remain=' + q.length) } catch (e) { /* ignore */ } }
           return { ok: true, entry: entry }
         })
+        return function () {
+          try { if (offRequeue) offRequeue() } catch (e) { /* ignore */ }
+          try { if (offQueue) offQueue() } catch (e) { /* ignore */ }
+        }
       } catch (e) { return function () {} }
     })
 
