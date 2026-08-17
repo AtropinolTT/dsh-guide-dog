@@ -574,3 +574,11 @@ git commit -m "docs(phase2): RC15 — 部署记录回填"
 - **标记核验（部署目录）：** voice-requeue（index 1 / client 1）、playVoiceEntry（client 5）、skip replay text=（index 1）、skip voice-dup text=（index 1）、`rc15-20260817`（client 1）；`rc14-20260817` 残留 0。
 - **提交：** 本部署记录回填 commit `docs(phase2): RC15 — 部署记录回填`（见 git log；SDD 台账在 `.superpowers/` gitignored 范围内保存完整明细）。
 - **下一步（用户侧验收）：** 重启 DSH + 硬刷新（Ctrl+Shift+R）→ 控制台确认 `[guide-dog] client build rc15-20260817` → 按上方「验收清单」逐项复测。
+
+### 部署记录补充（RC15-F 修复波重发布，2026-08-17 20:5x CST）
+
+- **原因：** 全分支评审（Critical #1 pending 单槽覆盖丢条目 + Important #2-5）修复后重发，确保部署 = 仓库。
+- **修复波提交：** `039960a`（FIFO pending/手势续播不重启/attempts 后置/mp3 抢占/断言加强/README 对齐）+ `383df8d`（stopCurrent 仅中断活跃播放，自然排空不回弹）+ bundle 重建 `81a938c`。
+- **sha256（重发布后，部署 = 仓库 = 服务端）：** index.js `4b55d8f3…`（host 未变）；client.js `13ec0ed9d95a76d38375200e6ff2753e34bd350929d81fe07fc3856047217053`。
+- **标记核验：** voice-requeue（index 1 / client 1）、`pending: [` FIFO（client 1）、`rc15-20260817`（client 1）；rc14 残留 0。
+- **下一步：** 重启 DSH + 硬刷新 → 控制台 `[guide-dog] client build rc15-20260817` → 按上方「验收清单」复测（重点：多条回复连播不丢中间条、首次自动播放被拦点击后不重启、失败回队 ≤3 次）。
