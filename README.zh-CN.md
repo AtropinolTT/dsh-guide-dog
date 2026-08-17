@@ -48,8 +48,18 @@ registry 数据同步自动更新。
 | `plugin-client.js` | Client 半区 — **唯一事实来源**（工具卡片、设置页、语音集群） |
 | `bundle/` | 由两半区生成的静态 web-profile 包（`deploy/convert_bundle.py`） |
 | `deploy/` | `convert_bundle.py`（源码 → 包）与 `publish.py`（包 → `~/.dsh/dsh-guide-dog` + web profile 注册） |
+| `package.json` | 根 manifest，声明 `dsh.bundle`（使仓库可通过 `dsh plugin add` 安装） |
 | `README.md` | 本文件（英文版） |
 | `README.zh-CN.md` | 本 README 的简体中文版 |
+
+## 安装
+
+用标准 DSH 插件命令直接从本仓库安装——根 `package.json` 已声明
+`dsh.bundle` manifest，profile 的 pnpm 层会自行解析该包（无需发布 npm）：
+
+```sh
+dsh plugin --profile web add github:AtropinolTT/dsh-guide-dog
+```
 
 ## 部署（静态 web-profile 包 — 当前方式）
 

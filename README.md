@@ -51,8 +51,19 @@ this README; the score badge updates automatically on every registry sync.
 | `plugin-client.js` | Client half — **source of record** (tool cards, settings page, voice cluster) |
 | `bundle/` | Static web-profile bundle generated from the two halves (`deploy/convert_bundle.py`) |
 | `deploy/` | `convert_bundle.py` (source → bundle) and `publish.py` (bundle → `~/.dsh/dsh-guide-dog` + web profile registration) |
+| `package.json` | Root manifest declaring the `dsh.bundle` (makes the repo installable via `dsh plugin add`) |
 | `README.md` | This file |
 | `README.zh-CN.md` | Simplified-Chinese version of this README |
+
+## Install
+
+Install straight from this repository with the standard DSH plugin command —
+the root `package.json` declares the `dsh.bundle` manifest, so the profile's
+pnpm layer resolves the package itself (no npm publish required):
+
+```sh
+dsh plugin --profile web add github:AtropinolTT/dsh-guide-dog
+```
 
 ## Deploy (static web-profile bundle — current)
 

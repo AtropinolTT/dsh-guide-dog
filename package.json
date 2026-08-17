@@ -1,0 +1,34 @@
+{
+  "name": "dsh-guide-dog",
+  "version": "0.1.0",
+  "description": "Guide Dog for DSH, powered by MiniMax — multimodal plugin: image/video/music/speech generation, vision inspection tools, voice mode, microphone voice input and real-time voice call mode.",
+  "type": "module",
+  "main": "bundle/lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./bundle/lib/index.js"
+    },
+    "./client": {
+      "default": "./bundle/lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./bundle/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "files": [
+    "bundle/lib/index.js",
+    "bundle/lib/client.js",
+    "bundle/cordis.patch.yml"
+  ],
+  "license": "MIT"
+}
