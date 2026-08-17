@@ -18,9 +18,9 @@ return {
 
     const h = React.createElement
 
-    // RC9 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
+    // RC13 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc12-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc13-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
