@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .superpowers/
+
+# guide-dog 媒体产物（测试生成）
+audio-turns/
