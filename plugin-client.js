@@ -20,7 +20,7 @@ return {
 
     // RC9 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc9-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc10-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -1010,7 +1010,13 @@ return {
           // RC6：流条目串行——host tts-stream 每会话 busy 门（speechStreamBusy）拒绝并发合成；
           // 预合成重叠 fetch 实测第二请求 1.8ms 即 429 → '播放中断' + 句子丢失。await 本句播放
           // 结束再取下句：句 N 合成（~1-2s）通常短于播放时长，链仍无缝续接。
-          else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; consumed = true; return playStreamEntry(r.entry, callSessionId || '') }
+          // RC10：播报条目（progress/hb，key 前缀非 'stream:'）不覆盖 lastSpokenSentence——
+          // 语音命令"重复"只重复回复句子，不重复播报。
+          else if (r.entry.stream && r.entry.text) {
+            if (!r.entry.key || r.entry.key.indexOf('stream:') === 0) lastSpokenSentence = r.entry.text
+            consumed = true
+            return playStreamEntry(r.entry, callSessionId || '')
+          }
           else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
         }

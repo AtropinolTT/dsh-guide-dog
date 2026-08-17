@@ -1712,7 +1712,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         return { kind: 'deny', reason: 'consensus_failed' }
       }
     })
-    // ---- 进度播报（spec §6.4） ----
+    // ---- 进度播报（spec §6.4；RC10 激进精简：仅播有效信息） ----
     function progressPhrase(name) {
       const map = { bash: '正在执行命令', read: '正在查找文件', grep: '正在查找文件', glob: '正在查找文件',
         write: '正在修改文件', edit: '正在修改文件', web_search: '正在搜索网页',
@@ -1721,29 +1721,41 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       return map[name] || '正在执行操作'
     }
     const PROGRESS_SILENT = { read: 1, grep: 1, glob: 1, skill: 1 } // 静默类（Phase 3 自动播报同白名单基础）
-    function shouldAnnounce(name) { return !PROGRESS_SILENT[name] }
+    const PROGRESS_MEDIA = { guide_dog_image: 1, guide_dog_video: 1, guide_dog_music: 1, guide_dog_speak: 1 } // RC10：生成媒体（耗时长，值得播）
+    // RC10（2026-08-17 验收）：激进精简——只播有意义的步骤：
+   //   write/edit（修改文件）、web_search（搜索）、媒体工具（生成媒体）、bash 仅破坏性命令
+    //   （与共识拦截同口径 DESTRUCTIVE_BASH_RE）；read/grep/glob/skill/未知工具静默——
+    //   不再播"正在执行操作"，多步任务不再连珠炮式播报。
+    function shouldAnnounce(name, args) {
+      if (PROGRESS_SILENT[name]) return false
+      if (name === 'write' || name === 'edit' || name === 'web_search') return true
+      if (PROGRESS_MEDIA[name]) return true
+      if (name === 'bash') return DESTRUCTIVE_BASH_RE.test(String((args && args.command) || ''))
+      return false // 未知工具静默
+    }
+    // RC10：同短语冷却去重——cooldownMs 内同短语不重复播（多步同类操作只报一次）
+    function progressDedupe(last, phrase, now, cooldownMs) {
+      if (last && last.phrase === phrase && now - last.ts < (cooldownMs || 4000)) return true
+      return false
+    }
+    const lastProgress = new Map() // sessionId -> {phrase, ts}：播报去重冷却状态
     function callOrA11yActive(sid) {
       const cfg = loadConfig()
       // C4 修复：读持久 callActiveSessions（isCallActive），不再读瞬时 callActiveFlags
       return !!((cfg.call && cfg.call.progress && isCallActive(sid)) || (cfg.a11y && cfg.a11y.enabled))
     }
+    // RC10（2026-08-17 验收）：播报从 mp3 并入流式通道——不再 speakImpl 合成 mp3，
+    // 直接 unshift {stream:true} 条目：与回复句子同走唯一 WebAudio PCM 链、同一时间线 →
+    // 单播放器构造性串行（一条接一条，不可能重叠/爆音）；合成延迟由 client 播放时承担。
+    // 去重：同短语冷却窗口内跳过（出错文本唯一，天然不冲突）。
     function announce(sid, text) {
-      // 播报优先：生成完成后才入队（C5 同款修复——占位条目 {url:null, phrase} 会被 client 轮询
-      // shift 弹出后丢弃，旧代码先 unshift 占位再回填 → 播报大概率丢失）
-      serialSpeak(function () {
-        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'progress' }).then(function (r) {
-          const q2 = voiceQueue.get(String(sid)) || []
-          if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'progress:' + sid + ':' + text })
-          else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
-          if (q2.length > VOICE_QUEUE_MAX) q2.pop()
-          voiceQueue.set(String(sid), q2)
-        }).catch(function (e) {
-          const q3 = voiceQueue.get(String(sid)) || []
-          q3.unshift({ error: 'tts_failed', message: String(e).slice(0, 200) })
-          if (q3.length > VOICE_QUEUE_MAX) q3.pop()
-          voiceQueue.set(String(sid), q3)
-        })
-      })
+      const now = Date.now()
+      if (progressDedupe(lastProgress.get(String(sid)), text, now)) return
+      lastProgress.set(String(sid), { phrase: text, ts: now })
+      const q2 = voiceQueue.get(String(sid)) || []
+      q2.unshift({ stream: true, text: text, key: 'progress:' + String(sid) + ':' + text })
+      if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+      voiceQueue.set(String(sid), q2)
     }
     // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
     // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
@@ -1761,7 +1773,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const agent = exec && exec.agent
         const sid = agent && agent.session ? String(agent.session.id || '') : ''
         const name = exec && exec.name ? String(exec.name) : ''
-        if (!sid || !callOrA11yActive(sid) || !shouldAnnounce(name)) return
+        const args = exec && exec.arguments ? exec.arguments : {}
+        if (!sid || !callOrA11yActive(sid) || !shouldAnnounce(name, args)) return
         const phrase = progressPhrase(name)
         announce(sid, phrase)
       } catch (e) { /* best effort */ }
@@ -1901,16 +1914,11 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const last = lastAgentEvent.get(String(sid)) || now
         if (now - last > 120000) {
           lastAgentEvent.set(String(sid), now) // 防重复轰炸
-          // C5 同款：生成完成后才入队（占位条目会被 client 先弹出）
-          serialSpeak(function () {
-            return speakImpl({ text: '仍在处理，请稍候', sessionId: String(sid), turnSeq: null, source: 'progress' }).then(function (r) {
-              const q2 = voiceQueue.get(String(sid)) || []
-              if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'hb:' + String(sid) })
-              else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
-              if (q2.length > VOICE_QUEUE_MAX) q2.pop()
-              voiceQueue.set(String(sid), q2)
-            }).catch(function () {})
-          })
+          // RC10：与 announce 同机制——流条目（单通道串行），不再 speakImpl 合成 mp3
+          const q2 = voiceQueue.get(String(sid)) || []
+          q2.unshift({ stream: true, text: '仍在处理，请稍候', key: 'hb:' + String(sid) })
+          if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+          voiceQueue.set(String(sid), q2)
         }
       })
     }

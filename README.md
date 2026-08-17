@@ -269,13 +269,16 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   摘要直接 TTS 播报（不走模型），随后开启 `consensus.summaryWindowMs` 打断
   窗口，窗口内用户发声即中止本次执行——工具物理上尚未启动）。拦截器自身
   失败 → 拒绝并口播"共识检查失败"（宁可拦错不可放错，spec §6.8）。
-- **进度播报（不静默原则）** — `agent/status`（running → "正在处理"）、
-  `tools/result`（工具名→短语：bash→"正在执行命令"、write/edit→
+- **进度播报（精简原则，RC10）** — 仅播有效信息：`agent/status`
+  （running → "正在处理"）、`tools/result`（工具名→短语：write/edit→
   "正在修改文件"、web_search→"正在搜索网页"、
-  guide_dog_image/video/music/speak→"正在生成媒体"、未知→"正在执行操作"；
-  read/grep/glob/skill 静默不播）、`agent/error`（"处理出错：<短原因>"）；
+  guide_dog_image/video/music/speak→"正在生成媒体"、
+  bash 仅破坏性命令（与共识拦截同口径 DESTRUCTIVE_BASH_RE）→"正在执行命令"；
+  read/grep/glob/skill/非破坏性 bash/未知工具静默）、`agent/error`
+  （"处理出错：<短原因>"）；同短语 4s 冷却去重（多步同类操作只报一次）；
   通话中 >120s 无任何事件 → 心跳播报"仍在处理，请稍候"。播报与回复朗读
-  共用队列：播报优先（队首）、回复让路。
+  共用队列：播报优先（队首）、回复让路；播报走**流式通道**
+  （与回复同一 WebAudio PCM 链）→ 单播放器构造性串行，一条接一条，不可能重叠。
 - **流式 TTS** — 回复文本按句切分（`stream.sentenceSplit` 字符集
   `。！？.!?\n`；`stream.maxSentenceChars` 超长句强制截断）逐句合成；每句
   经 `guide-dog/tts-token` 重新签发一次性 token（单次消费、5 分钟有效、
