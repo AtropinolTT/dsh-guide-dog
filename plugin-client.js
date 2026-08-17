@@ -18,6 +18,10 @@ return {
 
     const h = React.createElement
 
+    // RC9 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
+    // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
+    try { console.log('[guide-dog] client build rc9-20260817') } catch (e) { /* ignore */ }
+
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
     // 新播放任务（任一会话的新队列条目）覆盖当前播放。语音模式开关/语言检测/麦克风整合在
@@ -66,7 +70,14 @@ return {
     // RC8（2026-08-17 验收）：playEntry 返回 Promise（onended/onerror 结算）——callPoll 串行消费
     // url 条目（进度播报 mp3）时须等播完，否则播报与后续条目（另一条播报/回复流）重叠
     // → "同时播报多条" + 噪声。30s 兜底超时防队列卡死（stopCurrent 中断的音频不触发 onended）。
+    // RC9（2026-08-17 验收）：mp3 条目开播前先等流链排空（waitStreamDrain，函数提升）——
+    // playStreamEntry 在 fetch 结束即 resolve（C2 预取语义），其调度音频仍可能在播；若 mp3
+    // 直接开播，进度播报与仍响的句子叠加 → "同时播放多条语音" + 爆音（用户 11:43 复测，
+    // 队列 [流句子, 播报] 时必现）。链空闲时（语音模式/无通话）立即通过。
     function playEntry(url) {
+      return waitStreamDrain().then(function () { return playEntryNow(url) })
+    }
+    function playEntryNow(url) {
       stopCurrent()
       if (typeof Audio !== 'function') {
         showToast('播放器不可用'); return Promise.resolve()
@@ -1036,6 +1047,22 @@ return {
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
     const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, fetching: false }
+    // RC9（2026-08-17 验收）：流链排空等待——playStreamEntry 在 fetch 结束即 resolve（C2 预取
+    // 语义），其调度音频仍可能在播；mp3 条目（进度播报/语音模式）开播前必须等链排空
+    // （nodes 清空且 active 落回 false），否则播报与仍响的句子叠加。链空闲时立即通过。
+    // 30s 兜底防死等（stopStreamPlayback 打断会使 nodes 清空 → 立即通过）。
+    function waitStreamDrain(timeoutMs) {
+      const limit = timeoutMs || 30000
+      const start = Date.now()
+      return new Promise(function (resolve) {
+        const check = function () {
+          if (!streamPlayer.active && !streamPlayer.nodes.length) { resolve(); return }
+          if (Date.now() - start >= limit) { resolve(); return }
+          setTimeout(check, 100)
+        }
+        check()
+      })
+    }
     function getTtsToken(sid) {
       return host.call('guide-dog/tts-token', { sessionId: sid }).then(function (r) {
         return (r && r.ok && r.token) ? r.token : ''
@@ -1098,6 +1125,7 @@ return {
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
       const firstSentence = !streamPlayer.active // C2：仅在链空闲时走完整起播路径
       if (firstSentence) {
+        stopCurrent() // RC9：反向防叠——起播新链时终止仍在播的 mp3（如 repeat 命令直接调用时）
         streamPlayer.active = true
         streamPlayer.nextTime = 0
         setCallState({ phase: 'speaking' })
