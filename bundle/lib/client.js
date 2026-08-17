@@ -57,7 +57,7 @@ return {
 
     // RC14 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc14-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc15-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -96,52 +96,137 @@ return {
     }
     // ---- 模块级播放器：会话切换不中断；新播放任务覆盖旧任务 ----
     let curAudio = null
-    // ---- M9：录音归属会话（修复：卸载后 onstop 校验归属，丢弃陈旧提交） ----
+    // ---- M9：录音归属会话（卸载后 onstop 校验归属，丢弃陈旧提交） ----
     let recSessionRef = null // { sid, alive }：录音归属；卸载置 alive=false → onstop 丢弃
     function stopCurrent() {
       if (curAudio) {
         try { curAudio.pause() } catch (e) { /* ignore */ }
         curAudio = null
       }
-    }
-    // RC8（2026-08-17 验收）：playEntry 返回 Promise（onended/onerror 结算）——callPoll 串行消费
-    // url 条目（进度播报 mp3）时须等播完，否则播报与后续条目（另一条播报/回复流）重叠
-    // → "同时播报多条" + 噪声。30s 兜底超时防队列卡死（stopCurrent 中断的音频不触发 onended）。
-    // RC9（2026-08-17 验收）：mp3 条目开播前先等流链排空（waitStreamDrain，函数提升）——
-    // playStreamEntry 在 fetch 结束即 resolve（C2 预取语义），其调度音频仍可能在播；若 mp3
-    // 直接开播，进度播报与仍响的句子叠加 → "同时播放多条语音" + 爆音（用户 11:43 复测，
-    // 队列 [流句子, 播报] 时必现）。链空闲时（语音模式/无通话）立即通过。
-    function playEntry(url) {
-      return waitStreamDrain().then(function () { return playEntryNow(url) })
-    }
-    function playEntryNow(url) {
-      stopCurrent()
-      if (typeof Audio !== 'function') {
-        showToast('播放器不可用'); return Promise.resolve()
+      // RC15：持久播放器同停（共识 mp3 抢占时不得残留语音模式音频）
+      if (voicePlayer.audio) {
+        try { voicePlayer.audio.pause() } catch (e) { /* ignore */ }
       }
-      return new Promise(function (resolve) {
-        let settled = false
-        const timer = setTimeout(function () { if (!settled) { settled = true; resolve() } }, 30000)
-        const done = function () { if (!settled) { settled = true; clearTimeout(timer); resolve() } }
-        try {
-          const a = new Audio(String(url))
-          curAudio = a
-          a.onended = function () { if (curAudio === a) curAudio = null; done() }
-          a.onerror = function () {
-            if (curAudio === a) { curAudio = null; showToast('播放失败') }
-            done()
+      // RC15（F1）：中断时释放 busy 并回队——防 voicePlayer.busy 死锁吞条目（评审 Important）
+      if (voicePlayer.busy || voicePlayer.current || voicePlayer.pending) {
+        const a = voicePlayer.audio
+        if (a) { a.onended = null; a.onerror = null }
+        if (voicePlayer.ac) { try { voicePlayer.ac.abort() } catch (e) { /* ignore */ } voicePlayer.ac = null }
+        const cur = voicePlayer.current
+        if (cur && cur.objUrl) { try { URL.revokeObjectURL(cur.objUrl) } catch (e) { /* ignore */ } }
+        voicePlayer.current = null
+        voicePlayer.busy = false
+        voicePlayer.attempts.delete(String((cur && cur.entry && (cur.entry.key || cur.entry.url)) || ''))
+        if (cur) requeueVoiceEntry(cur.entry, cur.sid)
+        const pend = voicePlayer.pending
+        if (pend) { voicePlayer.pending = null; requeueVoiceEntry(pend.entry, pend.sid) }
+      }
+    }
+    // ============ RC15 播放器：语音模式/播报 mp3（持久元素 + fetch 全量下载） ============
+    // 旧实现逐条目 new Audio(url)：自动播放被拦/元素被替换 → 浏览器中止下载 →
+    // ERR_CONTENT_LENGTH_MISMATCH + Chrome 媒体重试风暴（同文件 10-30 次请求）。
+    // 新实现：fetch 一次拿全量字节（AbortController 120s 超时）→ Blob URL → 单一持久 Audio 元素。
+    const voicePlayer = { audio: null, ctx: null, busy: false, pending: null, attempts: new Map(), banner: false, current: null, ac: null }
+    function ensureVoiceAudio() {
+      if (!voicePlayer.audio) {
+        try { voicePlayer.audio = new Audio() } catch (e) { voicePlayer.audio = null }
+        if (voicePlayer.audio) voicePlayer.audio.preload = 'auto'
+      }
+      return voicePlayer.audio
+    }
+    // RC15：手势解锁——click/keydown/touchstart 后 resume AudioContext 并重试挂起条目
+    function unlockVoiceAudio() {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext
+        if (AC) {
+          voicePlayer.ctx = voicePlayer.ctx || new AC()
+          if (voicePlayer.ctx.state === 'suspended') { try { voicePlayer.ctx.resume() } catch (e) { /* ignore */ } }
+        }
+      } catch (e) { /* ignore */ }
+      const a = ensureVoiceAudio()
+      if (a && a.src && a.paused) { const p = a.play(); if (p && typeof p.catch === 'function') p.catch(function () {}) }
+      const pend = voicePlayer.pending
+      if (pend) { voicePlayer.pending = null; playVoiceEntry(pend.entry, pend.sid) }
+    }
+    // RC15：全局手势监听（apply 时注册一次；capture 阶段捕获页面任意点击）
+    function bindGestureUnlock() {
+      try {
+        ;['click', 'keydown', 'touchstart'].forEach(function (ev) {
+          try { window.addEventListener(ev, unlockVoiceAudio, true) } catch (e) { /* ignore */ }
+        })
+      } catch (e) { /* ignore */ }
+    }
+    // RC15：单条目播放——fetch 全量 → 持久元素播放；失败回队（≤3 次/条目）；自动播放被拦 → 挂起等手势
+    function playVoiceEntry(entry, sid) {
+      const key = String(entry.key || entry.url || '')
+      if (!key) return Promise.resolve()
+      const attempts = (voicePlayer.attempts.get(key) || 0) + 1
+      voicePlayer.attempts.set(key, attempts)
+      if (attempts > 3) {
+        voicePlayer.attempts.delete(key)
+        showToast('播放失败：' + String(entry.text || entry.url || '').slice(0, 24))
+        return Promise.resolve()
+      }
+      return waitStreamDrain().then(function () {
+        if (voicePlayer.busy) { voicePlayer.pending = { entry: entry, sid: sid }; return Promise.resolve() }
+        voicePlayer.busy = true
+        voicePlayer.banner = false
+        const ac = new AbortController()
+        voicePlayer.ac = ac
+        const timer = setTimeout(function () { try { ac.abort() } catch (e) { /* ignore */ } }, 120000)
+        return fetch(String(entry.url), { cache: 'no-store', signal: ac.signal }).then(function (r) {
+          if (!r.ok) throw new Error('http ' + r.status)
+          return r.blob()
+        }).then(function (blob) {
+          clearTimeout(timer)
+          voicePlayer.ac = null
+          const a = ensureVoiceAudio()
+          if (!a) throw new Error('no audio element')
+          const objUrl = URL.createObjectURL(blob)
+          voicePlayer.current = { entry: entry, sid: sid, objUrl: objUrl }
+          const cleanup = function () {
+            if (voicePlayer.current && voicePlayer.current.objUrl === objUrl) voicePlayer.current = null
+            try { URL.revokeObjectURL(objUrl) } catch (e) { /* ignore */ }
           }
+          a.onended = function () {
+            cleanup(); a.onended = null; a.onerror = null
+            voicePlayer.busy = false; voicePlayer.attempts.delete(key); nextVoiceEntry()
+          }
+          a.onerror = function () {
+            cleanup(); a.onended = null; a.onerror = null
+            voicePlayer.busy = false; requeueVoiceEntry(entry, sid); nextVoiceEntry()
+          }
+          a.src = objUrl
+          const c = (playCounts.get(key) || 0) + 1
+          playCounts.set(key, c)
+          gdLog('voice play key=' + key + ' times=' + c)
           const p = a.play()
           if (p && typeof p.catch === 'function') p.catch(function () {
-            if (curAudio === a) { curAudio = null; showToast('浏览器阻止了自动播放，请先点击页面') }
-            done()
+            // 自动播放策略拦截：不丢条目，挂起等待用户手势（unlockVoiceAudio 触发重播）
+            voicePlayer.busy = false
+            voicePlayer.pending = { entry: entry, sid: sid }
+            if (!voicePlayer.banner) { voicePlayer.banner = true; showToast('点击页面任意位置开启语音播报') }
           })
-        } catch (e) {
-          curAudio = null
-          showToast('播放失败')
-          done()
-        }
+          return Promise.resolve()
+        }).catch(function (e) {
+          clearTimeout(timer)
+          if (voicePlayer.ac === ac) voicePlayer.ac = null
+          voicePlayer.busy = false
+          gdLog('voice fail key=' + key + ' err=' + String((e && e.message) || e).slice(0, 60))
+          requeueVoiceEntry(entry, sid)
+          nextVoiceEntry()
+        })
       })
+    }
+    function requeueVoiceEntry(entry, sid) {
+      host.call('guide-dog/voice-requeue', {
+        sessionId: sid,
+        entry: { key: entry.key, url: entry.url, text: entry.text, stream: entry.stream, consensus: entry.consensus },
+      }).catch(function () {})
+    }
+    function nextVoiceEntry() {
+      const pend = voicePlayer.pending
+      if (pend) { voicePlayer.pending = null; playVoiceEntry(pend.entry, pend.sid) }
     }
     function beepFallback() {
       // WebAudio 振荡器兜底：Audio 元素被自动播放策略拦截时使用
@@ -468,9 +553,16 @@ return {
               pollBusy = true
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
-                  // RC8：url 条目同样串行等待（防语音模式多条 mp3 重叠）
-                  if (r.entry.url) return playEntry(r.entry.url)
+                  // RC15：持久播放器（fetch+Blob）；错误条目照旧提示
+                  if (r.entry.url) return playVoiceEntry(r.entry, sid)
                   else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
+                } else if (r && r.ok && !r.entry) {
+                  // RC15：与 callPoll 同款播放汇总埋点（语音模式 mp3 计数；!r.ok 跳过防跨回合误归零）
+                  if (playCounts.size) {
+                    const summary = Array.from(playCounts.entries()).map(function (e) { return e[0] + '=' + e[1] }).join(' | ')
+                    gdLog('PLAY-SUMMARY ' + summary)
+                    playCounts.clear()
+                  }
                 }
               }).catch(function () {}).then(function () { pollBusy = false })
             }, [effective, sid, tick])
@@ -1094,7 +1186,7 @@ return {
             consumed = true
             return playStreamEntry(r.entry, callSid())
           }
-          else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
+          else if (r.entry.url) { consumed = true; return playVoiceEntry(r.entry, callSid()) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
         }
         // RC14：仅在确认本轮播放窗口结束（r.ok && !r.entry，队列空）时落汇总埋点——按 key 列出本轮播放次数
@@ -1629,6 +1721,9 @@ return {
         })
       })
     })
+
+    // RC15：全局手势解锁监听（apply 时注册一次；capture 阶段捕获页面任意点击）
+    bindGestureUnlock()
   },
 }
 

@@ -2043,10 +2043,21 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(text).slice(0, 30)) } catch (e) { /* ignore */ }
           return
         }
-        // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队（"同一内容重复播放"贡献因子）
+        // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队
         const tkey = streamTurnKey(data.turn, data.step)
-        if (tkey !== 'undefined:undefined' && lastStreamTurn.get(sid) === tkey) return
-        lastStreamTurn.set(sid, tkey)
+        const now3 = Date.now()
+        if (tkey !== 'undefined:undefined') {
+          if (lastStreamTurn.get(sid) === tkey) return
+          lastStreamTurn.set(sid, tkey)
+        } else {
+          // RC15：turn/step 缺失 → 按净化文本短窗口去重（事件重放防御：同句 10s 内不重复入队）
+          const pc = sanitizeSpeechText(text)
+          if (pc && replayDup(lastStreamText.get(sid), pc, now3, 10000)) {
+            try { console.log('[gd-host] skip replay text=' + String(pc).slice(0, 20)) } catch (e) { /* ignore */ }
+            return
+          }
+          if (pc) lastStreamText.set(sid, { text: pc, at: now3 })
+        }
         const streamCfg = (cfg.call && cfg.call.stream) || {}
         const clean = sanitizeSpeechText(text)
         if (!clean) return
@@ -2185,6 +2196,19 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
     const VOICE_QUEUE_MAX = 40 // RC14：40 上限（净化后句子数骤减；超长回复截尾不截头）
     const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
+    // RC15：回队核心（纯函数，供 RPC 与 repro 复用）——同 key 已在队则不重复插入；超出上限截尾
+    function requeueEntry(q, entry, max) {
+      const dup = q.some(function (e) { return e.key === entry.key })
+      if (!dup) q.unshift(entry)
+      while (q.length > max) q.pop()
+      return { q: q, dup: dup }
+    }
+    const lastStreamText = new Map() // sessionId -> {text, at}（RC15：turn/step 缺失时的事件重放去重）
+    const lastVoiceText = new Map() // sessionId -> {text, at}（RC15：语音模式同文本短窗口去重）
+    // RC15：事件重放去重判定（纯函数，供两处监听与 repro 复用）——同文本且在窗口内 → true（应跳过）
+    function replayDup(prev, text, now, windowMs) {
+      return !!(prev && prev.text === text && (now - prev.at) < windowMs)
+    }
     ctx.on('session/event', function (session, event) {
       try {
         if (!event || event.type !== 'assistant/message') return
@@ -2207,6 +2231,13 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         // 极少见，不设 turn/end 兜底）。
         const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
         if (hasToolCall) return
+        // RC15：语音模式同文本短窗口去重（事件重放/agent 复述 → 复读机防御；10s 窗口）
+        const now4 = Date.now()
+        if (replayDup(lastVoiceText.get(sid), clean, now4, 10000)) {
+          try { console.log('[gd-host] skip voice-dup text=' + String(clean).slice(0, 20)) } catch (e) { /* ignore */ }
+          return
+        }
+        lastVoiceText.set(sid, { text: clean, at: now4 })
         // RC13（Task 3）：双通道互斥
         if (wasHostSpoken(sid, clean)) {
           try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(clean).slice(0, 30)) } catch (e) { /* ignore */ }
@@ -2233,7 +2264,19 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     })
     ctx.effect(function () {
       try {
-        return harness.handle('guide-dog/voice-queue', async function (args) {
+        const offRequeue = harness.handle('guide-dog/voice-requeue', async function (args) {
+          try {
+            const sid = args && args.sessionId ? String(args.sessionId) : ''
+            const entry = args && args.entry
+            if (!sid || !entry || !entry.key) return { ok: false, error: 'bad_args' }
+            const q = voiceQueue.get(sid) || []
+            const out = requeueEntry(q, entry, VOICE_QUEUE_MAX)
+            voiceQueue.set(sid, out.q)
+            try { console.log('[gd-host] requeue sid=' + sid + ' key=' + String(entry.key).slice(0, 24) + ' dup=' + out.dup) } catch (e) { /* ignore */ }
+            return { ok: true, dup: out.dup }
+          } catch (e) { return { ok: false, error: String((e && e.message) || e) } }
+        })
+        const offQueue = harness.handle('guide-dog/voice-queue', async function (args) {
           const sid = args && args.sessionId ? String(args.sessionId) : ''
           if (!sid) return { ok: true, entry: null }
           const q = voiceQueue.get(sid) || []
@@ -2242,6 +2285,10 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?') + ' remain=' + q.length) } catch (e) { /* ignore */ } }
           return { ok: true, entry: entry }
         })
+        return function () {
+          try { if (offRequeue) offRequeue() } catch (e) { /* ignore */ }
+          try { if (offQueue) offQueue() } catch (e) { /* ignore */ }
+        }
       } catch (e) { return function () {} }
     })
 

@@ -337,6 +337,33 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   - 复测定标（RC15 走向依据）：`QUEUE-DUP` → host 双入队；`PLAY-SUMMARY key=2` → client 双播；
     两者皆无但仍两遍 → tts-stream 音频双写；`enqueue from=` 同源两次同文本 → 事件重放。
 
+### RC15 修复（2026-08-17）：持久播放器 + 手势解锁 + 失败回队 + 事件重放去重
+
+- **持久语音播放器（`playVoiceEntry`，F1）** — 语音模式播放从「每次 new Audio() +
+  临时 URL」改为 **fetch + Blob + 单元素复用**：整段音频一次 fetch 到 `Blob`，
+  经 `URL.createObjectURL` 绑定到**唯一** `<audio>` 元素，后续条目只替换 `src`
+  与播放回调，不再反复创建/销毁 Audio 对象——消灭 `ERR_CONTENT_LENGTH_MISMATCH`
+  引起的重试风暴（每次重建 Audio 都会重放 mismatch 前的部分内容，长音频时表现为
+  「反复重播 + 卡顿」）。
+- **手势解锁 + 被拦挂起重试（F2）** — 浏览器自动播放策略下首次播放可能被拦
+  （`play()` rejected）：进入「待播放挂起」状态，绑定首次用户手势
+  （`pointerdown`/`keydown`/`touchend`，capture 阶段、消费即解绑）后自动继续；
+  被拦条目不再丢弃，手势后重放。`stopCurrent` 中断时正确释放 `busy` 并回队
+  （防 busy 死锁吞条目）。
+- **失败回队 RPC（`voice-requeue`，F3）** — 播放失败（解码/网络/被拦）时 client
+  调 host `voice-requeue` RPC 把该条目重新入队（`requeueEntry` 纯函数：新文本插队、
+  重复文本跳过、队尾 pop 截断），每条目最多重试 3 次（`attempts` map）——不再丢内容。
+- **事件重放 10s 文本窗口去重（`replayDup`，F4）** — host 对「通话下行 + 语音模式」
+  两通道的 enqueue 增加 10s 窗口的 last-text 去重（`lastStreamText`/`lastVoiceText`
+  双 map）：同文本 10s 内再次入队直接跳过（`[gd-host] skip replay text=` /
+  `[gd-host] skip voice-dup text=` 埋点）。根因：语音模式 + 通话下行的事件重放会让
+  同一文本入队两次——男声回复「7 遍」即该窗口缺失所致。
+- **url 条目播放计数（F5）** — `PLAY-SUMMARY` 汇总日志覆盖语音模式条目
+  （`playCounts` 按 `entry.key || entry.text` 计数，队列空时汇总清空）——url 条目
+  的播放次数可追踪，复测定位不再靠猜。
+- **构建标记** — 客户端 build tag 升级为 `rc15-20260817`（`plugin-client.js` 源与
+  `bundle/lib/client.js` 同步；硬刷新后 DevTools 控制台可见该行）。
+
 ### config.json schema（Phase 2：call / a11y）
 
 Phase 1 的 config（`~/.dsh/guide-dog/.guide-dog/config.json`）基础上新增，
