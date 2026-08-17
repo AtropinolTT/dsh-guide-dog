@@ -634,7 +634,12 @@ return {
     }
     function subscribeCall(fn) { callSubs.push(fn); return function () { const i = callSubs.indexOf(fn); if (i >= 0) callSubs.splice(i, 1) } }
     // 会话切换：通话状态随会话（header action 是会话级）；切会话时 phase 回 idle 但不自动挂断音频
-    let callSessionId = null
+    // RC13（三路评审定案）：通话归属（会话 + inputActions）在 startCall 时一次性捕获；
+    // 渲染期不再写全局——多会话 header 渲染互相覆盖曾导致转写串台（12:33-12:35 双会话
+    // 错投）与渲染期误挂断。对齐 Phase 1 M9 recSessionRef 模式。
+    let callSessionRef = null // { sid: string, actions: object|null }
+    function callSid() { return (callSessionRef && callSessionRef.sid) || '' }
+    function callActions() { return (callSessionRef && callSessionRef.actions) || null }
 
     // ---- 会话 header 发起/挂断按钮（conversation.session.header.actions，order 30） ----
     ctx.effect(function () {
@@ -643,34 +648,34 @@ return {
           return slots.register(
             { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
             function (props) {
-              // R12：header.actions 直接携带 inputActions（Task 4 探测定案）→ 存模块级，stopSegment 提交用
-              if (props.inputActions) gdInputActions = props.inputActions
-              const sid = props.sessionId || callSessionId
-              // I3（最终审稿）：渲染会话与记录会话不同且通话激活 → 先自动挂断（丢弃当前片段、
-              // 撤销 host 激活、停下行播放），再切到新会话——避免下行流停更、上行误投旧 sid。
-              if (sid !== callSessionId && callState.active) stopCall()
-              callSessionId = sid
+              // RC13：渲染期只读——任何会话的 header 渲染都不再写模块级全局（旧代码在渲染期
+              // 覆盖全局 inputActions 与会话归属 → 多会话互相串台；渲染期自动挂断 → 切会话即误挂）
+              const sid = props.sessionId || (callSessionRef && callSessionRef.sid) || ''
+              // 激活态按"通话归属会话"判定：只有归属会话的按钮显示"通话中"
+              const myCall = callState.active && callSessionRef && callSessionRef.sid === sid
               const [, force] = React.useState(0)
               React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-              const active = callState.active
               const style = {
                 display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
                 borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
-                background: active ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
-                color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
+                background: myCall ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
+                color: myCall ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
                 fontFamily: 'inherit', fontSize: '12px',
               }
               return React.createElement('button', {
-                style: style, title: active ? '挂断通话' : '发起语音通话',
+                style: style, title: myCall ? '挂断通话' : '发起语音通话',
                 onClick: function () {
-                  if (!active) {
+                  if (!myCall) {
+                    // RC13：仅在用户点击时切换通话会话——先挂断旧通话再开新通话（挂断动作
+                    // 不再由渲染期触发）。通话跨会话切换继续存活（浮动面板可挂断）。
+                    if (callState.active && callSessionRef) stopCall()
                     setCallState({ active: true, phase: 'listening', recording: false })
-                    startCall(sid) // Task 7 定义：初始化采集
+                    startCall(sid, props.inputActions) // RC13：归属（sid + inputActions）开播时刻捕获
                   } else {
-                    stopCall() // Task 7 定义：停止采集与播放
+                    stopCall()
                   }
                 },
-              }, active ? '📞 通话中' : '📞 通话')
+              }, myCall ? '📞 通话中' : '📞 通话')
             })
         })
       } catch (e) { return function () {} }
@@ -760,10 +765,11 @@ return {
     let callSegmentActive = false
     let callBargeCb = null // Task 12 设置：用户发声回调（bargeIn 钩子）
     let callRms = 0 // 最新 RMS（isUserSpeaking 供 Task 8/9 共识窗口查询）
-    let gdInputActions = null // R12：header.actions 的 inputActions（CallButton 渲染时捕获）
 
-    function startCall(sid) {
+    function startCall(sid, inputActions) {
       if (callMic) return
+      // RC13：通话归属开播时刻捕获——上传/打断/轮询/回退提交一律用此快照，杜绝渲染期覆盖串台
+      callSessionRef = { sid: String(sid || ''), actions: inputActions || null }
       setCallState({ active: true, phase: 'listening', recording: false, error: null })
       callActiveRpc('session', true) // C4：持久通话激活（Task 10 进度播报 / Task 11 下行流式判据）
       try {
@@ -862,10 +868,11 @@ return {
       callSegmentActive = false
       callActiveRpc('session', false) // C4：持久激活关闭
       // RC11：挂断清 host 待播队列——防陈旧条目在下次通话/页面刷新后重放
-      host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+      host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'clear-queue' }).catch(function () {})
       setCallState({ active: false, phase: 'idle', recording: false })
       // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
       if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
+      callSessionRef = null // RC13：最后清归属——clear-queue/停播已完成（其 callSid() 需在清空前有效）
     }
 
     function resetSegment() {
@@ -939,7 +946,7 @@ return {
 
     // 段上传 → 转写 → 插入 + 提交（与语音输入同路径；C1：raw `audio/webm` body）
     function uploadSegmentBlob(blob) {
-      const sid = callSessionId || ''
+      const sid = callSid()
       fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid, 'content-type': 'audio/webm' }, body: blob }).then(function (r) {
         return r.json()
       }).then(function (r) {
@@ -954,22 +961,22 @@ return {
           if (bargedAt && Date.now() - bargedAt < 10000) {
             bargedAt = 0
             gdLog('segment route=interrupt')
-            host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'interrupt', text: r.text }).then(function (rr) {
+            host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'interrupt', text: r.text }).then(function (rr) {
               if (!(rr && rr.ok)) {
                 gdLog('interrupt fallback -> submit')
-                const actions = gdInputActions
+                const actions = callActions()
                 if (actions) { insertText(actions, r.text); submitInput(actions) }
               }
             }).catch(function () {
               gdLog('interrupt fallback -> submit (err)')
-              const actions = gdInputActions
+              const actions = callActions()
               if (actions) { insertText(actions, r.text); submitInput(actions) }
             })
             setCallState({ phase: 'listening' })
             return
           }
           gdLog('segment route=submit')
-          const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
+          const actions = callActions() // RC13：开播时刻捕获的 inputActions
           if (actions) { insertText(actions, r.text); submitInput(actions) }
           setCallState({ phase: 'listening' })
         } else {
@@ -992,7 +999,7 @@ return {
     }
 
     function callActiveRpc(kind, active) {
-      host.call('guide-dog/call-active', { sessionId: callSessionId || '', kind: kind, active: active }).catch(function () {})
+      host.call('guide-dog/call-active', { sessionId: callSid(), kind: kind, active: active }).catch(function () {})
     }
 
     let consensusWindow = false
@@ -1033,7 +1040,7 @@ return {
       if (!callState.active || callPollBusy) return
       callPollBusy = true
       let consumed = false
-      host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
+      host.call('guide-dog/voice-queue', { sessionId: callSid() }).then(function (r) {
         if (r && r.ok && r.entry) {
           gdLog('poll ' + (r.entry.consensus ? 'consensus' : r.entry.stream ? 'stream' : r.entry.url ? 'url' : 'error') + ' key=' + (r.entry.key || '?') + ' text=' + String(r.entry.text || '').slice(0, 16))
           // RC8：全部条目类型都串行等待（consumed=true + return Promise）——进度播报 mp3 未播完
@@ -1047,7 +1054,7 @@ return {
           else if (r.entry.stream && r.entry.text) {
             if (!r.entry.key || r.entry.key.indexOf('stream:') === 0) lastSpokenSentence = r.entry.text
             consumed = true
-            return playStreamEntry(r.entry, callSessionId || '')
+            return playStreamEntry(r.entry, callSid())
           }
           else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
@@ -1276,7 +1283,7 @@ return {
       stopStreamPlayback()
       setCallState({ phase: 'listening' })
       // RC3：打断须清 host 待播队列——否则下个 poll tick 又 shift 出下一句，打断被队列复活
-      host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+      host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'clear-queue' }).catch(function () {})
     }
 
     // ============ 语音命令节（Phase 2） ============
@@ -1301,13 +1308,13 @@ return {
         case 'pause':
           if (streamPlayer.active) { stopStreamPlayback(); setCallState({ phase: 'listening' }) }
           // 清 host 待播队列（防停播后下一句仍到）
-          host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+          host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'clear-queue' }).catch(function () {})
           break
         case 'resume':
           setCallState({ phase: 'listening' }) // 恢复=回到收听（无缓冲重播；Task 14 增强：恢复未播队列）
           break
         case 'repeat':
-          if (lastSpokenSentence) { playStreamEntry({ stream: true, text: lastSpokenSentence, consensus: false }, callSessionId || '') }
+          if (lastSpokenSentence) { playStreamEntry({ stream: true, text: lastSpokenSentence, consensus: false }, callSid()) }
           break
         case 'slower': { const s = Math.min(1.2, callState.speed + 0.2); setCallState({ speed: s }) } break
         case 'faster': { const s = Math.max(0.8, callState.speed - 0.2); setCallState({ speed: s }) } break
