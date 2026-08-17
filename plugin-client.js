@@ -623,6 +623,9 @@ return {
               // R12：header.actions 直接携带 inputActions（Task 4 探测定案）→ 存模块级，stopSegment 提交用
               if (props.inputActions) gdInputActions = props.inputActions
               const sid = props.sessionId || callSessionId
+              // I3（最终审稿）：渲染会话与记录会话不同且通话激活 → 先自动挂断（丢弃当前片段、
+              // 撤销 host 激活、停下行播放），再切到新会话——避免下行流停更、上行误投旧 sid。
+              if (sid !== callSessionId && callState.active) stopCall()
               callSessionId = sid
               const [, force] = React.useState(0)
               React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
@@ -769,7 +772,9 @@ return {
           const minSpeechMs = vad.minSpeechMs !== undefined ? vad.minSpeechMs : 300
           const silenceMs = vad.silenceMs !== undefined ? vad.silenceMs : 700
           const maxSeg = (cfg.call && cfg.call.vad && cfg.call.vad.maxSegmentSeconds) || 60
-          let voicedSince = 0, silentSince = 0, lastVoiced = false
+          // I4（最终审稿）：打断最小连续发声时长（spec §6.6 防误触）——与 threshold/silenceMs 同处读取
+          const interruptMinMs = vad.interruptMinMs !== undefined ? vad.interruptMinMs : 300
+          let voicedSince = 0, silentSince = 0, lastVoiced = false, voicedStart = 0
           const sampleBuf = new Uint8Array(analyser.fftSize)
           const tick = function () {
             // 修正（Task 7）：rAF 循环须整通通话存活——仅 callMic 清空（stopCall）才终止；
@@ -781,18 +786,21 @@ return {
             const rms = Math.sqrt(sum / sampleBuf.length)
             callRms = rms // isUserSpeaking 查询用
             const voiced = rms >= threshold
+            const now = Date.now()
+            // I4：unvoiced→voiced 跳变记时；连续发声 ≥ interruptMinMs 才允许打断（防瞬时误触）
+            if (voiced && !lastVoiced) voicedStart = now
+            // I7（最终审稿）：打断检查置于段空闲分支之前——PTT 无活动段时同样生效（spec §6.3）
+            if (callState.phase === 'speaking' && voiced && (now - voicedStart) >= interruptMinMs && callBargeCb) callBargeCb()
             if (!callSegmentActive) {
               // VAD 自动起段（spec 6.9.1：说话-停顿-说话 两段成回合，无需点击）：
               // 无活动段且检测到语音 → 自动 startSegment；PTT 模式由 mode 门控排除；
-              // barge-in 在段内路径（下方），auto-start 仅在 !callSegmentActive 时触发，互不冲突
+              // barge-in 已提前执行（I7），auto-start 仅在此分支触发，互不冲突
               if (callState.mode === 'vad' && voiced) startSegment()
               callMic.raf = requestAnimationFrame(tick)
               return
             }
-            const now = Date.now()
             if (voiced) { voicedSince = now; lastVoiced = true }
             else if (lastVoiced) { silentSince = now; lastVoiced = false }
-            const isSpeaking = voiced || (now - voicedSince < silenceMs)
             // 端点：静音 ≥ silenceMs 且说过话（VAD 模式）→ 结束段
             if (callState.mode === 'vad' && voicedSince > 0 && !voiced && (now - voicedSince) >= silenceMs) {
               if (now - callMic.segmentStart >= minSpeechMs) stopSegment()
@@ -806,16 +814,18 @@ return {
               callMic.raf = requestAnimationFrame(tick)
               return
             }
-            // 打断检测：播放中用户发声 → bargeIn 钩子
-            if (isSpeaking && callState.phase === 'speaking' && voiced && callBargeCb) callBargeCb()
             callMic.raf = requestAnimationFrame(tick)
           }
           callMic.raf = requestAnimationFrame(tick)
           setCallState({ phase: 'listening' })
         }).catch(function (err) {
+          // I2（最终审稿）：麦克风获取失败 → 同步撤销 host 侧持久激活（否则 host 仍以为通话
+          // 激活，进度/流式/心跳持续对一个已死的通话开火）
+          callActiveRpc('session', false)
           setCallState({ active: false, phase: 'idle', error: '麦克风不可用：' + String((err && err.message) || err) })
         })
       } catch (e) {
+        callActiveRpc('session', false)
         setCallState({ active: false, phase: 'idle', error: '麦克风初始化失败：' + String(e) })
       }
     }
@@ -861,9 +871,9 @@ return {
       const blob = new Blob(chunks, { type: 'audio/webm' })
       // 上传 → 转写 → 插入 + 提交（与语音输入同路径）
       const sid = callSessionId || ''
-      const fd = new FormData()
-      fd.append('audio', blob, 'call-' + Date.now() + '.webm')
-      fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid }, body: fd }).then(function (r) {
+      // C1（最终审稿）：host 按 raw body 处理（base64 整个请求体）——FormData multipart
+      // 会让 whisper 解不出音频。改发 raw `audio/webm` body，`x-session-id` 头不变。
+      fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid, 'content-type': 'audio/webm' }, body: blob }).then(function (r) {
         return r.json()
       }).then(function (r) {
         if (r && r.ok && r.text) {
@@ -996,19 +1006,26 @@ return {
     async function playStreamEntry(entry, sid) {
       // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
       const playId = ++streamPlayer.playSeq
-      if (streamPlayer.active) { stopStreamPlayback() } // 新任务覆盖（v2.1 语义）
+      // C2（最终审稿）：句间预合成——前一句仍在播放/排队（active）时**不再**停播覆盖（v2.1
+      // 语义仅保留给非流条目 playEntry/playEntryConsensus）；本句流取来后解码帧追加调度到
+      // 既有无缝链（scheduleChunk 按 streamPlayer.nextTime 续接），不重置 nextTime/active/phase，
+      // 也不重开共识窗口（窗口只属于首句播放）。1s 轮询持续 shift 队列 → 每句首帧在上一句
+      // 结束前即已解码入链，实现"当前句播放期间预取下一句"。
       // C3 修复（2026-08-16 审稿）：token 为**单次消费**（consumeTtsToken 即删）——每句都必须重新签发，
       // 不得缓存复用（旧代码 `if (!streamPlayer.token)` 只取一次 → 第二句起 403）。
       streamPlayer.token = await getTtsToken(sid)
       if (!streamPlayer.token) { setCallState({ phase: 'listening', error: '流式播放失败：无 token' }); showToast('流式播放失败：无 token'); return }
       const cfg = voiceState.cfg || {}
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
-      streamPlayer.active = true
-      streamPlayer.nextTime = 0
+      const firstSentence = !streamPlayer.active // C2：仅在链空闲时走完整起播路径
+      if (firstSentence) {
+        streamPlayer.active = true
+        streamPlayer.nextTime = 0
+        setCallState({ phase: 'speaking' })
+        if (entry.consensus) notifyConsensusSpeech(true) // Task 9：共识摘要播报开窗口（仅首句）
+      }
       const audioCtx = ensureStreamCtx()
       try { await audioCtx.resume() } catch (e) { /* ignore */ }
-      setCallState({ phase: 'speaking' })
-      if (entry.consensus) notifyConsensusSpeech(true) // Task 9：共识摘要播报开窗口
       const controller = new AbortController()
       streamPlayer.controller = controller
       const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
@@ -1075,8 +1092,10 @@ return {
     function matchCallCommand(text) {
       const t = String(text || '').replace(/[，。！？\s]/g, '')
       const table = [
-        { re: /^(停|暂停)$/, cmd: 'pause' },
-        { re: /^(继续|恢复)$/, cmd: 'resume' },
+        // I5（最终审稿）：停/继续 是 host 共识确认词（CONSENT_YES_RE/NO_RE）——本地命中会吞掉
+        // 用户的确认回答。暂停/恢复 与确认词无冲突，保留为命令。
+        { re: /^暂停$/, cmd: 'pause' },
+        { re: /^恢复$/, cmd: 'resume' },
         { re: /^(重复|再说一遍)$/, cmd: 'repeat' },
         { re: /^(慢一点|慢些)$/, cmd: 'slower' },
         { re: /^(快一点|快点)$/, cmd: 'faster' },
