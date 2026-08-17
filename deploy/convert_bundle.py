@@ -235,7 +235,10 @@ def convert():
     # Client plugin-level inject: wait for the `slots` service before apply
     # (the static client Loader honours plugin inject like the host one; the
     # dynamic sandbox provided services differently).
-    pat3 = re.compile(r"return \{\n  async apply\(ctx\) \{")
+    # R17 (2026-08-17): the client source now carries `inject: ['slots']`
+    # itself (added in ae2c71c), so the insertion must be idempotent — match
+    # with or without the line and always emit it.
+    pat3 = re.compile(r"return \{\n(?:  inject: \['slots'\],\n)?  async apply\(ctx\) \{")
     client, n3 = pat3.subn("return {\n  inject: ['slots'],\n  async apply(ctx) {", client)
     if n3 != 1:
         raise SystemExit('client apply header matched %d times (expected 1)' % n3)
