@@ -71,7 +71,7 @@ return {
         try { voicePlayer.audio.pause() } catch (e) { /* ignore */ }
       }
       // RC15（F1）：中断时释放 busy 并回队——防 voicePlayer.busy 死锁吞条目（评审 Important）
-      if (voicePlayer.busy || voicePlayer.current || (voicePlayer.pending && voicePlayer.pending.length)) {
+      if (voicePlayer.busy || voicePlayer.current) {
         const a = voicePlayer.audio
         if (a) { a.onended = null; a.onerror = null }
         if (voicePlayer.ac) { try { voicePlayer.ac.abort() } catch (e) { /* ignore */ } voicePlayer.ac = null }
