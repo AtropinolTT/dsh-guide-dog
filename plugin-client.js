@@ -733,7 +733,7 @@ return {
 
     // ---- 采集控制接口（Task 7：MediaRecorder + AnalyserNode VAD + PTT + 上传提交） ----
     // 模块级采集状态（Phase 1 惯例：全部状态模块级，不用 useRef）
-    let callMic = null // { stream, rec, analyser, raf, segmentStart, chunks, segmentSeconds, audioCtx }
+    let callMic = null // { stream, rec, analyser, raf, segmentStart, segmentSeconds, audioCtx }（rec：当前段 recorder，自持 gdChunks）
     let callSegmentActive = false
     let callBargeCb = null // Task 12 设置：用户发声回调（bargeIn 钩子）
     let callRms = 0 // 最新 RMS（isUserSpeaking 供 Task 8/9 共识窗口查询）
@@ -756,15 +756,11 @@ return {
           analyser.smoothingTimeConstant = 0.3
           src.connect(analyser)
           if (typeof audioCtx.resume === 'function') { try { audioCtx.resume() } catch (e) { /* ignore */ } }
-          let rec = null
-          try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
-          rec.ondataavailable = function (ev) {
-            if (callMic && callSegmentActive && ev.data && ev.data.size > 0) callMic.chunks.push(ev.data)
-          }
-          callMic = { stream: stream, rec: rec, analyser: analyser, raf: 0, segmentStart: 0, chunks: [], segmentSeconds: 0, audioCtx: audioCtx }
-          // 修正（Task 7）：brief 未调 rec.start() → ondataavailable 永不触发、无任何音频数据。
-          // 录音须整通通话持续运行（timeslice 250ms 出片），段采集由 ondataavailable 的 callSegmentActive 门控
-          try { rec.start(250) } catch (e) { /* ignore */ }
+          // RC4（2026-08-17 验收）：不再整通通话持有一个 MediaRecorder——旧实现 chunk0（EBML 头）
+          // 总在首个段开始前到达并被 callSegmentActive 门丢弃 → 段 blob 无头 → ffmpeg 解不出
+          // （用户实测 "[Errno 1094995529] Invalid data found"）。录音器改由 startSegment 每段新建，
+          // 每段 chunk0 自带 EBML 头，段 blob 为完整 webm。VAD 分析只依赖 analyser，与 recorder 无关。
+          callMic = { stream: stream, rec: null, analyser: analyser, raf: 0, segmentStart: 0, segmentSeconds: 0, audioCtx: audioCtx }
           // VAD 轮询：能量检测（threshold 可配）
           const cfg = voiceState.cfg || {}
           const vad = (cfg.call && cfg.call.vad) || {}
@@ -834,7 +830,8 @@ return {
     function stopCall() {
       if (callMic) {
         try { cancelAnimationFrame(callMic.raf) } catch (e) { /* ignore */ }
-        try { if (callMic.rec.state !== 'inactive') callMic.rec.stop() } catch (e) { /* ignore */ }
+        // RC4：中止在途段 recorder——gdAbort 让 onstop 跳过上传（通话已结束，不提交）
+        try { if (callMic.rec) { callMic.rec.gdAbort = true; if (callMic.rec.state !== 'inactive') callMic.rec.stop() } } catch (e) { /* ignore */ }
         try { callMic.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
         try { callMic.audioCtx.close() } catch (e) { /* ignore */ }
         callMic = null
@@ -848,7 +845,8 @@ return {
 
     function resetSegment() {
       if (!callMic) return
-      callMic.chunks = []
+      // RC4：chunks 归 recorder 所有（每段独立 recorder 自持 gdChunks），此处不得清空——
+      // 清空会丢掉段内已采集的簇（EBML 头在 chunk0，早于首段到达，段 blob 将无头）
       callMic.segmentStart = Date.now()
       callMic.segmentSeconds = 0
     }
@@ -859,6 +857,12 @@ return {
       resetSegment()
       callActiveRpc('speaking', true) // C4：瞬时发声（共识窗口中止判定用；非持久激活）
       setCallState({ recording: true })
+      // RC4：每段独立 MediaRecorder——每段 chunk0 自带 EBML 头，段 blob 完整可解码
+      try {
+        const rec = newSegmentRecorder()
+        callMic.rec = rec
+        if (rec) { try { rec.start(250) } catch (e) { /* ignore */ } }
+      } catch (e) { callMic.rec = null }
     }
 
     function stopSegment() {
@@ -866,14 +870,51 @@ return {
       callSegmentActive = false
       callActiveRpc('speaking', false)
       setCallState({ recording: false, phase: 'processing' })
-      const chunks = callMic.chunks
-      callMic.chunks = []
-      if (!chunks.length) { setCallState({ phase: 'listening', error: null }); return }
-      const blob = new Blob(chunks, { type: 'audio/webm' })
-      // 上传 → 转写 → 插入 + 提交（与语音输入同路径）
+      // RC4：停止段 recorder——最终 dataavailable（含剩余数据）先到，onstop 再上传；
+      // 段 blob = 完整 webm（EBML 头 + 全部簇 + 收尾数据），不截尾
+      const rec = callMic.rec
+      let stopped = false
+      if (rec) {
+        try { if (rec.state !== 'inactive') { rec.stop(); stopped = true } } catch (e) { stopped = false }
+      }
+      if (!stopped) {
+        // 防御：recorder 未运行 / stop 失败 → onstop 不会触发，按现有数据直接上传，避免卡 processing
+        if (rec && rec.gdChunks.length) uploadSegmentBlob(new Blob(rec.gdChunks, { type: 'audio/webm' }))
+        else setCallState({ phase: 'listening', error: null })
+      }
+    }
+
+    // RC4：每段独立 recorder——每段 chunk0 自带 EBML 头 → 段 blob 可解码（chrome/firefox 通用）
+    function newSegmentRecorder() {
+      if (!callMic || !callMic.stream) return null
+      let rec = null
+      try {
+        if (typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          rec = new MediaRecorder(callMic.stream, { mimeType: 'audio/webm;codecs=opus' })
+        }
+      } catch (e) { rec = null }
+      if (!rec) {
+        try { rec = new MediaRecorder(callMic.stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(callMic.stream) }
+      }
+      rec.gdChunks = []
+      rec.gdAbort = false
+      rec.gdStopped = false
+      rec.ondataavailable = function (ev) {
+        if (ev.data && ev.data.size > 0 && !rec.gdAbort) rec.gdChunks.push(ev.data)
+      }
+      rec.onstop = function () {
+        if (rec.gdStopped) return
+        rec.gdStopped = true
+        if (rec.gdAbort) return // stopCall 中止：不提交
+        if (!rec.gdChunks.length) { setCallState({ phase: 'listening', error: null }); return }
+        uploadSegmentBlob(new Blob(rec.gdChunks, { type: 'audio/webm' }))
+      }
+      return rec
+    }
+
+    // 段上传 → 转写 → 插入 + 提交（与语音输入同路径；C1：raw `audio/webm` body）
+    function uploadSegmentBlob(blob) {
       const sid = callSessionId || ''
-      // C1（最终审稿）：host 按 raw body 处理（base64 整个请求体）——FormData multipart
-      // 会让 whisper 解不出音频。改发 raw `audio/webm` body，`x-session-id` 头不变。
       fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid, 'content-type': 'audio/webm' }, body: blob }).then(function (r) {
         return r.json()
       }).then(function (r) {
