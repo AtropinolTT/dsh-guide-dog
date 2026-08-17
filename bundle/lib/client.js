@@ -973,7 +973,7 @@ return {
                     if (!measureLogged) { measureLogged = true; try { gdLog('measure card=' + (cardFound ? 'found' : 'bar-root') + ' top=' + Math.round(top) + ' bottom=' + Math.round(bottom) + ' left=' + Math.round(left) + ' w=' + Math.round(width)) } catch (e) { /* ignore */ } }
                     const cardW = Math.min(width - 32, 780)
                     const cardLeft = left + Math.max(0, (width - cardW) / 2)
-                    const pillRight = cardLeft - 21 // RC20-F4：右缘距卡片 7px + 视觉整体左移 14px
+                    const pillRight = cardLeft - 28 // RC20-F5：右缘距卡片 7px + 视觉整体左移 21px（14+7）
                     setPos({
                       callLeft: pillRight - PILL_W, callTop: top, // 通话 pill 上缘对齐卡片上缘
                       voiceLeft: pillRight - PILL_W, voiceTop: bottom - PILL_H, // 语音 pill 下缘对齐卡片下缘
