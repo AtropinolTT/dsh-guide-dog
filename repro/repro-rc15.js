@@ -130,7 +130,7 @@ if (echoSrc) {
 }
 
 // ---- 静态契约（RC18：流播放 HTMLAudio 直出——RDP/Chrome 环境 WebAudio AudioContext 输出无声） ----
-ok(client.includes('client build rc18-20260817'), 'client build tag rc18')
+ok(client.includes('client build rc19-20260817'), 'client build tag rc19')
 ok(client.includes('function ensureStreamAudio('), 'client stream audio element')
 ok(client.includes('function playStreamWav('), 'client stream wav player')
 ok(client.includes('function waitStreamFree('), 'client stream serial wait')
@@ -152,5 +152,45 @@ ok(client.includes('streamAudio.el.src && streamAudio.el.paused'), 'client gestu
 
 // ---- 静态契约（RC18：agent 不得自调音频技能——语音由插件自动播报） ----
 ok(host.includes('调用 audio-conversation、speech-mmx、mmx'), 'host voice auto guidance')
+
+// ---- 静态契约（RC19：下行 TTS 非流式——MiniMax 流式接口整段音频发两遍 → 每句话播两遍） ----
+ok(count(host, "'--stream'") === 0, 'host no mmx --stream left')
+ok(host.includes("'speech', 'synthesize', '--text', text, '--format', format"), 'host non-stream synth argv')
+ok(host.includes("'--sample-rate', String(sampleRate)"), 'host non-stream sample rate')
+ok(host.includes("'--out', tmp"), 'host non-stream out file')
+ok(host.includes("readBytes(tmp, MAX_FILE_BYTES)"), 'host read synth file')
+ok(host.includes("rm -f ' + quote(tmp)"), 'host synth tmp cleanup')
+ok(host.includes("speechStreamBusy.delete(sid)"), 'host busy gate release')
+
+// ---- 静态契约（RC19：markdown 结构转句界——不复读 '--'/'|---|---|' 噪音段） ----
+ok(host.includes("replace(/^\\s*#{1,6}\\s+/gm, '。')"), 'host header to sentence boundary')
+ok(host.includes("replace(/^\\s*(?:[-+*]|>\\s*)\\s*/gm, '。')"), 'host list marker to sentence boundary')
+ok(host.includes("replace(/^\\s*\\d{1,3}[.、)]\\s*/gm, '。')"), 'host ordered marker to sentence boundary')
+ok(host.includes("replace(/^\\s*\\|[\\-:| ]+\\|\\s*$/gm, '')"), 'host table sep row dropped')
+ok(host.includes("replace(/\\|/g, '，')"), 'host table cells to comma')
+ok(host.includes("replace(/^\\s*[=\\-]{3,}\\s*$/gm, '')"), 'host hr rule dropped')
+ok(host.includes("const pureSeg = /^[\\s，。！？!?；;、—\\-_=|]+$/"), 'host pure-segment filter in splitter')
+ok(host.includes("!pureSeg.test(seg)"), 'host pure segment skip')
+
+// ---- 行为（RC19：净化 + 分句 快照） ----
+const rc19Src = host.match(/function sanitizeSpeechText\(text\) \{[\s\S]*?\n    \}/)
+ok(!!rc19Src, 'host extract sanitizeSpeechText rc19')
+if (rc19Src) {
+  const sanitizeRC19 = new Function('return ' + rc19Src[0])()
+  const s1 = sanitizeRC19('---\n## 标题\n- 项一\n| a | b |\n正文。')
+  ok(!s1.includes('---'), 'rc19: hr rule removed')
+  ok(!s1.includes('|'), 'rc19: pipes removed')
+  ok(s1.includes('标题'), 'rc19: header text kept')
+  ok(s1.includes('项一'), 'rc19: list item kept')
+  ok(s1.includes('a ， b'), 'rc19: table cells comma-joined')
+  ok(s1.includes('正文。'), 'rc19: body kept with sentence end')
+  const splitRC19 = host.match(/function splitSentences\(text, splitChars, maxChars\) \{[\s\S]*?\n    \}/)
+  if (splitRC19) {
+    const splitter = new Function('return ' + splitRC19[0])()
+    const segs = splitter(sanitizeRC19('。句一。句二'), '。！？.!?\n', 200)
+    ok(segs.length === 2 && segs[0] === '句一。', 'rc19: pure-。 segment skipped')
+    ok(!segs.some(function (s) { return /^[\s，。]+$/.test(s) }), 'rc19: no pure punctuation chunk')
+  }
+}
 
 process.exit(fail === 0 ? 0 : 1)

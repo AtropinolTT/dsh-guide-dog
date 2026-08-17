@@ -1830,6 +1830,9 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     })
     // ---- 下行流式 TTS（spec §6.5，零 WebSocket） ----
     // RC14：播报文本净化——URL/markdown/emoji/列表标记不朗读（通话模式不读网址）
+    // RC19：下行分句前把 markdown 结构转成句界——标题/列表项/有序项各自成句（行首转 '。'），
+    // 表格单元格 | → 逗号停顿，表格分隔行与 --- 分隔线整体丢弃（旧行为把 '--'/'|---|---|'
+    // 整行拿去 TTS，播成噪音；复测日志实证 38 句回复 3 个 '--' 空音）。纯符号行最终丢弃。
     function sanitizeSpeechText(text) {
       return String(text || '')
         .replace(/```[\s\S]*?```/g, ' ')
@@ -1837,12 +1840,19 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // [标题](url) → 标题
         .replace(/https?:\/\/[^\s，。！？!?）)]+/g, ' ') // 裸 URL（中文标点收尾）
         .replace(/www\.[^\s，。！？!?）)]+/g, ' ')
-        .replace(/^\s*(?:[-+*]|>\s*)\s*/gm, ' ') // 行首列表/引用标记
-        .replace(/^\s*\d{1,3}[.、)]\s*/gm, ' ') // 行首有序列表标记
-        .replace(/[*_~#|]/g, ' ')
+        .replace(/^\s*\|[\-:| ]+\|\s*$/gm, '') // 表格分隔行 |---|---| → 丢弃
+        .replace(/\|/g, '，') // 表格单元格 → 逗号停顿
+        .replace(/^\s*#{1,6}\s+/gm, '。') // 标题 → 句界
+        .replace(/^\s*(?:[-+*]|>\s*)\s*/gm, '。') // 列表/引用项 → 句界
+        .replace(/^\s*\d{1,3}[.、)]\s*/gm, '。') // 有序项 → 句界
+        .replace(/^\s*[=\-]{3,}\s*$/gm, '') // 分隔线 --- → 丢弃
+        .replace(/[*_~#]/g, ' ')
         .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{00A9}\u{00AE}]/gu, ' ') // emoji 区段
         .replace(/[ \t]{2,}/g, ' ')
-        .replace(/\s+$/g, '')
+        .split('\n').map(function (ln) {
+          const t = ln.replace(/^[，\s]+|[，\s]+$/g, '').trim() // 边角只清逗号/空白，句末 '。' 保留
+          return /^[\s，。！？!?；;、—\-_=|]*$/.test(t) ? '' : t
+        }).filter(function (ln) { return ln !== '' }).join('\n')
         .trim()
     }
     function splitSentences(text, splitChars, maxChars) {
@@ -1851,15 +1861,18 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       // RC14：'.' 不再按字符类拆分（URL/小数拆断）——智能规则：后跟空白+大写/CJK 才拆
       const extra = String(splitChars || '').replace(/[\\\]]/g, '\\$&').replace(/[.\s]/g, '')
       const re = new RegExp('[。！？!?；;' + extra + '][ \t]*|\\n+|(?:\\.)(?=[ \t]+[A-Z0-9\u4e00-\u9fff])', 'g')
+      // RC19：句界标记 '。' 独立成段（结构转换插入的句首标记）与纯符号残留一律跳过——
+      // 旧实现把 '。' 段拿去 TTS 播成无声/杂音（复测日志 20+ 个 '。' 段）
+      const pureSeg = /^[\s，。！？!?；;、—\-_=|]+$/
       const out = []
       let last = 0, m
       while ((m = re.exec(text)) !== null) {
-        const seg = text.slice(last, m.index + m[0].length).trim()
-        if (seg) out.push(seg)
+        const seg = text.slice(last, m.index + m[0].length).trim().replace(/^[，\s]+|[，\s]+$/g, '')
+        if (seg && !pureSeg.test(seg)) out.push(seg)
         last = m.index + m[0].length
       }
-      const tail = text.slice(last).trim()
-      if (tail) out.push(tail)
+      const tail = text.slice(last).trim().replace(/^[，\s]+|[，\s]+$/g, '')
+      if (tail && !pureSeg.test(tail)) out.push(tail)
       const res = []
       for (const s of out) {
         if (s.length <= max) res.push(s)
@@ -1894,27 +1907,31 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
               const ttsCfg = loadConfig().tts || {}
               const voice = hasCJK(text) ? (ttsCfg.voiceZh || 'Chinese (Mandarin)_Gentle_Youth') : ((cfg.call && cfg.call.voice) || 'English_expressive_narrator')
               const speed = (cfg.call && cfg.call.speed) || 1.0
-              res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' })
-              let handle = null
+              // RC19：流式 TTS 改非流式合成——根因实证（2026-08-17 复测）：
+              // MiniMax T2A 流式接口把整段音频随首事件与末尾 status=2 事件各发一遍（SSE 探针：
+              // '你好' event#1 hex=69036 + event#4 hex=69104），mmx --stream 全量拼接 →
+              // 每句话播两遍（转写实证 --stream '你好' → '你好你好'；非流式 → '你好'）。
+              // 客户端本就整段收齐后才起播（RC18 HTMLAudio），流式无延迟收益；
+              // 改 mmx 非流式 --out 文件合成（speakImpl 同款通路），音频只出现一次。
+              if (req.method === 'HEAD') { speechStreamBusy.delete(sid); res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' }); res.end(); return }
+              let tmp = ''
               try {
-                handle = subprocess.spawn({
-                  argv: ['mmx', 'speech', 'synthesize', '--stream', '--text', text, '--format', format, '--sample-rate', String(sampleRate), '--voice', voice, '--speed', String(speed)],
-                  cwd: (await guideDogRoot()) + '/.guide-dog',
-                  stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 1024 * 1024 } },
-                  graceMs: 3000,
-                })
-                let first = true
-                handle.stdout.on('data', function (chunk) {
-                  if (first) { first = false; if (req.method === 'HEAD') { try { handle.terminate() } catch (e) { /* ignore */ } } }
-                  if (req.method === 'HEAD') return
-                  try { res.write(chunk) } catch (e) { try { handle.terminate() } catch (e2) { /* ignore */ } }
-                })
-                await handle.done
-                try { res.end() } catch (e) { /* ignore */ }
+                const root = await guideDogRoot()
+                const tmpDir = root + '/.guide-dog/tmp'
+                tmp = tmpDir + '/tts-' + String(Date.now()) + '-' + String(Math.floor(Math.random() * 1000000)) + '.pcm'
+                await runRaw('mkdir -p ' + quote(tmpDir), { timeoutMs: 10000 })
+                const syn = await mmx(['speech', 'synthesize', '--text', text, '--format', format, '--sample-rate', String(sampleRate), '--voice', voice, '--speed', String(speed), '--out', tmp], { timeoutMs: 120000 })
+                const data = syn.ok ? await readBytes(tmp, MAX_FILE_BYTES) : null
+                try { await runRaw('rm -f ' + quote(tmp), { timeoutMs: 10000 }) } catch (e) { /* ignore */ }
+                if (!data || !data.length) {
+                  // I1 语义保持：失败响应必须结束且不双写 head
+                  try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+                  return
+                }
+                res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' })
+                try { res.end(data) } catch (e) { /* ignore */ }
               } catch (e) {
-                // I1（最终审稿）：writeHead(200) 已发出时 spawn 失败 → 再 writeHead(500) 抛
-                // ERR_HTTP_HEADERS_SENT（被吞）且响应永不 end → client fetch 挂死。加
-                // headersSent 守卫并保证响应一定结束。
+                if (tmp) { try { await runRaw('rm -f ' + quote(tmp), { timeoutMs: 10000 }) } catch (e2) { /* ignore */ } }
                 try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
               } finally {
                 speechStreamBusy.delete(sid)
