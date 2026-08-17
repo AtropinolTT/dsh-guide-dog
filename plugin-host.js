@@ -823,7 +823,8 @@ if __name__ == '__main__':
       if (!st) { release(); return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' } }
       await pushIndex({ name: name, kind: 'audio', prompt: text.slice(0, 200), voice: voice, ts: Date.now(), bytes: st.size || 0, source: source, turnSeq: seq, spoken: transformed.slice(0, 160) })
       // RC13：本机扬声器播放成功后登记文本——队列通道（语音模式/下行）消费即删，防双响
-      if (args.playOnHost) { const played = await playOnHost(abs); if (played) markHostSpoken(sid, transformed) }
+      // RC14：注册双键——净化后文本与 downlink 匹配（markdown/URL 文本互斥生效）；transform.py 改写文本时净化键可能不完全一致，属可接受边缘
+      if (args.playOnHost) { const played = await playOnHost(abs); if (played) { markHostSpoken(sid, transformed); markHostSpoken(sid, sanitizeSpeechText(transformed)) } }
       return { ok: true, kind: 'audio', url: MEDIA_ROUTE + '/' + name, file: abs, voice: voice, bytes: st.size || 0 }
     }
     async function playOnHost(abs) {
@@ -1950,7 +1951,11 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         }
         pendingFinal.delete(sid)
         // RC13（Task 3）：双通道互斥——本机扬声器已播（guide_dog_speak playOnHost）的文本不再入队
-        if (wasHostSpoken(sid, text)) return
+        // RC14：按净化后文本匹配——downlink 文本含 markdown/URL 净化后才与 speakImpl 注册键一致
+        if (wasHostSpoken(sid, sanitizeSpeechText(text))) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(text).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
         // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队（"同一内容重复播放"贡献因子）
         const tkey = streamTurnKey(data.turn, data.step)
         if (tkey !== 'undefined:undefined' && lastStreamTurn.get(sid) === tkey) return
@@ -1960,12 +1965,17 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         if (!clean) return
         const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
-        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) }) })
+        sentences.forEach(function (s) {
+          // RC14：诊断埋点——同句已在队列则告警（仅日志，不丢弃）
+          const dup = q.some(function (e) { return e.text === s })
+          if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
+          q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) })
+        })
         // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
         while (q.length > VOICE_QUEUE_MAX) q.pop()
         voiceQueue.set(sid, q)
-        // RC12 诊断日志（DSH 终端可见）
-        try { console.log('[gd-host] enqueue n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
+        // RC12 诊断日志（DSH 终端可见）；RC14：补来源标签（downlink 入队）
+        try { console.log('[gd-host] enqueue from=downlink n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
     })
     // RC13：回合结束兜底——本回合无可播最终消息（终结型工具回合：最后一条 assistant/message
@@ -1982,16 +1992,26 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const pend = pendingFinal.get(sid)
         if (!pend || pend.turn !== turn || !pend.text) return
         pendingFinal.delete(sid)
+        // RC14：本机已播（guide_dog_speak playOnHost）不再兜底入队
+        if (wasHostSpoken(sid, sanitizeSpeechText(pend.text))) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(pend.text).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
         const streamCfg = (cfg.call && cfg.call.stream) || {}
         const clean = sanitizeSpeechText(pend.text)
         if (!clean) return
         const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
-        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) }) })
+        sentences.forEach(function (s) {
+          // RC14：诊断埋点——同句已在队列则告警（仅日志，不丢弃）
+          const dup = q.some(function (e) { return e.text === s })
+          if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
+          q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) })
+        })
         // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
         while (q.length > VOICE_QUEUE_MAX) q.pop()
         voiceQueue.set(sid, q)
-        try { console.log('[gd-host] turn-end flush n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
+        try { console.log('[gd-host] enqueue from=turnend n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
     })
     // ---- 容错（spec §6.8） ----
@@ -2101,7 +2121,10 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
         if (hasToolCall) return
         // RC13（Task 3）：双通道互斥
-        if (wasHostSpoken(sid, clean)) return
+        if (wasHostSpoken(sid, clean)) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(clean).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
         // 异步串行 TTS，不阻塞事件循环
         serialSpeak(function () {
           return speakImpl({ text: clean, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
@@ -2129,7 +2152,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const q = voiceQueue.get(sid) || []
           const entry = q.length ? q.shift() : null
           if (!q.length) voiceQueue.delete(sid)
-          if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?')) } catch (e) { /* ignore */ } }
+          if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?') + ' remain=' + q.length) } catch (e) { /* ignore */ } }
           return { ok: true, entry: entry }
         })
       } catch (e) { return function () {} }
