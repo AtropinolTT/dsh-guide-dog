@@ -304,6 +304,39 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   失败提示音 + 面板错误状态（绝不静默）；共识拦截器失败保守拒绝并口播原因。
   通话转写/打断/轮询的会话归属在发起通话时一次性捕获（RC13）——多会话切换不再串台。
 
+### RC14 修复（2026-08-17）：播报内容选择 + 队列截尾 + 进度去重 + 双播定位
+
+- **播报内容净化（`sanitizeSpeechText`，F1）** — 入队前对回复文本做一次 markdown/URL/emoji
+  剥离：`[标题](url)` 保留标题去 URL；裸 URL（`https?://`、`www.`）整段移除；行首列表/引用
+  标记（`-`/`+`/`*`/`>`）与行首有序列表标记（`1.` `1、` `1)`）剥除；`**加粗**`/`` ` ``/`` ``` ``
+  等 markdown 标记剥除；emoji 区段（`U+1F000-U+1FAFF` 等）剥除。通话场景只朗读人话，不读
+  网址/`**`/`-`/📢 等元字符，避免"thepaper/newsD/weather.com"这类 URL 碎片被打散朗读。
+- **智能分句（`splitSentences`，F2）** — 默认分隔符 `'。！？.!?\n'` 中的 `.` 改为智能规则：
+  仅当 `.` 后**紧跟空白+大写字母/数字/CJK** 才拆（`'Hello. Next'` 拆成 2 句；`'8.17 的上海'`
+  保持 1 句；URL 内部的 `.` 不会被打断）。中文分隔集合追加 `；;`，避免 `…；` 把一句中文回复
+  拆成两半。
+- **队列上限 40 截尾（`VOICE_QUEUE_MAX`，F3）** — 由 10 提到 40，**丢队尾保内容**：
+  超限时 `while (q.length > VOICE_QUEUE_MAX) q.pop()`（先入内容优先；旧 `splice(0, …)`
+  从队头删的策略会把主内容先裁掉，保留 URL 碎片）。announce/hb 的 progress 仍用 `pop()`
+  （unshift 到队首，progress 优先）。
+- **进度短语 30s 去重窗口（F4）** — `announce` 的 `progressDedupe` 冷却由 4s 延长到 30s：
+  web_search 多次结果间隔 ~4.3s 时不会连播 3 次「正在搜索网页」。`progressDedupe` 函数
+  本体未动；`repro-progress.js` 语义保持。
+- **双通道互斥按净化后文本匹配（F5）** — `wasHostSpoken` / `markHostSpoken` 统一使用
+  `sanitizeSpeechText` 处理后的文本作为键：downlink、turn-end flush、voice-mode 三处
+  `wasHostSpoken` 都按净化键匹配；`speakImpl` 在 `playOnHost` 成功后同时注册原始键与
+  净化键（双键），下游任一通道都能正确去重。已知边界：transform.py 改写文本时两个键
+  可能不完全一致（属可接受边缘）。
+- **诊断埋点（F6，一次复测定位"读两遍"）** — 零行为变更，只加日志：
+  - host（`[gd-host]`，DSH 终端可见）：
+    `enqueue from=downlink|turnend|voice-mode|consensus|announce|heartbeat n=... qlen=...`、
+    `shift key=... remain=...`、`skip host-spoken sid=... text=...`、`QUEUE-DUP text=...`。
+  - client（`[gd]`，浏览器 DevTools）：
+    `playStreamEntry ... times=...`（每次播放按 `entry.key || entry.text` 累加计数）、
+    `PLAY-SUMMARY key=N | ...`（队列空时汇总当前所有计数后清空）。
+  - 复测定标（RC15 走向依据）：`QUEUE-DUP` → host 双入队；`PLAY-SUMMARY key=2` → client 双播；
+    两者皆无但仍两遍 → tts-stream 音频双写；`enqueue from=` 同源两次同文本 → 事件重放。
+
 ### config.json schema（Phase 2：call / a11y）
 
 Phase 1 的 config（`~/.dsh/guide-dog/.guide-dog/config.json`）基础上新增，

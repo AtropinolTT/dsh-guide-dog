@@ -38,7 +38,8 @@ function check(cond, label) {
   check(toolCallSkips >= 2, 'host: 下行 + 语音模式两个监听都跳过带 tool-call 的中间消息')
   check(/pendingFinal/.test(srcH), 'host: pendingFinal 缓冲中间文本（turn/end 兜底用）')
   check(/'turn\/end'/.test(srcH), 'host: turn/end 兜底监听存在')
-  check(/turn-end flush/.test(srcH), 'host: turn/end 兜底入队（终结工具回合不静音）')
+  // RC14-T3 重命名：[gd-host] turn-end flush → enqueue from=turnend（带源标签更清晰）
+  check(/enqueue from=turnend/.test(srcH), 'host: turn/end 兜底入队（终结工具回合不静音）')
 }
 
 // ---- 3. 双通道互斥（Task 3，host） ----
@@ -46,8 +47,9 @@ function check(cond, label) {
   check(/function markHostSpoken/.test(srcH), 'host: markHostSpoken 存在')
   check(/function wasHostSpoken/.test(srcH), 'host: wasHostSpoken 存在（消费即删）')
   check(/markHostSpoken\(sid, transformed\)/.test(srcH), 'host: playOnHost 成功后标记文本')
-  const w = (srcH.match(/wasHostSpoken\(sid, text\)/g) || []).length
-  check(w >= 2, 'host: 下行 + 语音模式两个监听都跳过本机已播文本')
+  // RC14-T1/T3：wasHostSpoken 改为按净化后文本匹配（downlink/turn-end/voice-mode 三处）
+  const w = (srcH.match(/wasHostSpoken\(sid, sanitizeSpeechText\(/g) || []).length
+  check(w >= 2, 'host: 下行 + 语音模式（或 turn-end）两个监听按净化后文本匹配本机已播')
 }
 
 // ---- 4. 播放管线爆音（Task 4，client） ----

@@ -2195,5 +2195,30 @@ Expected: 通过。
 cd /home/tt-wsl-ubuntu/skills-repo/guide-dog-dsh && git add -A && git commit -m "docs(phase2): acceptance run record"
 ```
 
+## RC14 修复（2026-08-17，SDD 5 任务 + 评审门禁）
+
+子计划：`plans/2026-08-17-rc14-call-fixes.md`（commit fbf9800）
+台账：`.superpowers/sdd/2026-08-17-rc14-call-fixes/progress.md`
+
+**四根因一句话**：
+1. **RC-A 队列丢弃**：`VOICE_QUEUE_MAX=10` + `splice(0, …)` 从队头删 → 主内容被裁，保留 URL 碎片
+2. **RC-B URL 拆读**：`splitSentences` 把 `'.'` 按字符类拆 → URL 内部断；无 markdown/emoji 净化
+3. **RC-C 进度重复**：progress 冷却 4s < web_search 结果间隔 ~4.3s → 连播 3 次
+4. **RC-D 双播**：经完整排除（host 单入队 / agent 无 speak / 无双实例 / tts-stream 单次 / client 单 fetch）后未定 → 加入诊断埋点一次复测定位
+
+**提交链**：
+- T1 F1+F2 净化+智能分句：`fix(phase2): RC14-T1 — 播报文本净化（URL/markdown/emoji/列表标记）+ 智能分句（'.' 数字不拆）`（6d628a8）
+- T2 F3+F4 队列+去重：`fix(phase2): RC14-T2 — 队列上限 40 截尾保内容 + 进度短语去重窗口 30s`（3677d1a）
+- T3 F5+host 埋点：`fix(phase2): RC14-T3 — 双通道互斥补全（净化文本匹配 + turn-end 检查）+ [gd-host] 诊断埋点`（1d6c72a）
+- T4 client 埋点：`fix(phase2): RC14-T4 — client 播放计数埋点（times/PLAY-SUMMARY，零行为变更）`（31d1e96）
+- T4-F1 评审 minor：`fix(phase2): RC14-T4-F1 — 修 PLAY-SUMMARY 条件注释矛盾 + stopCall 清播放计数`（ab6b6e0c）
+- T5 回归+bundle+台账：`docs(phase2): RC14-T5 — repro-rc14 + 全量回归 + bundle rc14 + README + 台账`（**`9fde092`**）
+- T5 bundle：`chore(phase2): rebuild bundle rc14-20260817 (generated)`（**`b7b6511`**）
+
+**部署说明**（提交完成）：
+- 提交链头 `9fde092`，bundle 提交 `b7b6511`
+- bundle rc14-20260817：`.superpowers/sdd/2026-08-17-rc14-call-fixes/progress.md` 部署记录节
+- 验收：重启 DSH + 硬刷新 → DevTools 控制台 `[guide-dog] client build rc14-20260817`
+
 
 
