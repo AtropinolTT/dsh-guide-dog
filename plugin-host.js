@@ -1857,6 +1857,69 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         voiceQueue.set(sid, q)
       } catch (e) { /* best effort */ }
     })
+    // ---- 容错（spec §6.8） ----
+    const lastAgentEvent = new Map() // sessionId -> ts
+    ctx.on('agent/status', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (sid) lastAgentEvent.set(sid, Date.now())
+      } catch (e) { /* ignore */ }
+    })
+    ctx.on('tools/result', function (exec) {
+      try {
+        const agent = exec && exec.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (sid) lastAgentEvent.set(sid, Date.now())
+      } catch (e) { /* ignore */ }
+    })
+    function heartbeatCheck() {
+      const now = Date.now()
+      // C4 修复：遍历持久激活集合（callActiveSessions），不再读瞬时 callActiveFlags
+      callActiveSessions.forEach(function (sid) {
+        const last = lastAgentEvent.get(String(sid)) || now
+        if (now - last > 120000) {
+          lastAgentEvent.set(String(sid), now) // 防重复轰炸
+          // C5 同款：生成完成后才入队（占位条目会被 client 先弹出）
+          serialSpeak(function () {
+            return speakImpl({ text: '仍在处理，请稍候', sessionId: String(sid), turnSeq: null, source: 'progress' }).then(function (r) {
+              const q2 = voiceQueue.get(String(sid)) || []
+              if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'hb:' + String(sid) })
+              else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+              if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+              voiceQueue.set(String(sid), q2)
+            }).catch(function () {})
+          })
+        }
+      })
+    }
+    // R2（2026-08-16 控制器裁定）：双路径心跳——interval 可用走 timerSvc.interval
+    // （disposer 挂 ctx.effect），否则 sleep 递归清扫；两条路径互斥，仅一条运行。
+    // T3 守护：timerSvc 为 null 时 sleep 路径绝不启动（sleep 早退 → Promise 立即 resolve → 忙循环）。
+    function startSleepSweeper() {
+      // 前置分号防 ASI 合并（IIFE 语句）
+      ;(function hb() {
+        sleep(30000).then(function () {
+          heartbeatCheck()
+          hb()
+        })
+      })()
+    }
+    const heartbeatTimer = timerSvc && typeof timerSvc.interval === 'function'
+      ? timerSvc.interval(heartbeatCheck, 30000)
+      : (timerSvc ? startSleepSweeper() : null)
+    if (heartbeatTimer) ctx.effect(heartbeatTimer)
+    ctx.effect(function () {
+      try {
+        return harness.handle('guide-dog/call-command', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          const cmd = args && args.cmd ? String(args.cmd) : ''
+          if (!sid || !cmd) return { ok: false, error: 'bad_args' }
+          if (cmd === 'clear-queue') { voiceQueue.delete(sid); return { ok: true } }
+          return { ok: true }
+        })
+      } catch (e) { return function () {} }
+    })
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
