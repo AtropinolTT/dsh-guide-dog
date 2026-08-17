@@ -52,12 +52,14 @@ function check(cond, label) {
 
 // ---- 4. 播放管线爆音（Task 4，client） ----
 {
-  check(/function scheduleChunk\(audioCtx, wavBytes, playId\)/.test(srcC), 'client: scheduleChunk 带 playId')
-  check(/playId !== streamPlayer\.playSeq \|\| !streamPlayer\.active/.test(srcC), 'client: 解码帧代际守卫（旧 fetch 帧不加入新链）')
+  check(/function scheduleChunk\(audioCtx, wavBytes, gen\)/.test(srcC), 'client: scheduleChunk 带 gen 代际参数')
+  check(/gen !== streamPlayer\.gen \|\| !streamPlayer\.active/.test(srcC), 'client: 解码帧代际守卫（旧 fetch 帧不加入新链）')
+  check(/const gen = streamPlayer\.gen/.test(srcC), 'client: playStreamEntry 捕获解码代际 gen')
   check(/src\._gdGain = g/.test(srcC), 'client: 每帧恒接 GainNode（停播淡出需要）')
   check(/gapMs > 3/.test(srcC), 'client: 淡入阈值收窄到 3ms')
   const m = srcC.match(/function stopStreamPlayback\(\) \{[\s\S]*?\n    \}/)
   check(!!m && /playSeq \+= 1/.test(m[0]), 'client: stopStreamPlayback 递增代际（在途帧作废）')
+  check(!!m && /gen \+= 1/.test(m[0]), 'client: stopStreamPlayback 递增解码代际 gen（旧解码帧作废）')
   check(!!m && /linearRampToValueAtTime\(0\.0001, now \+ 0\.01\)/.test(m[0]), 'client: 停播 10ms 淡出（防硬切咔哒）')
   check(!!m && /src\.stop\(now \+ 0\.015\)/.test(m[0]), 'client: 淡出后延时停源')
   check(!!m && /fetching = false/.test(m[0]), 'client: stopStreamPlayback 清在途标志')
