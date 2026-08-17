@@ -919,6 +919,7 @@ return {
     let echoWinStart = 0, echoWinLast = 0, echoVoicedMs = 0 // 回声地板检测窗（时间累计）
     let echoQuietStart = 0 // 持续安静计时（清除 echoFloor：agent 与用户都静音 ≥2s）
     let playbackEndedAt = 0 // 最近一次下行播报结束时刻（回声尾抑制窗基准）
+    let windowLogged = false // RC17-F 诊断：回声尾窗拦截日志（每窗一次，防刷屏）
 
     function startCall(sid, inputActions) {
       if (callMic) return
@@ -995,6 +996,12 @@ return {
               // barge-in 已提前执行（I7），auto-start 仅在此分支触发，互不冲突
               // RC2：播放（speaking）期间禁止自动起段——TTS 输出/环境声不得开段（回声开环）；打断由 barge-in 独占
               // RC17：播报结束回声尾抑制窗（echoTailMs）内禁止自动起段——扬声器余响会开段录到 agent 自己的话
+              if ((now - playbackEndedAt) > echoTailMs) windowLogged = false // 窗已过期，允许下次再记
+              // RC17-F 诊断（每窗一次）：窗内检测到发声但被拦截——复测定位窗口是否生效
+              if (callState.mode === 'vad' && voiced && callState.phase !== 'speaking' && (now - playbackEndedAt) <= echoTailMs && !windowLogged) {
+                windowLogged = true
+                gdLog('echo tail window active, auto-start blocked')
+              }
               if (callState.mode === 'vad' && voiced && callState.phase !== 'speaking' && (now - playbackEndedAt) > echoTailMs) startSegment()
               callMic.raf = requestAnimationFrame(tick)
               return
@@ -1400,6 +1407,12 @@ return {
       const firstSentence = !streamPlayer.active // C2：仅在链空闲时走完整起播路径
       gdLog('playStreamEntry playId=' + playId + ' first=' + firstSentence + ' key=' + (entry.key || '?') + ' text=' + String(entry.text || '').slice(0, 16) + ' times=' + c)
       if (firstSentence) {
+        // RC17-F：起播瞬间若有活动段（噪声/回声误开），作废丢弃——防段尾录进 agent 自己话音再被提交
+        if (callSegmentActive && callMic && callMic.rec) {
+          try { callMic.rec.gdAbort = true; if (callMic.rec.state !== 'inactive') callMic.rec.stop() } catch (e) { /* ignore */ }
+          callSegmentActive = false
+          setCallState({ recording: false })
+        }
         stopCurrent() // RC9：反向防叠——起播新链时终止仍在播的 mp3（如 repeat 命令直接调用时）
         streamPlayer.active = true
         streamPlayer.nextTime = 0

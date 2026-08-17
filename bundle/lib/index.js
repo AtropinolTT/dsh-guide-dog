@@ -1740,6 +1740,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const q2 = voiceQueue.get(String(sid)) || []
           if (r && r.ok && r.url) {
             q2.push({ url: r.url, key: 'consensus:' + sid + ':' + Date.now(), consensus: true })
+            // RC17-F：共识摘要文本入回声缓冲（其 mp3 播放会被麦克风拾取）
+            pushAgentSpeech(String(sid), text, Date.now())
           } else {
             q2.push({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
           }
@@ -1877,6 +1879,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       q2.unshift({ stream: true, text: clean, key: 'progress:' + String(sid) + ':' + clean })
       if (q2.length > VOICE_QUEUE_MAX) q2.pop()
       voiceQueue.set(String(sid), q2)
+      // RC17-F：进度播报文本入回声缓冲（否则其回声可绕过拒收被提交）
+      pushAgentSpeech(String(sid), clean, Date.now())
       try { console.log('[gd-host] announce ' + clean + ' qlen=' + q2.length) } catch (e) { /* ignore */ }
     }
     // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
@@ -2144,6 +2148,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           q2.unshift({ stream: true, text: '仍在处理，请稍候', key: 'hb:' + String(sid) })
           if (q2.length > VOICE_QUEUE_MAX) q2.pop()
           voiceQueue.set(String(sid), q2)
+          // RC17-F：心跳播报文本入回声缓冲
+          pushAgentSpeech(String(sid), '仍在处理，请稍候', Date.now())
         }
       })
     }
@@ -2234,7 +2240,17 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         if (r === t) return true
         if (t.length >= 6 && (r.indexOf(t) >= 0 || t.indexOf(r) >= 0)) return true
       }
-      return false
+      // RC17-F：字符二元组覆盖率（抗 ASR 变体/片段回声）——转写 ≥50% 的二元组出现在最近播报任一文本 → 回声
+      const grams = new Set()
+      for (let i = 0; i + 2 <= t.length; i++) grams.add(t.slice(i, i + 2))
+      if (grams.size < 6) return false
+      let hit = 0
+      for (const g of grams) {
+        for (let j = 0; j < recent.length; j++) {
+          if (String((recent[j] && recent[j].t) || '').indexOf(g) >= 0) { hit++; break }
+        }
+      }
+      return (hit / grams.size) >= 0.5
     }
     function echoGuard(result, sid) {
       if (result && result.ok && sid && lastAgentSpeech.has(sid)) {
