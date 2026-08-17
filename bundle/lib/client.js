@@ -996,7 +996,7 @@ return {
     // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
-    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0 }
+    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, fetching: false }
     function getTtsToken(sid) {
       return host.call('guide-dog/tts-token', { sessionId: sid }).then(function (r) {
         return (r && r.ok && r.token) ? r.token : ''
@@ -1033,7 +1033,10 @@ return {
         src.onended = function () {
           const i = streamPlayer.nodes.indexOf(src)
           if (i >= 0) streamPlayer.nodes.splice(i, 1)
-          if (!streamPlayer.nodes.length && streamPlayer.active) {
+          // C6（最终审稿）：链排空但仍有句子 fetch 在途时**不得**停 active——否则在途 fetch 的
+          // `if (!streamPlayer.active)` 守卫会 abort 自己，catch 又因 active=false 跳过重连，
+          // 该句被静默丢弃（如先于下一句首帧解码就排空的短句"好的/收到"）
+          if (!streamPlayer.nodes.length && !streamPlayer.fetching && streamPlayer.active) {
             streamPlayer.active = false
             setCallState({ phase: 'listening' })
           }
@@ -1063,6 +1066,9 @@ return {
       }
       const audioCtx = ensureStreamCtx()
       try { await audioCtx.resume() } catch (e) { /* ignore */ }
+      // C6（最终审稿）：fetch 在途标志——追加句 fetch 期间即使既有链排空也不停 active；
+      // finally 在 catch/重连逻辑之后清除，重连再入时看到的仍是 false
+      streamPlayer.fetching = true
       const controller = new AbortController()
       streamPlayer.controller = controller
       const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
@@ -1106,6 +1112,7 @@ return {
           }
         }
       } finally {
+        streamPlayer.fetching = false // C6：在 catch/重连之后清除（重连再入时看到 false）
         streamPlayer.controller = null
         if (entry.consensus) notifyConsensusSpeech(false)
       }
