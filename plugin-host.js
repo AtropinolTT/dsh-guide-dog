@@ -1777,7 +1777,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     // 去重：同短语冷却窗口内跳过（出错文本唯一，天然不冲突）。
     function announce(sid, text) {
       const now = Date.now()
-      if (progressDedupe(lastProgress.get(String(sid)), text, now)) {
+      // RC14：30s 短语窗口——web_search 结果间隔 ~4.3s > 旧 4s → 连播 3 次
+      if (progressDedupe(lastProgress.get(String(sid)), text, now, 30000)) {
         try { console.log('[gd-host] announce DEDUPE ' + text) } catch (e) { /* ignore */ }
         return
       }
@@ -1960,7 +1961,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
         sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) }) })
-        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
+        while (q.length > VOICE_QUEUE_MAX) q.pop()
         voiceQueue.set(sid, q)
         // RC12 诊断日志（DSH 终端可见）
         try { console.log('[gd-host] enqueue n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
@@ -1986,7 +1988,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
         sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) }) })
-        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
+        while (q.length > VOICE_QUEUE_MAX) q.pop()
         voiceQueue.set(sid, q)
         try { console.log('[gd-host] turn-end flush n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
@@ -2073,7 +2076,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     //   - 文本提取: const data = event.data || {}；content 取 data.content（或 data.message.content）blocks；
     //     text = content 中 type==='text' 的 b.text 拼接
     //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
-    const VOICE_QUEUE_MAX = 10 // M5：每会话队列上限（防 voiceQueue 无界增长；超限丢最旧）
+    const VOICE_QUEUE_MAX = 40 // RC14：40 上限（净化后句子数骤减；超长回复截尾不截头）
     const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
     ctx.on('session/event', function (session, event) {
       try {
