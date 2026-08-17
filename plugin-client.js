@@ -71,7 +71,7 @@ return {
         try { voicePlayer.audio.pause() } catch (e) { /* ignore */ }
       }
       // RC15（F1）：中断时释放 busy 并回队——防 voicePlayer.busy 死锁吞条目（评审 Important）
-      if (voicePlayer.busy || voicePlayer.current || voicePlayer.pending) {
+      if (voicePlayer.busy || voicePlayer.current || (voicePlayer.pending && voicePlayer.pending.length)) {
         const a = voicePlayer.audio
         if (a) { a.onended = null; a.onerror = null }
         if (voicePlayer.ac) { try { voicePlayer.ac.abort() } catch (e) { /* ignore */ } voicePlayer.ac = null }
@@ -82,14 +82,15 @@ return {
         voicePlayer.attempts.delete(String((cur && cur.entry && (cur.entry.key || cur.entry.url)) || ''))
         if (cur) requeueVoiceEntry(cur.entry, cur.sid)
         const pend = voicePlayer.pending
-        if (pend) { voicePlayer.pending = null; requeueVoiceEntry(pend.entry, pend.sid) }
+        voicePlayer.pending = []
+        if (pend) { for (let i = 0; i < pend.length; i++) { if (pend[i] && pend[i].entry) requeueVoiceEntry(pend[i].entry, pend[i].sid) } }
       }
     }
     // ============ RC15 播放器：语音模式/播报 mp3（持久元素 + fetch 全量下载） ============
     // 旧实现逐条目 new Audio(url)：自动播放被拦/元素被替换 → 浏览器中止下载 →
     // ERR_CONTENT_LENGTH_MISMATCH + Chrome 媒体重试风暴（同文件 10-30 次请求）。
     // 新实现：fetch 一次拿全量字节（AbortController 120s 超时）→ Blob URL → 单一持久 Audio 元素。
-    const voicePlayer = { audio: null, ctx: null, busy: false, pending: null, attempts: new Map(), banner: false, current: null, ac: null }
+    const voicePlayer = { audio: null, ctx: null, busy: false, pending: [], attempts: new Map(), banner: false, current: null, ac: null }
     function ensureVoiceAudio() {
       if (!voicePlayer.audio) {
         try { voicePlayer.audio = new Audio() } catch (e) { voicePlayer.audio = null }
@@ -107,9 +108,20 @@ return {
         }
       } catch (e) { /* ignore */ }
       const a = ensureVoiceAudio()
-      if (a && a.src && a.paused) { const p = a.play(); if (p && typeof p.catch === 'function') p.catch(function () {}) }
-      const pend = voicePlayer.pending
-      if (pend) { voicePlayer.pending = null; playVoiceEntry(pend.entry, pend.sid) }
+      // RC15-F：被拦条目已加载 → 直接续播同一 blob（不再重新 fetch，防重启 + 泄漏）
+      if (voicePlayer.current && a && a.src && a.paused) {
+        const p = a.play()
+        if (p && typeof p.catch === 'function') p.catch(function () {})
+        const ck = String(voicePlayer.current.entry && (voicePlayer.current.entry.key || voicePlayer.current.entry.url || ''))
+        voicePlayer.pending = voicePlayer.pending.filter(function (q) {
+          return String(q.entry && (q.entry.key || q.entry.url || '')) !== ck
+        })
+        return
+      }
+      if (!voicePlayer.busy && voicePlayer.pending && voicePlayer.pending.length) {
+        const first = voicePlayer.pending.shift()
+        playVoiceEntry(first.entry, first.sid)
+      }
     }
     // RC15：全局手势监听（apply 时注册一次；capture 阶段捕获页面任意点击）
     function bindGestureUnlock() {
@@ -123,17 +135,20 @@ return {
     function playVoiceEntry(entry, sid) {
       const key = String(entry.key || entry.url || '')
       if (!key) return Promise.resolve()
-      const attempts = (voicePlayer.attempts.get(key) || 0) + 1
-      voicePlayer.attempts.set(key, attempts)
-      if (attempts > 3) {
-        voicePlayer.attempts.delete(key)
-        showToast('播放失败：' + String(entry.text || entry.url || '').slice(0, 24))
-        return Promise.resolve()
-      }
       return waitStreamDrain().then(function () {
-        if (voicePlayer.busy) { voicePlayer.pending = { entry: entry, sid: sid }; return Promise.resolve() }
+        if (voicePlayer.busy) { voicePlayer.pending.push({ entry: entry, sid: sid }); while (voicePlayer.pending.length > 40) voicePlayer.pending.shift(); return Promise.resolve() }
+        // RC15-F：mp3 抢占（恢复 RC14 语义）——播报/语音条目开播前停掉流/共识播放器，防双音重叠
+        stopCurrent()
         voicePlayer.busy = true
         voicePlayer.banner = false
+        const attempts = (voicePlayer.attempts.get(key) || 0) + 1
+        voicePlayer.attempts.set(key, attempts)
+        if (attempts > 3) {
+          voicePlayer.busy = false
+          voicePlayer.attempts.delete(key)
+          showToast('播放失败：' + String(entry.text || entry.url || '').slice(0, 24))
+          return Promise.resolve()
+        }
         const ac = new AbortController()
         voicePlayer.ac = ac
         const timer = setTimeout(function () { try { ac.abort() } catch (e) { /* ignore */ } }, 120000)
@@ -167,7 +182,7 @@ return {
           if (p && typeof p.catch === 'function') p.catch(function () {
             // 自动播放策略拦截：不丢条目，挂起等待用户手势（unlockVoiceAudio 触发重播）
             voicePlayer.busy = false
-            voicePlayer.pending = { entry: entry, sid: sid }
+            voicePlayer.pending.push({ entry: entry, sid: sid })
             if (!voicePlayer.banner) { voicePlayer.banner = true; showToast('点击页面任意位置开启语音播报') }
           })
           return Promise.resolve()
@@ -189,7 +204,7 @@ return {
     }
     function nextVoiceEntry() {
       const pend = voicePlayer.pending
-      if (pend) { voicePlayer.pending = null; playVoiceEntry(pend.entry, pend.sid) }
+      if (pend && pend.length) { const first = pend.shift(); playVoiceEntry(first.entry, first.sid) }
     }
     function beepFallback() {
       // WebAudio 振荡器兜底：Audio 元素被自动播放策略拦截时使用

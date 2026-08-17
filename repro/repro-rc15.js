@@ -50,14 +50,18 @@ ok(client.includes('attempts > 3'), 'client attempt cap 3')
 ok(client.includes("'guide-dog/voice-requeue'"), 'client requeue rpc')
 ok(client.includes('waitStreamDrain()'), 'client drain wait')
 ok(client.includes('voice play key='), 'client voice play count log')
-ok(client.includes("else if (r && r.ok && !r.entry) {"), 'client poll summary branch')
+ok(client.includes('playVoiceEntry(r.entry, sid)'), 'client poll voice entry')
+ok(client.includes('pending: []'), 'client pending fifo init')
+ok(client.includes('voicePlayer.pending.push'), 'client pending stash push')
+ok(client.includes('voicePlayer.pending.shift'), 'client pending drain shift')
+ok(client.includes('voicePlayer.current && a && a.src && a.paused'), 'client resume loaded only')
 ok(count(client, 'function playEntry(') === 0, 'client playEntry removed')
 ok(count(client, 'function playEntryNow(') === 0, 'client playEntryNow removed')
 ok(count(client, 'new Audio(String(url))') === 1, 'client per-entry Audio only in playEntryConsensus')
 
 // ---- 静态契约（Task 2 F1：stopCurrent 中断释放 busy 并回队） ----
 ok(client.includes('requeueVoiceEntry(cur.entry, cur.sid)'), 'client stop requeue current')
-ok(client.includes('requeueVoiceEntry(pend.entry, pend.sid)'), 'client stop requeue pending')
+ok(client.includes('requeueVoiceEntry(pend[i].entry, pend[i].sid)'), 'client stop requeue all pending')
 
 // ---- 静态契约（Task 3：去重） ----
 ok(host.includes('function replayDup('), 'host replayDup pure fn')

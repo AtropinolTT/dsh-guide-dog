@@ -347,7 +347,7 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   「反复重播 + 卡顿」）。
 - **手势解锁 + 被拦挂起重试（F2）** — 浏览器自动播放策略下首次播放可能被拦
   （`play()` rejected）：进入「待播放挂起」状态，绑定首次用户手势
-  （`pointerdown`/`keydown`/`touchend`，capture 阶段、消费即解绑）后自动继续；
+  （`click`/`keydown`/`touchstart`，capture 阶段、常驻监听）后自动继续；
   被拦条目不再丢弃，手势后重放。`stopCurrent` 中断时正确释放 `busy` 并回队
   （防 busy 死锁吞条目）。
 - **失败回队 RPC（`voice-requeue`，F3）** — 播放失败（解码/网络/被拦）时 client
@@ -359,7 +359,7 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
   `[gd-host] skip voice-dup text=` 埋点）。根因：语音模式 + 通话下行的事件重放会让
   同一文本入队两次——男声回复「7 遍」即该窗口缺失所致。
 - **url 条目播放计数（F5）** — `PLAY-SUMMARY` 汇总日志覆盖语音模式条目
-  （`playCounts` 按 `entry.key || entry.text` 计数，队列空时汇总清空）——url 条目
+  （`playCounts` 按 `entry.key || entry.url` 计数，队列空时汇总清空）——url 条目
   的播放次数可追踪，复测定位不再靠猜。
 - **构建标记** — 客户端 build tag 升级为 `rc15-20260817`（`plugin-client.js` 源与
   `bundle/lib/client.js` 同步；硬刷新后 DevTools 控制台可见该行）。
