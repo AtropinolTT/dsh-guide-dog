@@ -949,7 +949,7 @@ return {
     // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
-    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null }
+    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0 }
     function getTtsToken(sid) {
       return host.call('guide-dog/tts-token', { sessionId: sid }).then(function (r) {
         return (r && r.ok && r.token) ? r.token : ''
@@ -994,16 +994,17 @@ return {
       }).catch(function () { /* 解码失败：跳过该块 */ })
     }
     async function playStreamEntry(entry, sid) {
+      // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
+      const playId = ++streamPlayer.playSeq
       if (streamPlayer.active) { stopStreamPlayback() } // 新任务覆盖（v2.1 语义）
       // C3 修复（2026-08-16 审稿）：token 为**单次消费**（consumeTtsToken 即删）——每句都必须重新签发，
       // 不得缓存复用（旧代码 `if (!streamPlayer.token)` 只取一次 → 第二句起 403）。
       streamPlayer.token = await getTtsToken(sid)
-      if (!streamPlayer.token) { showToast('流式播放失败：无 token'); return }
+      if (!streamPlayer.token) { setCallState({ phase: 'listening', error: '流式播放失败：无 token' }); showToast('流式播放失败：无 token'); return }
       const cfg = voiceState.cfg || {}
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
       streamPlayer.active = true
       streamPlayer.nextTime = 0
-      const AC = window.AudioContext || window.webkitAudioContext
       const audioCtx = ensureStreamCtx()
       try { await audioCtx.resume() } catch (e) { /* ignore */ }
       setCallState({ phase: 'speaking' })
@@ -1035,10 +1036,20 @@ return {
         }
         if (acc.length > 0) { const wav = pcmToWav(acc, sr); scheduleChunk(audioCtx, wav) }
       } catch (e) {
+        // R15 修复：新播放已接管（playSeq 已递增）→ 旧 abort rejection 直接退出，不拆新播放状态
+        if (playId !== streamPlayer.playSeq) return
         if (streamPlayer.active) {
           streamPlayer.active = false
           setCallState({ phase: 'listening', error: '播放中断' })
-          showToast('播放中断，已尝试重连')
+          // 重连一次（C3：每句已重新取 token，playStreamEntry 内部即新 token + GET）
+          if (!playStreamEntry._retried) {
+            playStreamEntry._retried = true
+            showToast('播放中断，已尝试重连')
+            playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
+            setTimeout(function () { playStreamEntry._retried = false }, 5000)
+          } else {
+            showToast('播放中断')
+          }
         }
       } finally {
         streamPlayer.controller = null
