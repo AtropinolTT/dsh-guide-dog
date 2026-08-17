@@ -843,6 +843,7 @@ return {
     // RC20-F 布局常量：两 pill 同宽（PILL_W），右缘距输入框 7px；通话 pill 上缘/语音 pill 下缘对齐卡片
     const PILL_W = 104
     const PILL_H = 34
+    let measureLogged = false // 诊断：测量彻底失败仅记录一次（防刷屏）
     ctx.effect(function () {
       try {
         loadVoiceCfg()
@@ -886,24 +887,37 @@ return {
                   try {
                     const wdoc = window && window.document
                     if (!wdoc || typeof wdoc.querySelector !== 'function') { setPos(null); return }
-                    // 量取输入卡片：优先官方 slot wrapper [data-slot=conversation.composer.bar]，
-                    // 回退 [data-composer-seat]（seat 顶含空 dock 行 + gap6 − 负 margin9 → 卡片上缘 ≈ top−3）。
+                    // 量取输入卡片。坑（RC20-F 实测）：slot outlet 包装是 display:contents（无几何盒，
+                    // getBoundingClientRect 全 0）——直接量 [data-slot=…] 会得到 0 尺寸并永远卡 null；
+                    // 必须先取其子元素（组件根，带 padding 的真实盒）再量。尺寸异常时逐级回退：
+                    // bar 组件根 → [data-composer-seat]（卡片上缘 ≈ top−3，下缘 = bottom−8）。
                     const bar = wdoc.querySelector('[data-slot="conversation.composer.bar"]')
-                    const seat = wdoc.querySelector('[data-composer-seat]')
+                    const barRoot = bar && bar.firstElementChild ? bar.firstElementChild : null
                     let top = 0, bottom = 0, width = 0, left = 0
-                    if (bar) {
-                      const b = bar.getBoundingClientRect()
-                      if (!b || !b.width || !b.height) { setPos(null); return }
-                      top = b.top // 卡片上缘（bar 无 padding-top；notice 场景近似）
-                      bottom = b.bottom - 8 // bar padding-bottom 8px → 卡片下缘
-                      left = b.left; width = b.width
-                    } else if (seat) {
-                      const r = seat.getBoundingClientRect()
-                      if (!r || !r.width || !r.height) { setPos(null); return }
-                      top = r.top - 3
-                      bottom = r.bottom - 8
-                      left = r.left; width = r.width
-                    } else { setPos(null); return }
+                    if (barRoot) {
+                      const b = barRoot.getBoundingClientRect()
+                      if (b && b.width && b.height) {
+                        top = b.top // 卡片上缘（bar 根无 padding-top；notice 场景近似）
+                        bottom = b.bottom - 8 // bar 根 padding-bottom 8px → 卡片下缘
+                        left = b.left; width = b.width
+                      }
+                    }
+                    if (!width) {
+                      const seat = wdoc.querySelector('[data-composer-seat]')
+                      if (seat) {
+                        const r = seat.getBoundingClientRect()
+                        if (r && r.width && r.height) {
+                          top = r.top - 3 // seat 顶 = 空 dock 行 + gap6 − 负 margin9 → 卡片上缘 ≈ top−3
+                          bottom = r.bottom - 8
+                          left = r.left; width = r.width
+                        }
+                      }
+                    }
+                    if (!width) {
+                      // 诊断（仅一次）：bar 根与 seat 均无几何盒时记录现场（F12 排查定位）
+                      if (!measureLogged) { measureLogged = true; try { gdLog('measure no-bar-root no-seat') } catch (e) { /* ignore */ } }
+                      setPos(null); return // 测量失败 → 本 tick 隐藏，下个 tick 重试
+                    }
                     const cardW = Math.min(width - 32, 780) // --dsh-composer-card-max-width=748+32；side-clearance 16
                     const cardLeft = left + Math.max(0, (width - cardW) / 2)
                     const pillRight = cardLeft - 7 // RC20-F：两 pill 右缘距输入框 7px
