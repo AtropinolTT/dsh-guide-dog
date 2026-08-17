@@ -59,4 +59,24 @@ ok(count(client, 'new Audio(String(url))') === 1, 'client per-entry Audio only i
 ok(client.includes('requeueVoiceEntry(cur.entry, cur.sid)'), 'client stop requeue current')
 ok(client.includes('requeueVoiceEntry(pend.entry, pend.sid)'), 'client stop requeue pending')
 
+// ---- 静态契约（Task 3：去重） ----
+ok(host.includes('function replayDup('), 'host replayDup pure fn')
+ok(host.includes('const lastStreamText = new Map()'), 'host lastStreamText map')
+ok(host.includes('const lastVoiceText = new Map()'), 'host lastVoiceText map')
+ok(host.includes("'[gd-host] skip replay text='"), 'host replay skip log')
+ok(host.includes("'[gd-host] skip voice-dup text='"), 'host voice-dup skip log')
+ok(host.includes('lastStreamText.set(sid, { text: pc, at: now3 })'), 'host replay window set')
+ok(host.includes('lastVoiceText.set(sid, { text: clean, at: now4 })'), 'host voice-dup window set')
+
+// ---- 行为（Task 3：窗口去重判定） ----
+const replaySrc = extractFn(host, 'replayDup')
+ok(!!replaySrc, 'extract replayDup')
+if (replaySrc) {
+  const replayDup = new Function('return ' + replaySrc)()
+  ok(replayDup(null, 'x', 0, 10000) === false, 'replayDup no prev')
+  ok(replayDup({ text: 'x', at: 0 }, 'x', 5000, 10000) === true, 'replayDup same within window')
+  ok(replayDup({ text: 'x', at: 0 }, 'x', 15000, 10000) === false, 'replayDup same after window')
+  ok(replayDup({ text: 'y', at: 0 }, 'x', 5000, 10000) === false, 'replayDup different text')
+}
+
 process.exit(fail === 0 ? 0 : 1)
