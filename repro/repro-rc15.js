@@ -83,4 +83,8 @@ if (replaySrc) {
   ok(replayDup({ text: 'y', at: 0 }, 'x', 5000, 10000) === false, 'replayDup different text')
 }
 
+// ---- 静态契约（RC16：通话输入遵循同一设备设置） ----
+ok(count(client, 'getUserMedia(micAudioReq())') === 2, 'voice + call share mic constraint')
+ok(count(client, 'getUserMedia({ audio: true })') === 0, 'no hardcoded audio-only gUM')
+
 process.exit(fail === 0 ? 0 : 1)

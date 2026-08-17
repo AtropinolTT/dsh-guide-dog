@@ -288,6 +288,11 @@ return {
     let micSeconds = 0
     let micLang = 'auto'
     let micDeviceId = '' // 用户选择的输入设备（设置页下拉）
+    // RC16（2026-08-17 通话输入修复）：采集约束单一来源——语音模式与通话模式共用同一设备设置。
+    // 旧实现通话模式硬编码 { audio: true }（忽略 deviceId）→ 该流上 recorder 不产出数据、段静默丢弃。
+    function micAudioReq() {
+      return micDeviceId ? { audio: { deviceId: { exact: micDeviceId } } } : { audio: true }
+    }
     let micMime = 'audio/webm' // 实际 MediaRecorder mime（wav 优先：增量切片可解码）
     let partialAcc = '' // 累积预览文本（wav 增量模式：每次只含新音频文本，需累积显示）
     // 实时预览（partial）转写状态（2026-08-15 用户需求：边说边显示识别结果于输入框）
@@ -546,9 +551,8 @@ return {
             }, [effective, sid, tick])
             const startRec = function () {
               try {
-                // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认
-                const audioReq = micDeviceId ? { audio: { deviceId: { exact: micDeviceId } } } : { audio: true }
-                navigator.mediaDevices.getUserMedia(audioReq).then(function (stream) {
+                // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认（RC16：micAudioReq 单一来源）
+                navigator.mediaDevices.getUserMedia(micAudioReq()).then(function (stream) {
                   // 音量检测：MediaRecorder 之外并行接 AnalyserNode（2026-08-15 诊断：浏览器录 RDP 虚拟麦克风静音）
                   let analyser = null
                   let volTimer = null
@@ -880,7 +884,8 @@ return {
       setCallState({ active: true, phase: 'listening', recording: false, error: null })
       callActiveRpc('session', true) // C4：持久通话激活（Task 10 进度播报 / Task 11 下行流式判据）
       try {
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+        // RC16：通话输入遵循同一设备设置（旧 { audio: true } 硬编码 → 流上 recorder 不产出数据）
+        navigator.mediaDevices.getUserMedia(micAudioReq()).then(function (stream) {
           // AC 获取（Phase 1 已验证模式）：全局优先，window 兜底
           var AC = null
           try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
@@ -1020,7 +1025,14 @@ return {
       if (!stopped) {
         // 防御：recorder 未运行 / stop 失败 → onstop 不会触发，按现有数据直接上传，避免卡 processing
         if (rec && rec.gdChunks.length) uploadSegmentBlob(new Blob(rec.gdChunks, { type: 'audio/webm' }))
-        else setCallState({ phase: 'listening', error: null })
+        else {
+          // RC16 诊断（仅日志）：recorder 无数据 → 记录现场（轨道状态）供 F12 排查
+          try {
+            const tracks = callMic && callMic.stream ? callMic.stream.getTracks().map(function (t) { return t.kind + ':' + t.readyState }).join(',') : 'no-stream'
+            gdLog('call seg empty rec=' + (rec ? rec.state : 'null') + ' chunks=' + (rec ? rec.gdChunks.length : 0) + ' tracks=' + tracks)
+          } catch (e) { /* ignore */ }
+          setCallState({ phase: 'listening', error: null })
+        }
       }
     }
 
@@ -1046,7 +1058,11 @@ return {
         if (rec.gdStopped) return
         rec.gdStopped = true
         if (rec.gdAbort) return // stopCall 中止：不提交
-        if (!rec.gdChunks.length) { setCallState({ phase: 'listening', error: null }); return }
+        if (!rec.gdChunks.length) {
+          // RC16 诊断（仅日志）：录了但零数据 → 流/recorder 异常（F12 排查）
+          try { gdLog('call seg onstop no chunks rec=' + rec.state) } catch (e) { /* ignore */ }
+          setCallState({ phase: 'listening', error: null }); return
+        }
         uploadSegmentBlob(new Blob(rec.gdChunks, { type: 'audio/webm' }))
       }
       return rec
