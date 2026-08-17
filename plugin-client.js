@@ -607,6 +607,7 @@ return {
           '.gd-float-pill{display:inline-flex;align-items:center;gap:4px;height:34px;padding:0 10px;border-radius:100px;border:1px solid var(--dsw-alias-border-l2,#ccc);background:var(--dsw-alias-button-floating-fill,#fff);box-shadow:var(--dsw-shadow-lv2,0 2px 8px rgba(0,0,0,.12));font-family:inherit;font-size:12px;color:var(--dsw-alias-label-primary,#333);cursor:pointer;white-space:nowrap}' +
           '.gd-float-icon{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:none;border-radius:50%;background:transparent;cursor:pointer;font-family:inherit;font-size:14px}' +
           '.gd-panel-up{position:absolute;bottom:calc(100% + 8px);left:0;width:260px;z-index:1000;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l1,#ddd);border-radius:10px;padding:12px;box-shadow:0 4px 16px rgba(0,0,0,.15);font-family:inherit;font-size:13px;color:var(--dsw-alias-label-secondary,#333)}' +
+          '.gd-panel-left{position:absolute;right:calc(100% + 8px);top:0;width:200px;z-index:1000;background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l1,#ddd);border-radius:10px;padding:12px;box-shadow:0 4px 16px rgba(0,0,0,.15);font-family:inherit;font-size:13px;color:var(--dsw-alias-label-secondary,#333)}' +
           '.gd-toast{position:fixed;right:16px;bottom:16px;max-width:380px;display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-primary);font-size:12px;line-height:1.5;box-shadow:0 4px 16px rgba(0,0,0,.18);pointer-events:auto;animation:gd-toast-in .18s ease-out}' +
           '.gd-toast-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-error-primary);flex:none}' +
           '.gd-toast-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
@@ -652,7 +653,182 @@ return {
     function callSid() { return (callSessionRef && callSessionRef.sid) || '' }
     function callActions() { return (callSessionRef && callSessionRef.actions) || null }
 
-    // ============ 统一悬浮通话/语音 dock（RC20：输入框正左侧悬浮、双折叠向上展开） ============
+    // ---- 输入框内录音话筒（conversation.input.left，order 30）：RC20-F 语音 pill 的麦克风回到输入框内部 ----
+    // 与 dock 语音 pill（开关+语言）分工：此组件只管单次录音（M9 归属 / partial 预览 / vol 检测 / 卸载清理），
+    // 语音模式播放轮询留在 dock（tick 驱动）。语言检测默认值 micLang 由 dock 语音面板设置（共享模块变量）。
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.input.left', function () {
+          return slots.register(
+            { name: 'conversation.input.left', id: 'guide-dog-mic', order: 30, label: function () { return 'Guide Dog mic' } },
+            function (props) {
+              const sid = props.sessionId || ''
+              const state = React.useState({ phase: 0, seconds: 0, lang: micLang, error: null }) // mic: 0 idle / 1 recording / 2 transcribing
+              const s = state[0]; const set = state[1]
+              const [, force] = React.useState(0)
+              React.useEffect(function () {
+                if (!localeSvc || typeof localeSvc.subscribe !== 'function') return
+                return localeSvc.subscribe(function () { force(Date.now() % 100000) })
+              }, [])
+              // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
+              React.useEffect(function () {
+                return function () {
+                  if (recSessionRef) recSessionRef.alive = false // M9：标记录音已死 → 迟到的 onstop 丢弃
+                  if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
+                  if (micRec) {
+                    try { micRec.rec.stop() } catch (e) { /* ignore */ }
+                    try { micRec.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                    micRec = null
+                  }
+                }
+              }, [])
+              // 单次录音（与原 input.left 语音行同款逻辑：M9 归属 / partial 预览 / vol 检测）
+              const startRec = function () {
+                try {
+                  // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认（RC16：micAudioReq 单一来源）
+                  navigator.mediaDevices.getUserMedia(micAudioReq()).then(function (stream) {
+                    let analyser = null
+                    let volTimer = null
+                    try {
+                      var AC = null
+                      try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
+                      if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
+                      if (AC) {
+                        const actx = new AC()
+                        const src = actx.createMediaStreamSource(stream)
+                        analyser = actx.createAnalyser()
+                        analyser.fftSize = 1024
+                        src.connect(analyser)
+                        if (typeof actx.resume === 'function') { try { actx.resume() } catch (e) { /* ignore */ } }
+                        const buf = new Uint8Array(analyser.fftSize)
+                        let silentMs = 0
+                        if (timerSvc && typeof timerSvc.interval === 'function') {
+                          volTimer = timerSvc.interval(function () {
+                            try {
+                              analyser.getByteTimeDomainData(buf)
+                              let sum = 0
+                              for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
+                              const rms = Math.sqrt(sum / buf.length)
+                              if (rms >= 0.008) {
+                                silentMs = 0
+                                set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
+                              } else {
+                                silentMs += 500
+                                set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
+                              }
+                            } catch (e) { /* ignore */ }
+                          }, 500)
+                        }
+                      }
+                    } catch (e) { analyser = null }
+                    micMime = 'audio/wav'
+                    let rec = null
+                    try {
+                      if (typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/wav')) {
+                        rec = new MediaRecorder(stream, { mimeType: 'audio/wav' })
+                      }
+                    } catch (e) { rec = null }
+                    if (!rec) {
+                      micMime = 'audio/webm'
+                      try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+                    }
+                    micChunks = []; micSeconds = 0
+                    rec.ondataavailable = function (ev) {
+                      if (ev.data && ev.data.size > 0) micChunks.push(ev.data)
+                      micSeconds += 1
+                      set(function (prev) { return Object.assign({}, prev, { seconds: micSeconds }) })
+                      const max = (voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.maxSeconds) || 60
+                      if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
+                    }
+                    rec.onstop = function () {
+                      if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
+                      if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
+                      partialStale = true
+                      // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，闭包里的 sid/inputActions
+                      // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交
+                      if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return
+                      transcribe(sid, props.inputActions, set)
+                    }
+                    recSessionRef = { sid: sid, alive: true }
+                    rec.start(1000)
+                    micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
+                    set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
+                    if (!analyser) {
+                      set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
+                    }
+                    // 实时预览：每 3s 把新增音频送去转写（WAV 增量可解码），结果累积进输入框 draft
+                    partialBusy = false; partialIdx = 0; partialStale = false; partialAcc = ''
+                    if (timerSvc && typeof timerSvc.interval === 'function') {
+                      partialTimer = timerSvc.interval(function () {
+                        if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
+                        partialBusy = true
+                        const isWav = micMime.indexOf('wav') >= 0
+                        const parts = isWav ? micChunks.slice(partialIdx) : micChunks.slice(0)
+                        partialIdx = micChunks.length
+                        const build = isWav ? buildWavBlob(parts) : Promise.resolve(new Blob(parts, { type: micMime }))
+                        build.then(function (blob) {
+                          if (!blob) { partialBusy = false; return }
+                          return blob.arrayBuffer().then(function (buf) {
+                            const bytes = new Uint8Array(buf)
+                            let bin = ''
+                            for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+                            return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: micMime, sessionId: sid, language: micLang, partial: true })
+                          })
+                        }).then(function (r) {
+                          partialBusy = false
+                          // RC20：partial 预览插入用 props.inputActions（原版引用未声明 inputActions 的 ReferenceError 已修）
+                          if (!partialStale && r && r.ok && r.text) {
+                            if (isWav) { partialAcc += (partialAcc ? ' ' : '') + r.text; insertText(props.inputActions, partialAcc) }
+                            else { insertText(props.inputActions, r.text) }
+                          }
+                        }).catch(function () { partialBusy = false })
+                      }, 3000)
+                    }
+                    playStartTone()
+                  }).catch(function (err) {
+                    if (micRec) return
+                    const name = err && err.name
+                    set(function (prev) { return Object.assign({}, prev, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }) })
+                  })
+                } catch (e) { set(function (prev) { return Object.assign({}, prev, { error: 'mic_denied' }) }) }
+              }
+              const toggleMic = function () {
+                if (s.phase === 1) {
+                  const r = micRec
+                  micRec = null
+                  if (r) {
+                    if (r.volTimer) { try { r.volTimer() } catch (e) { /* ignore */ } }
+                    try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+                  }
+                  return
+                }
+                if (s.phase === 2) return
+                startRec()
+              }
+              const micErrText = {
+                mic_denied: t('voice.errMicDenied'), no_device: t('voice.errNoDevice'),
+                empty_speech: s.diag && s.diag.indexOf('no-data') === 0 ? t('voice.errNoData') + '（' + s.diag.slice(7) + '）' : t('voice.errEmptySpeech'),
+                stt_failed: t('voice.errSttFailed'), stt_timeout: t('voice.errSttTimeout'), engine_unavailable: t('voice.errEngine'),
+                insert_failed: t('voice.insertFailed'),
+              }[s.error] || (s.error ? t('voice.transcribeFailed') + '（' + s.error + '）' : null)
+              const micTip = s.phase === 1 ? t('voice.stopRec') : (s.phase === 2 ? t('voice.transcribing') : t('voice.input'))
+              return h('div', { className: 'gd-voice' },
+                windowCannotRecord()
+                  ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', rel: 'noreferrer', title: t('voice.browserBlock') }, micIcon(false))
+                  : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
+                s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
+                s.phase === 1 && s.vol ? h('span', {
+                  className: 'gd-vol',
+                  title: s.vol === 'voice' ? t('voice.volVoice') : (s.vol === 'noana' ? t('voice.volNoana') : t('voice.volSilent')),
+                  style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : (s.vol === 'noana' ? '#888' : 'var(--dsw-alias-state-error-primary, #c62828)') },
+                }, s.vol === 'voice' ? t('voice.volOn') : (s.vol === 'noana' ? t('voice.volNoanaShort') : t('voice.volSilentShort'))) : null,
+                micErrText ? h('span', { className: 'gd-err', title: micErrText }, micErrText) : null)
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ============ 统一悬浮通话/语音 dock（RC20-F：输入框左缘双 pill，通话上缘/语音下缘对齐、同宽、右缘 7px） ============
     // 挂载 conversation.input.dock（会话级座位：新会话即渲染——解决"新对话无法从通话模式开始"）。
     // 部件本体 position:fixed 悬浮于输入卡片正左侧（垂直对齐工具行）：量取官方 [data-composer-seat]
     // （ui-conversation 自身也用它定位 composer）→ 按列内居中公式推出卡片左缘；测量失败 → 隐藏不错位。
@@ -664,6 +840,9 @@ return {
       setCallState({ active: true, phase: 'listening', recording: false })
       startCall(sid, actions) // RC13：归属（sid + inputActions）开播时刻捕获
     }
+    // RC20-F 布局常量：两 pill 同宽（PILL_W），右缘距输入框 7px；通话 pill 上缘/语音 pill 下缘对齐卡片
+    const PILL_W = 104
+    const PILL_H = 34
     ctx.effect(function () {
       try {
         loadVoiceCfg()
@@ -707,14 +886,31 @@ return {
                   try {
                     const wdoc = window && window.document
                     if (!wdoc || typeof wdoc.querySelector !== 'function') { setPos(null); return }
+                    // 量取输入卡片：优先官方 slot wrapper [data-slot=conversation.composer.bar]，
+                    // 回退 [data-composer-seat]（seat 顶含空 dock 行 + gap6 − 负 margin9 → 卡片上缘 ≈ top−3）。
+                    const bar = wdoc.querySelector('[data-slot="conversation.composer.bar"]')
                     const seat = wdoc.querySelector('[data-composer-seat]')
-                    if (!seat) { setPos(null); return }
-                    const r = seat.getBoundingClientRect()
-                    if (!r || !r.width || !r.height) { setPos(null); return }
-                    const cardW = Math.min(r.width - 32, 780) // --dsh-composer-card-max-width=748+32；side-clearance 16
-                    const cardLeft = r.left + Math.max(0, (r.width - cardW) / 2)
-                    const toolY = r.bottom - 24 // 工具行垂直中心（卡片底内收约 24px）
-                    setPos({ left: cardLeft - 10 - 34, top: toolY - 17 }) // 34px 高 pill，卡片左缘外 10px
+                    let top = 0, bottom = 0, width = 0, left = 0
+                    if (bar) {
+                      const b = bar.getBoundingClientRect()
+                      if (!b || !b.width || !b.height) { setPos(null); return }
+                      top = b.top // 卡片上缘（bar 无 padding-top；notice 场景近似）
+                      bottom = b.bottom - 8 // bar padding-bottom 8px → 卡片下缘
+                      left = b.left; width = b.width
+                    } else if (seat) {
+                      const r = seat.getBoundingClientRect()
+                      if (!r || !r.width || !r.height) { setPos(null); return }
+                      top = r.top - 3
+                      bottom = r.bottom - 8
+                      left = r.left; width = r.width
+                    } else { setPos(null); return }
+                    const cardW = Math.min(width - 32, 780) // --dsh-composer-card-max-width=748+32；side-clearance 16
+                    const cardLeft = left + Math.max(0, (width - cardW) / 2)
+                    const pillRight = cardLeft - 7 // RC20-F：两 pill 右缘距输入框 7px
+                    setPos({
+                      callLeft: pillRight - PILL_W, callTop: top, // 通话 pill 上缘对齐卡片上缘
+                      voiceLeft: pillRight - PILL_W, voiceTop: bottom - PILL_H, // 语音 pill 下缘对齐卡片下缘
+                    })
                   } catch (e) { setPos(null) }
                 }
                 measure()
@@ -754,162 +950,24 @@ return {
                   }
                 }).catch(function () {}).then(function () { pollBusy = false })
               }, [effective, sid, tick, locTick])
-              // ---- 单次录音（语音面板）：与原 input.left 语音行同款逻辑（M9 归属 / partial 预览 / vol 检测） ----
-              const startRec = function () {
-                try {
-                  // 输入设备选择（设置页下拉，存 voiceInput.deviceId）；空 = 系统默认（RC16：micAudioReq 单一来源）
-                  navigator.mediaDevices.getUserMedia(micAudioReq()).then(function (stream) {
-                    // 音量检测：MediaRecorder 之外并行接 AnalyserNode（2026-08-15 诊断：浏览器录 RDP 虚拟麦克风静音）
-                    let analyser = null
-                    let volTimer = null
-                    try {
-                      // AC 获取修复（2026-08-15）：沙箱里 AudioContext 以全局暴露，window.AudioContext 可能为
-                      // undefined → 先前写法静默跳过音量检测（●声/○静音 永不显示）。全局优先，window 兜底。
-                      var AC = null
-                      try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
-                      if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
-                      if (AC) {
-                        const actx = new AC()
-                        const src = actx.createMediaStreamSource(stream)
-                        analyser = actx.createAnalyser()
-                        analyser.fftSize = 1024
-                        src.connect(analyser)
-                        if (typeof actx.resume === 'function') { try { actx.resume() } catch (e) { /* ignore */ } }
-                        // 每 500ms 读 RMS：UI 显示"检测到声音/未检测到"；持续静音 2.5s 提示
-                        const buf = new Uint8Array(analyser.fftSize)
-                        let silentMs = 0
-                        if (timerSvc && typeof timerSvc.interval === 'function') {
-                          volTimer = timerSvc.interval(function () {
-                            try {
-                              analyser.getByteTimeDomainData(buf)
-                              let sum = 0
-                              for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
-                              const rms = Math.sqrt(sum / buf.length)
-                              if (rms >= 0.008) {
-                                silentMs = 0
-                                set(function (prev) { return Object.assign({}, prev, { vol: 'voice' }) })
-                              } else {
-                                silentMs += 500
-                                set(function (prev) { return Object.assign({}, prev, { vol: silentMs >= 2500 ? 'silent' : 'quiet' }) })
-                              }
-                            } catch (e) { /* ignore */ }
-                          }, 500)
-                        }
-                      }
-                    } catch (e) { analyser = null }
-                    // 2026-08-15：优先 audio/wav（PCM 增量切片可解码）；webm 增量切片实测无法解码
-                    micMime = 'audio/wav'
-                    let rec = null
-                    try {
-                      if (typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/wav')) {
-                        rec = new MediaRecorder(stream, { mimeType: 'audio/wav' })
-                      }
-                    } catch (e) { rec = null }
-                    if (!rec) {
-                      micMime = 'audio/webm'
-                      try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
-                    }
-                    micChunks = []; micSeconds = 0
-                    rec.ondataavailable = function (ev) {
-                      if (ev.data && ev.data.size > 0) micChunks.push(ev.data)
-                      micSeconds += 1
-                      set(function (prev) { return Object.assign({}, prev, { seconds: micSeconds }) })
-                      const max = (voiceState.cfg && voiceState.cfg.voiceInput && voiceState.cfg.voiceInput.maxSeconds) || 60
-                      if (micSeconds >= max && rec.state === 'recording') { try { rec.stop() } catch (e) { /* ignore */ } }
-                    }
-                    rec.onstop = function () {
-                      if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
-                      if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
-                      partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
-                      // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，闭包里的 sid/inputActions
-                      // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交
-                      if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return // M9：丢弃陈旧提交
-                      transcribe(sid, props.inputActions, set)
-                    }
-                    recSessionRef = { sid: sid, alive: true } // M9：录音归属当前会话（onstop 提交前校验）
-                    rec.start(1000)
-                    micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
-                    set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
-                    // 音量检测不可用（AC 获取失败）：phase:1 之后再设 noana（避免被上面的 vol:null 覆盖）
-                    if (!analyser) {
-                      set(function (prev) { return Object.assign({}, prev, { vol: 'noana' }) })
-                    }
-                    // 实时预览：每 3s 把"上次 partial 之后"的新增音频送去转写（WAV 增量可解码，host 常驻 worker
-                    // 单次 ~0.8s），结果累积进输入框 draft（预览）。webm fallback 退化为全量重传 + 覆盖显示。
-                    partialBusy = false; partialIdx = 0; partialStale = false; partialAcc = ''
-                    if (timerSvc && typeof timerSvc.interval === 'function') {
-                      partialTimer = timerSvc.interval(function () {
-                        if (partialBusy || partialStale || !micChunks.length || micChunks.length <= partialIdx) return
-                        partialBusy = true
-                        const isWav = micMime.indexOf('wav') >= 0
-                        const parts = isWav ? micChunks.slice(partialIdx) : micChunks.slice(0)
-                        partialIdx = micChunks.length
-                        const build = isWav ? buildWavBlob(parts) : Promise.resolve(new Blob(parts, { type: micMime }))
-                        build.then(function (blob) {
-                          if (!blob) { partialBusy = false; return }
-                          return blob.arrayBuffer().then(function (buf) {
-                            const bytes = new Uint8Array(buf)
-                            let bin = ''
-                            for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
-                            return host.call('guide-dog/transcribe', { audioB64: btoa(bin), mime: micMime, sessionId: sid, language: micLang, partial: true })
-                          })
-                        }).then(function (r) {
-                          partialBusy = false
-                          // RC20：partial 预览插入修正——原 input.left 版本引用未声明的 inputActions（ReferenceError
-                          // 被 catch 吞掉 → 预览从不生效），搬迁时改用 props.inputActions
-                          if (!partialStale && r && r.ok && r.text) {
-                            if (isWav) { partialAcc += (partialAcc ? ' ' : '') + r.text; insertText(props.inputActions, partialAcc) }
-                            else { insertText(props.inputActions, r.text) } // webm fallback：全量重传，覆盖显示
-                          }
-                        }).catch(function () { partialBusy = false })
-                      }, 3000)
-                    }
-                    playStartTone() // 录音开始提示音：确认录音通道已真正启动
-                  }).catch(function (err) {
-                    // 防御：若 micRec 已建立（录音已在运行），说明异常发生在启动后（不应误报权限错误）
-                    if (micRec) return
-                    const name = err && err.name
-                    set(function (prev) { return Object.assign({}, prev, { error: (name === 'NotFoundError' || name === 'OverconstrainedError') ? 'no_device' : 'mic_denied' }) })
-                  })
-                } catch (e) { set(function (prev) { return Object.assign({}, prev, { error: 'mic_denied' }) }) }
-              }
-              const toggleMic = function () {
-                if (s.phase === 1) {
-                  const r = micRec
-                  micRec = null
-                  if (r) {
-                    if (r.volTimer) { try { r.volTimer() } catch (e) { /* ignore */ } }
-                    try { r.rec.stop() } catch (e) { /* ignore */ } try { r.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
-                  }
-                  return
-                }
-                if (s.phase === 2) return
-                startRec()
-              }
-              const micErrText = {
-                mic_denied: t('voice.errMicDenied'), no_device: t('voice.errNoDevice'),
-                empty_speech: s.diag && s.diag.indexOf('no-data') === 0 ? t('voice.errNoData') + '（' + s.diag.slice(7) + '）' : t('voice.errEmptySpeech'),
-                stt_failed: t('voice.errSttFailed'), stt_timeout: t('voice.errSttTimeout'), engine_unavailable: t('voice.errEngine'),
-                insert_failed: t('voice.insertFailed'),
-              }[s.error] || (s.error ? t('voice.transcribeFailed') + '（' + s.error + '）' : null)
               const vm = (voiceState.cfg && voiceState.cfg.voiceMode) || {}
               const voiceTip = t('voice.tip') + (effective ? t('voice.on') : t('voice.off')) + t('voice.tipMid') + (vm.default ? t('voice.on') : t('voice.off')) + t('voice.tipEnd')
-              const micTip = s.phase === 1 ? t('voice.stopRec') : (s.phase === 2 ? t('voice.transcribing') : t('voice.input'))
               const phaseText = { listening: t('call.listening'), processing: t('call.processing'), speaking: t('call.speaking'), idle: t('call.idle') }[callState.phase] || ''
               if (!pos) return null // 测量失败（无会话等）→ 隐藏，不错位
-              const pillStyle = { display: 'inline-flex', alignItems: 'center', gap: '4px', height: '34px', padding: '0 10px', borderRadius: '100px', border: '1px solid var(--dsw-alias-border-l2, #ccc)', background: 'var(--dsw-alias-button-floating-fill, #fff)', boxShadow: 'var(--dsw-shadow-lv2, 0 2px 8px rgba(0,0,0,0.12))', fontFamily: 'inherit', fontSize: '12px', color: 'var(--dsw-alias-label-primary, #333)', cursor: 'pointer', whiteSpace: 'nowrap' }
-              const iconBtn = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '24px', height: '24px', padding: 0, border: 'none', borderRadius: '50%', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '14px' }
+              const pillStyle = { display: 'inline-flex', alignItems: 'center', gap: '4px', boxSizing: 'border-box', width: PILL_W + 'px', height: PILL_H + 'px', padding: '0 8px', borderRadius: '17px', border: '1px solid var(--dsw-alias-border-l2, #ccc)', background: 'var(--dsw-alias-button-floating-fill, #fff)', boxShadow: 'var(--dsw-shadow-lv2, 0 2px 8px rgba(0,0,0,0.12))', fontFamily: 'inherit', fontSize: '11px', color: 'var(--dsw-alias-label-primary, #333)', cursor: 'pointer', whiteSpace: 'nowrap', overflow: 'hidden' }
+              const iconBtn = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: 'none', width: '22px', height: '22px', padding: 0, border: 'none', borderRadius: '50%', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '14px' }
               const rowStyle = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '6px 0' }
               const btnStyle = { padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--dsw-alias-border-l1, #ccc)', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '12px' }
-              const micPillBorder = myCall ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : (callState.recording ? { borderColor: '#c62828' } : {})
-              const micColor = myCall ? { color: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : (callState.recording ? { color: '#c62828' } : {})
+              const callBorder = myCall ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : (callState.recording ? { borderColor: '#c62828' } : {})
+              const callColor = myCall ? { color: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : (callState.recording ? { color: '#c62828' } : {})
               const segTitle = callState.mode === 'ptt' ? t('call.segPtt') : t('call.segVad')
               const micBtnStyle = Object.assign({}, btnStyle, callState.recording ? { background: '#c62828', color: '#fff' } : {})
-              return h('div', { className: 'gd-float-dock', style: { left: pos.left, top: pos.top } },
-                // ---- 通话 pill：点话筒 = 开始/挂断 ----
-                h('div', { className: 'gd-float-pill', style: micPillBorder, title: myCall ? t('call.stop') : t('call.start') },
-                  h('button', { className: 'gd-float-icon', style: micColor, onClick: function () { toggleCall(sid, props.inputActions) } }, myCall ? '🎙' : '🎤'),
-                  myCall ? h('span', null, phaseText + (callState.muted ? t('call.muted') : '')) : null,
+              const statusText = myCall ? (phaseText + (callState.muted ? t('call.muted') : '')) : ''
+              // ---- 通话 dock：固定于卡片左上方（上缘对齐卡片上缘），面板向上展开 ----
+              const callDock = h('div', { className: 'gd-float-dock', style: { left: pos.callLeft, top: pos.callTop } },
+                h('div', { className: 'gd-float-pill', style: Object.assign({}, pillStyle, callBorder), title: myCall ? t('call.stop') : t('call.start') },
+                  h('button', { className: 'gd-float-icon', style: callColor, onClick: function () { toggleCall(sid, props.inputActions) } }, '📞'),
+                  myCall ? h('span', { style: { flex: 'auto', textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis' } }, statusText) : null,
                   h('button', { className: 'gd-float-icon', title: callOpen ? t('call.close') : t('call.open'), onClick: function () { setCallOpen(!callOpen); if (voiceOpen) setVoiceOpen(false) } }, callOpen ? '▾' : '▴')),
                 callOpen ? h('div', { className: 'gd-panel-up' },
                   h('div', { style: rowStyle },
@@ -934,28 +992,19 @@ return {
                       h('option', { value: '0.8' }, '0.8x'),
                       h('option', { value: '1' }, '1x'),
                       h('option', { value: '1.2' }, '1.2x'))),
-                  callState.error ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: 6 } }, callState.error) : null) : null,
-                // ---- 语音 pill：点喇叭 = 切换语音模式 ----
+                  callState.error ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: 6 } }, callState.error) : null) : null)
+              // ---- 语音 dock：固定于卡片左下方（下缘对齐卡片下缘），面板向左展开（防与通话 pill 重叠） ----
+              const voiceDock = h('div', { className: 'gd-float-dock', style: { left: pos.voiceLeft, top: pos.voiceTop } },
                 h('div', { className: 'gd-float-pill', style: effective ? { borderColor: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}, title: voiceTip },
                   h('button', { className: 'gd-float-icon', style: effective ? { color: 'var(--dsw-alias-state-success-primary, #2e7d32)' } : {}, onClick: function () { setVoiceOverride(sid, !effective) } }, speakerIcon(effective)),
-                  h('span', null, effective ? t('voice.on') : t('voice.off')),
-                  h('button', { className: 'gd-float-icon', title: voiceOpen ? t('voice.close') : t('voice.open'), onClick: function () { setVoiceOpen(!voiceOpen); if (callOpen) setCallOpen(false) } }, voiceOpen ? '▾' : '▴')),
-                voiceOpen ? h('div', { className: 'gd-panel-up' },
+                  h('span', { style: { flex: 'auto', textAlign: 'center' } }, effective ? t('voice.on') : t('voice.off')),
+                  h('button', { className: 'gd-float-icon', title: voiceOpen ? t('voice.close') : t('voice.open'), onClick: function () { setVoiceOpen(!voiceOpen); if (callOpen) setCallOpen(false) } }, voiceOpen ? '▸' : '◂')),
+                voiceOpen ? h('div', { className: 'gd-panel-left' },
                   h('div', { style: rowStyle },
                     h('span', null, t('voice.title')),
-                    h('select', { className: 'gd-select', value: s.lang, title: t('voice.lang'), onChange: function (e) { micLang = e.target.value; set(function (prev) { return Object.assign({}, prev, { lang: e.target.value }) }) } },
-                      h('option', { value: 'auto' }, t('voice.auto')), h('option', { value: 'zh' }, t('voice.zh')), h('option', { value: 'en' }, t('voice.en')))),
-                  h('div', { style: rowStyle },
-                    windowCannotRecord()
-                      ? h('a', { className: 'gd-btn', href: '/guide-dog/recorder', target: '_blank', rel: 'noreferrer', title: t('voice.browserBlock') }, micIcon(false))
-                      : h('button', { className: 'gd-btn' + (s.phase === 1 ? ' gd-rec' : ''), title: micTip, onClick: toggleMic }, micIcon(s.phase === 1)),
-                    s.phase === 1 ? h('span', { className: 'gd-sec' }, s.seconds + 's') : null,
-                    s.phase === 1 && s.vol ? h('span', {
-                      className: 'gd-vol',
-                      title: s.vol === 'voice' ? t('voice.volVoice') : (s.vol === 'noana' ? t('voice.volNoana') : t('voice.volSilent')),
-                      style: { fontSize: 11, color: s.vol === 'voice' ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : (s.vol === 'noana' ? '#888' : 'var(--dsw-alias-state-error-primary, #c62828)') },
-                    }, s.vol === 'voice' ? t('voice.volOn') : (s.vol === 'noana' ? t('voice.volNoanaShort') : t('voice.volSilentShort'))) : null),
-                  micErrText ? h('div', { className: 'gd-err', style: { marginTop: 4 }, title: micErrText }, micErrText) : null) : null)
+                    h('select', { className: 'gd-select', defaultValue: micLang, title: t('voice.lang'), onChange: function (e) { micLang = e.target.value } },
+                      h('option', { value: 'auto' }, t('voice.auto')), h('option', { value: 'zh' }, t('voice.zh')), h('option', { value: 'en' }, t('voice.en'))))) : null)
+              return h('div', null, callDock, voiceDock)
             })
         })
       } catch (e) { return function () {} }

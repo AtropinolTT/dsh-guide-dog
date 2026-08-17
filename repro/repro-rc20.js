@@ -9,24 +9,32 @@ let fail = 0
 function ok(cond, msg) { if (cond) { console.log('PASS ' + msg) } else { fail++; console.log('FAIL ' + msg) } }
 function count(hay, needle) { return hay.split(needle).length - 1 }
 
-// ---- RC20 A：统一悬浮 dock（输入框正左侧）替代四处旧 UI ----
+// ---- RC20 A：统一悬浮 dock（RC20-F：通话 pill 上缘/语音 pill 下缘对齐输入框，右缘 7px，同宽） ----
 ok(client.includes('client build rc20-20260817'), 'client build tag rc20')
 ok(count(client, "'guide-dog-call-btn'") === 0, 'client header call btn removed')
 ok(count(client, "'guide-dog-call-panel'") === 0, 'client right call panel removed')
 ok(count(client, "'guide-dog-call-status'") === 0, 'client old dock status removed')
-ok(count(client, "'guide-dog-voice'") === 0, 'client input.left voice row removed')
-ok(count(client, "'conversation.input.left'") === 0, 'client no input.left seat')
+ok(count(client, "'guide-dog-voice'") === 0, 'client old input.left voice row id removed')
 ok(count(client, "'conversation.session.header.actions'") === 0, 'client no session header actions seat')
 ok(client.includes("id: 'guide-dog-call-dock'"), 'client unified dock widget id')
-ok(client.includes("querySelector('[data-composer-seat]')"), 'client seat measure (official attr)')
+ok(client.includes("querySelector('[data-slot=\"conversation.composer.bar\"]')"), 'client bar slot measure')
+ok(client.includes("querySelector('[data-composer-seat]')"), 'client seat fallback measure')
 ok(client.includes('gd-float-dock'), 'client float dock class')
-ok(client.includes('gd-panel-up'), 'client upward panel class')
+ok(client.includes('gd-panel-up'), 'client upward panel class (call)')
+ok(client.includes('gd-panel-left'), 'client leftward panel class (voice)')
 ok(client.includes('function toggleCall('), 'client mic toggles call (start/hangup)')
 ok(client.includes('callOpen'), 'client call panel open state')
 ok(client.includes('voiceOpen'), 'client voice panel open state')
 ok(count(client, 'callPoll()') === 2, 'client call poll kept in dock (def + interval)')
 ok(client.includes('[effective, sid, tick, locTick]'), 'client voice poll re-triggers on tick')
 ok(client.includes('toggleCall(sid, props.inputActions)'), 'client dock toggleCall with inputActions')
+ok(client.includes("'📞'"), 'client handset icon restored')
+ok(count(client, 'const PILL_W = 104') === 1, 'client pill shared width const')
+ok(client.includes('cardLeft - 7'), 'client pill right edge 7px from card')
+ok(client.includes('callTop: top'), 'client call pill top aligned to card top')
+ok(client.includes('voiceTop: bottom - PILL_H'), 'client voice pill bottom aligned to card bottom')
+ok(count(client, "'conversation.input.left'") === 2, 'client input.left seat restored (mic row)')
+ok(client.includes("id: 'guide-dog-mic'"), 'client record mic back inside input')
 
 // ---- RC20 D：i18n 简体中文/英文（跟随 DSH 应用语言） ----
 ok(client.includes("ctx.get('locale')"), 'client locale service access')
