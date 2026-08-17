@@ -1691,8 +1691,11 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const kind = args && args.kind === 'session' ? 'session' : 'speaking'
           const active = !!(args && args.active)
           if (kind === 'session') {
-            if (active) callActiveSessions.add(String(sid))
-            else callActiveSessions.delete(String(sid))
+            if (active) {
+              callActiveSessions.add(String(sid))
+              // RC11：新通话 = 新队列——清掉挂断/刷新残留的旧条目，防陈旧内容重放
+              voiceQueue.delete(String(sid))
+            } else callActiveSessions.delete(String(sid))
           } else {
             callActiveFlags.set(String(sid), active)
           }
@@ -1957,6 +1960,9 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       } catch (e) { return function () {} }
     })
     // 下行主通道：assistant 消息 → 分句 → 流条目入队列（client 播放器识别 stream 条目走 GET）
+    // RC11：按 (turn,step) 去重——同一事件重复/重放时不重复入队
+    const lastStreamTurn = new Map() // sessionId -> 'turn:step'
+    function streamTurnKey(turn, step) { return String(turn) + ':' + String(step) }
     ctx.on('session/event', function (session, event) {
       try {
         if (!event || event.type !== 'assistant/message') return
@@ -1970,6 +1976,10 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
         const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
         if (!text) return
+        // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队（"同一内容重复播放"贡献因子）
+        const tkey = streamTurnKey(data.turn, data.step)
+        if (tkey !== 'undefined:undefined' && lastStreamTurn.get(sid) === tkey) return
+        lastStreamTurn.set(sid, tkey)
         const streamCfg = (cfg.call && cfg.call.stream) || {}
         const sentences = splitSentences(text, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
@@ -2032,6 +2042,24 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const cmd = args && args.cmd ? String(args.cmd) : ''
           if (!sid || !cmd) return { ok: false, error: 'bad_args' }
           if (cmd === 'clear-queue') { voiceQueue.delete(sid); return { ok: true } }
+          // RC11：打断直达 agent——steer 作为 next-step 输入注入运行中的回合（下一个 step
+          // 边界消费；DSH 无 step-only abort）。消息形状对齐 dsh-llm UserMessage。
+          if (cmd === 'interrupt') {
+            const text = args && typeof args.text === 'string' ? args.text.trim() : ''
+            if (!text) return { ok: false, error: 'bad_args' }
+            const agentsSvc = ctx.get('agents')
+            const agent = agentsSvc && typeof agentsSvc.get === 'function' ? agentsSvc.get(sid) : null
+            if (agent && typeof agent.steer === 'function') {
+              try {
+                const msg = { id: 'gd-interrupt:' + Date.now() + ':' + Math.random().toString(36).slice(2, 8), role: 'user', content: [{ type: 'text', text: text }], source: { kind: 'user' } }
+                await agent.steer(msg)
+                return { ok: true, delivered: true }
+              } catch (e) {
+                return { ok: false, error: 'steer_failed', message: String(e).slice(0, 200) }
+              }
+            }
+            return { ok: false, error: 'agent_unavailable' }
+          }
           return { ok: true }
         })
       } catch (e) { return function () {} }

@@ -20,7 +20,7 @@ return {
 
     // RC9 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc10-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc11-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -861,6 +861,8 @@ return {
       }
       callSegmentActive = false
       callActiveRpc('session', false) // C4：持久激活关闭
+      // RC11：挂断清 host 待播队列——防陈旧条目在下次通话/页面刷新后重放
+      host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
       setCallState({ active: false, phase: 'idle', recording: false })
       // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
       if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
@@ -945,6 +947,23 @@ return {
           // Task 13：语音命令拦截——命中命令则执行且不提交到对话
           const cmd = matchCallCommand(r.text)
           if (cmd) { runCallCommand(cmd); setCallState({ phase: 'listening' }); return }
+          // RC11：打断直达 agent——打断后 10s 内的首个转写段走 interrupt RPC（host 侧
+          // agent.steer 注入当前回合，下一个 step 边界消费），不再 submitInput 排队成新回合；
+          // agent 不可用时回退原路径（插入 + 提交）。
+          if (bargedAt && Date.now() - bargedAt < 10000) {
+            bargedAt = 0
+            host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'interrupt', text: r.text }).then(function (rr) {
+              if (!(rr && rr.ok)) {
+                const actions = gdInputActions
+                if (actions) { insertText(actions, r.text); submitInput(actions) }
+              }
+            }).catch(function () {
+              const actions = gdInputActions
+              if (actions) { insertText(actions, r.text); submitInput(actions) }
+            })
+            setCallState({ phase: 'listening' })
+            return
+          }
           const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
           if (actions) { insertText(actions, r.text); submitInput(actions) }
           setCallState({ phase: 'listening' })
@@ -1172,7 +1191,10 @@ return {
         // R15 修复：新播放已接管（playSeq 已递增）→ 旧 abort rejection 直接退出，不拆新播放状态
         if (playId !== streamPlayer.playSeq) return
         if (streamPlayer.active) {
-          streamPlayer.active = false
+          // RC11（V4-Pro 诊断确认）：重试前**完整停链**——已 src.start 的旧帧仍在播放，
+          // 仅置 active=false 会让重试以 firstSentence 另起新链（nextTime=0），同句在新旧
+          // 两条链上重叠 → "同一内容重复播放" + 同相 16bit PCM 叠加削波爆音。
+          stopStreamPlayback()
           setCallState({ phase: 'listening', error: '播放中断' })
           // 重连一次（C3：每句已重新取 token，playStreamEntry 内部即新 token + GET）
           if (!playStreamEntry._retried) {
@@ -1205,7 +1227,9 @@ return {
       notifyConsensusSpeech(false)
     }
     // Task 13：打断接线（spec §6.6）——Task 7 VAD 轮询在 phase==='speaking' 且发声时调用本回调
+    let bargedAt = 0 // RC11：最近一次打断时刻——打断后窗口内的首个转写段路由到 agent 打断（steer），而非排队新回合
     callBargeCb = function () {
+      bargedAt = Date.now()
       // 打断（spec §6.6）：停播 + 清缓冲（abort fetch 由 stopStreamPlayback 完成）
       stopStreamPlayback()
       setCallState({ phase: 'listening' })
