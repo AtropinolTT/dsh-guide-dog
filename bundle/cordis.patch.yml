@@ -1,0 +1,9 @@
+# dsh-guide-dog bundle patch
+#
+# Mounts the Guide Dog host half as one row in the web profile composition
+# (same shape as the published dsh-better-sidebar patch). The host half
+# registers the guide_dog_* tools globally, so every session sees them
+# without any dynamic plugin or per-session deployment.
+- insert:
+    - id: guide-dog
+      name: 'dsh-guide-dog'

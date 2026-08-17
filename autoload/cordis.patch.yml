@@ -1,0 +1,12 @@
+# Auto-deploy Guide Dog for every agent session (host composition layer).
+#
+# The dynamic Cordis plugin (gdog-*) is process-local: after a DSH restart the
+# definitions are gone and the plugin must be re-deployed. This row installs a
+# host-level plugin that reads the Guide Dog sources from the repo directory and
+# calls the dynamic Cordis runner (define + run) for every agent that is created
+# in this process. The first client activation per process still needs one
+# human approval (the browser runs the client half); afterwards the grant covers
+# future versions until the next restart.
+- insert:
+    - id: guide-dog-autoload
+      name: 'dsh-guide-dog-autoload'

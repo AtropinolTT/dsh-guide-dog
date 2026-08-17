@@ -1,3 +1,40 @@
+window.__ModuleLoader__.load({
+  id: 'dsh-guide-dog',
+  factory: (require) => {
+    var module = { exports: {} };
+    var exports = module.exports;
+    Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+    const React = require('react');
+    // Compatibility layer: the dynamic client half ran inside the
+    // cordis-client-runner sandbox, which injected `styles` and `host`
+    // (package-private RPC). In the static bundle `styles.insert` manages a
+    // <style> tag itself (returning a disposer, like the sandbox one) and
+    // `host.call` becomes a same-origin fetch against the JSON routes the
+    // host half registers under /guide-dog/api/.
+    const styles = {
+      insert: function (css) {
+        const el = document.createElement('style');
+        el.setAttribute('data-guide-dog', '');
+        el.textContent = css;
+        document.head.appendChild(el);
+        return function () { if (el.parentNode) el.parentNode.removeChild(el) };
+      },
+    };
+    const host = {
+      call: function (name, args) {
+        return fetch('/guide-dog/api/' + name, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(args === undefined ? {} : args),
+        }).then(function (r) {
+          if (!r.ok) return { ok: false, error: 'http ' + r.status };
+          return r.json().catch(function () { return { ok: false, error: 'bad json' } });
+        }).catch(function (e) {
+          return { ok: false, error: String((e && e.message) || e) };
+        });
+      },
+    };
+    const plugin = (() => {
 return {
   inject: ['slots'],
   async apply(ctx) {
@@ -1972,3 +2009,10 @@ return {
     bindGestureUnlock()
   },
 }
+
+    })();
+    exports.name = plugin.name || 'dsh-guide-dog';
+    exports.apply = plugin.apply;
+    return module.exports;
+  }
+});

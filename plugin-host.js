@@ -24,6 +24,27 @@ return {
     let indexChain = Promise.resolve()
     const players = new Map()
     const spokenTurns = new Map() // sessionId -> Set<turnSeq>
+    // RC13（三路评审定案）：双通道互斥——playOnHost 已在本机扬声器播放的文本，不得再经
+    // voice-mode/downlink 队列通道播一遍（本机 + 浏览器双响）。消费即删（同文本只挡一次，
+    // 用户合法要求重复播放不受影响）。
+    const hostSpoken = new Map() // sessionId -> Map<normalizedText, true>
+    function normSpeech(s) { return String(s || '').replace(/\s+/g, ' ').trim() }
+    function markHostSpoken(sid, text) {
+      const k = normSpeech(text)
+      if (!k) return
+      let m = hostSpoken.get(String(sid))
+      if (!m) { m = new Map(); hostSpoken.set(String(sid), m) }
+      m.set(k, true)
+    }
+    function wasHostSpoken(sid, text) {
+      const m = hostSpoken.get(String(sid))
+      if (!m) return false
+      const k = normSpeech(text)
+      if (!k || !m.has(k)) return false
+      m.delete(k) // 消费一次
+      if (!m.size) hostSpoken.delete(String(sid))
+      return true
+    }
 
     console.log('[guide-dog] apply shell=' + !!shell + ' fs=' + !!fsSvc + ' webServer=' + !!webServer + ' sandboxPolicy=' + !!sandboxPolicy + ' systemPrompt=' + !!systemPrompt + ' subprocess=' + !!subprocess + ' timer=' + !!timerSvc)
 
@@ -32,6 +53,16 @@ return {
       voiceMode: { default: false, sessions: {} },
       voiceInput: { autoSend: false, engine: 'whisper', language: 'auto', maxSeconds: 60, whisper: { python: 'python3', model: 'small' } },
       tts: { voiceEn: 'English_expressive_narrator', voiceZh: 'Chinese (Mandarin)_Gentle_Youth', speed: 0.95, format: 'mp3' },
+      call: {
+        mode: 'vad',
+        vad: { method: 'energy', threshold: 0.02, silenceMs: 700, minSpeechMs: 300, maxSegmentSeconds: 60, interruptMinMs: 300, echoTailMs: 1500 },
+        stream: { format: 'pcm', sampleRate: 24000, sentenceSplit: '。！？.!?\n', maxSentenceChars: 200 },
+        voice: 'English_expressive_narrator',
+        speed: 1.0,
+        progress: true,
+        consensus: { enabled: true, summaryWindowMs: 3000 },
+      },
+      a11y: { enabled: false, autoNarrate: true, visionCloud: true, summaryFirst: true },
     }
     function deepMerge(base, over) {
       if (over === null || typeof over !== 'object' || Array.isArray(over)) return over === undefined ? base : over
@@ -40,7 +71,6 @@ return {
       for (const k of Object.keys(over)) if (!(k in base)) out[k] = over[k]
       return out
     }
-    function probeKeys(o) { try { return o ? Object.keys(o).slice(0, 40) : [] } catch (e) { return [] } }
     let guideRoot = ''
     async function guideDogRoot() {
       if (guideRoot) return guideRoot
@@ -55,6 +85,7 @@ return {
     }
     let configCache = deepMerge(CONFIG_DEFAULTS, {})
     let configReady = Promise.resolve()
+    let configWriteChain = Promise.resolve() // A4（I3）：并发 set-config 串行化，防后写覆盖先写
     async function readTextFile(abs) {
       if (!fsSvc) return null
       try {
@@ -78,7 +109,7 @@ return {
     }
     function refreshConfig() { configReady = doRefreshConfig(); return configReady }
     function loadConfig() { return configCache }
-    async function saveConfig(patch) {
+    async function doSaveConfig(patch) {
       const root = await guideDogRoot()
       const next = deepMerge(configCache, patch || {})
       const dir = root + '/.guide-dog'
@@ -87,13 +118,20 @@ return {
         // 原子写：tmp → mv → chmod 600；写前保留 .bak 供解析失败回退
         const okTmp = await writeTextFile(dir + '/config.json.tmp', JSON.stringify(next, null, 2))
         if (!okTmp) return { ok: false, error: 'config_write_failed' }
-        await runRaw('cp -f ' + quote(dir + '/config.json') + ' ' + quote(dir + '/config.json.bak') + ' 2>/dev/null; mv -f ' + quote(dir + '/config.json.tmp') + ' ' + quote(dir + '/config.json') + '; ' + 'chmod 600 ' + quote(dir + '/config.json'), { timeoutMs: 10000 })
+        const mv = await runRaw('cp -f ' + quote(dir + '/config.json') + ' ' + quote(dir + '/config.json.bak') + ' 2>/dev/null; mv -f ' + quote(dir + '/config.json.tmp') + ' ' + quote(dir + '/config.json') + '; ' + 'chmod 600 ' + quote(dir + '/config.json'), { timeoutMs: 10000 })
+        if (mv.exitCode !== 0) return { ok: false, error: 'config_write_failed' } // M2：shell 链失败不得假成功
         configCache = next
         return { ok: true }
       } catch (e) {
         console.error('[guide-dog] config write failed', e)
         return { ok: false, error: 'config_write_failed' }
       }
+    }
+    function saveConfig(patch) {
+      // A4（I3）：串行化 —— 同一时刻只允许一个写，后续 patch 从前一结果合并
+      const p = configWriteChain.then(function () { return doSaveConfig(patch) })
+      configWriteChain = p.then(function () {}, function () {})
+      return p
     }
     async function writeStatus(patch) {
       try {
@@ -112,8 +150,22 @@ return {
 用法:
   python3 whisper_transcribe.py --audio <path> [--model base|small] [--language auto|zh|en] [--out-file <path>] --output json
   python3 whisper_transcribe.py --audio-b64-file <path> [--delete-b64] [--model base|small] [--language auto|zh|en] [--out-file <path>] --output json
-stdout 恒为单行 JSON; exit 恒 0（调用方以 ok 字段判断）。--out-file 可选：同时把同一 JSON 写入文件（host 端读取用）。"""
+  python3 whisper_transcribe.py --prewarm <dir> [--model base|small] [--out-file <path>] --output json   # 仅下载模型到 <dir>
+  python3 whisper_transcribe.py --serve [--model base|small]   # 常驻模式（2026-08-15：实时预览 worker）
+    stdin 每行一个 JSON 任务: {"id":N,"b64Path":"...","model":"base","language":"zh"}
+    stdout 每行一个 JSON 响应: {"id":N,"ok":true,"text":"...","language":"zh"}（模型懒加载并缓存，进程常驻）
+stdout 恒为单行 JSON; exit 恒 0（调用方以 ok 字段判断）。--out-file 可选：同时把同一 JSON 写入文件（host 端读取用）。
+
+模型来源（2026-08-14 修复：huggingface.co 网络不可达）：
+  - 优先加载本地目录 ~/.guide-dog/models/faster-whisper-<model>（零网络，插件预热/预下载）
+  - 缺失时回退按模型名从 HF 下载；HF_ENDPOINT 默认指向 hf-mirror.com 镜像
+"""
 import argparse, base64, json, os, sys, tempfile, time
+
+# 必须在 import huggingface_hub / faster_whisper 之前设置：
+# huggingface.co 在国内网络不可达（Errno 101），官方镜像 hf-mirror.com 可达（实测 ~2.2MB/s）
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+
 
 def emit(obj, out_file):
     text = json.dumps(obj, ensure_ascii=False)
@@ -126,6 +178,87 @@ def emit(obj, out_file):
             pass
     sys.exit(0)
 
+
+def resolve_model_ref(model):
+    """优先插件本地模型目录（~/.guide-dog/models/faster-whisper-<model>），回退模型名（镜像下载）。"""
+    try:
+        local = os.path.join(os.path.expanduser('~'), '.guide-dog', 'models', 'faster-whisper-' + model)
+        if os.path.isfile(os.path.join(local, 'model.bin')):
+            return local
+    except Exception:  # noqa: BLE001
+        pass
+    return model
+
+
+def _simplify(text, language_arg, info):
+    """简体化（2026-08-15 用户需求：中文输入默认转简体）。"""
+    try:
+        detected_zh = (language_arg == 'zh') or (getattr(info, 'language', None) or '').startswith('zh')
+        if detected_zh and text:
+            from zhconv import convert as _zh_convert
+            text = _zh_convert(text, 'zh-cn')
+    except Exception:  # noqa: BLE001
+        pass
+    return text
+
+
+def _transcribe_one(model, audio_path, language_arg):
+    """单次转写：返回 (ok, obj)。"""
+    from faster_whisper import WhisperModel
+    t0 = time.time()
+    model = WhisperModel(resolve_model_ref(model), device='cpu', compute_type='int8')
+    lang = None if language_arg == 'auto' else language_arg
+    segments, info = model.transcribe(audio_path, language=lang, vad_filter=True)
+    text = ''.join(s.text for s in segments).strip()
+    text = _simplify(text, language_arg, info)
+    if not text:
+        return False, {'error': 'empty_speech', 'message': 'no speech recognized'}
+    return True, {'text': text, 'language': getattr(info, 'language', None),
+                  'durationMs': int((time.time() - t0) * 1000)}
+
+
+def serve_main():
+    """常驻模式：模型懒加载并缓存；stdin 行 JSON 任务 → stdout 行 JSON 响应（2026-08-15）。"""
+    from faster_whisper import WhisperModel
+    models = {}
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+            mid = job.get('id')
+            b64_path = job.get('b64Path')
+            if not b64_path or not os.path.exists(b64_path):
+                print(json.dumps({'id': mid, 'ok': False, 'error': 'bad_args', 'message': 'b64Path missing'}, ensure_ascii=False), flush=True)
+                continue
+            with open(b64_path, 'r', encoding='utf-8') as f:
+                data = base64.b64decode(f.read().strip())
+            fd, audio_path = tempfile.mkstemp(suffix='.webm')
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+            try:
+                model_name = job.get('model') or 'base'
+                if model_name not in models:
+                    models[model_name] = WhisperModel(resolve_model_ref(model_name), device='cpu', compute_type='int8')
+                lang = job.get('language') or 'auto'
+                segments, info = models[model_name].transcribe(audio_path, language=None if lang == 'auto' else lang, vad_filter=True)
+                text = ''.join(s.text for s in segments).strip()
+                text = _simplify(text, lang, info)
+                if not text:
+                    print(json.dumps({'id': mid, 'ok': False, 'error': 'empty_speech', 'message': 'no speech recognized'}, ensure_ascii=False), flush=True)
+                else:
+                    print(json.dumps({'id': mid, 'ok': True, 'text': text, 'language': getattr(info, 'language', None)}, ensure_ascii=False), flush=True)
+            finally:
+                try:
+                    if os.path.exists(audio_path): os.unlink(audio_path)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({'id': job.get('id') if 'job' in locals() else None, 'ok': False, 'error': 'stt_failed', 'message': str(e)[:300]}, ensure_ascii=False), flush=True)
+    sys.exit(0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--audio', default=None)
@@ -135,7 +268,22 @@ def main():
     ap.add_argument('--language', default='auto')
     ap.add_argument('--out-file', default=None)
     ap.add_argument('--output', default='json')
+    ap.add_argument('--prewarm', default=None)  # 仅下载模型到 <dir> 后退出（host 启动预热用）
+    ap.add_argument('--no-keep-empty', action='store_true')  # 空转写结果不保留诊断副本（partial 预览用）
+    ap.add_argument('--serve', action='store_true')  # 常驻 worker（2026-08-15）
     args = ap.parse_args()
+    if args.serve:
+        serve_main()
+        return
+    # 预热模式：只下载模型，不转写
+    if args.prewarm:
+        try:
+            from huggingface_hub import snapshot_download
+            os.makedirs(args.prewarm, exist_ok=True)
+            snapshot_download('Systran/faster-whisper-' + args.model, local_dir=args.prewarm)
+            emit({'ok': True, 'prewarm': args.prewarm}, args.out_file)
+        except Exception as e:  # noqa: BLE001
+            emit({'ok': False, 'error': 'stt_failed', 'message': ('prewarm failed: ' + str(e))[:300]}, args.out_file)
     audio_path = args.audio
     cleanup = []
     try:
@@ -152,12 +300,38 @@ def main():
             emit({'ok': False, 'error': 'stt_failed', 'message': 'audio file missing'}, args.out_file)
         from faster_whisper import WhisperModel
         t0 = time.time()
-        model = WhisperModel(args.model, device='cpu', compute_type='int8')
+        model = WhisperModel(resolve_model_ref(args.model), device='cpu', compute_type='int8')
         lang = None if args.language == 'auto' else args.language
         segments, info = model.transcribe(audio_path, language=lang, vad_filter=True)
         text = ''.join(s.text for s in segments).strip()
+        # 简体化（2026-08-15 用户需求：中文输入默认转简体）：显式 zh 或检测为中文时，
+        # 用 zhconv 繁→简；未安装时保持原样（不阻塞转写）。zh-cn 转换表对简体输入幂等。
+        try:
+            detected_zh = (args.language == 'zh') or (getattr(info, 'language', None) or '').startswith('zh')
+            if detected_zh and text:
+                from zhconv import convert as _zh_convert
+                text = _zh_convert(text, 'zh-cn')
+        except Exception:  # noqa: BLE001
+            pass
         if not text:
-            emit({'ok': False, 'error': 'empty_speech', 'message': 'no speech recognized'}, args.out_file)
+            # 诊断（2026-08-15）：保留音频副本供分析（~/.guide-dog/tmp/empty-<ts>.webm），
+            # message 带时长信息；副本不随 cleanup 删除（cleanup 只含 b64/原临时文件）。
+            # --no-keep-empty（partial 预览转写）时不保留，避免静音片段不断累积副本。
+            keep = None
+            if not args.no_keep_empty:
+                try:
+                    import shutil
+                    keep_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tmp')
+                    os.makedirs(keep_dir, exist_ok=True)
+                    keep = os.path.join(keep_dir, 'empty-' + str(int(time.time())) + '.webm')
+                    shutil.copyfile(audio_path, keep)
+                except Exception:  # noqa: BLE001
+                    keep = None
+            try:
+                dur = round(info.duration, 2) if info and getattr(info, 'duration', None) else -1
+            except Exception:  # noqa: BLE001
+                dur = -1
+            emit({'ok': False, 'error': 'empty_speech', 'message': 'no speech recognized (dur=%ss keep=%s)' % (dur, keep or 'none')}, args.out_file)
         emit({'ok': True, 'text': text, 'language': info.language,
               'durationMs': int((time.time() - t0) * 1000)}, args.out_file)
     except ImportError:
@@ -170,6 +344,7 @@ def main():
                 if p and os.path.exists(p): os.unlink(p)
             except Exception:  # noqa: BLE001
                 pass
+
 
 if __name__ == '__main__':
     main()
@@ -186,14 +361,101 @@ if __name__ == '__main__':
       sttProbeDone = true
       const cfg = loadConfig()
       const py = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.python) || 'python3'
-      const res = await runRaw(py + " -c 'import faster_whisper; print(faster_whisper.__version__)'", { timeoutMs: 15000 })
+      const model = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.model) || 'small'
+      const res = await runRaw(quote(py) + " -c 'import faster_whisper; print(faster_whisper.__version__)'", { timeoutMs: 15000 })
+      // 模型缓存检查（2026-08-14 修复：hf.co 不可达 → 本地模型目录 + 镜像预热）
+      const localDir = (await guideDogRoot()) + '/.guide-dog/models/faster-whisper-' + model
+      const cached = !!(await statFile(localDir + '/model.bin'))
       await writeStatus({
         whisperAvailable: res.exitCode === 0 && !res.denied,
         whisperVersion: (res.stdout || '').trim(),
         whisperPython: py,
+        whisperModelCached: cached,
         probeAt: Date.now(),
       })
+      // 模型缺失 → 后台预热（hf-mirror.com 镜像，subprocess 非沙箱可写 ~/.guide-dog/models；不阻塞插件激活）
+      if (res.exitCode === 0 && !cached && subprocess) {
+        try {
+          await ensureWhisperScript()
+          const script = (await guideDogRoot()) + '/.guide-dog/scripts/whisper_transcribe.py'
+          const handle = subprocess.spawn({
+            argv: [py, script, '--prewarm', localDir, '--model', model, '--output', 'json'],
+            cwd: (await guideDogRoot()) + '/.guide-dog',
+            stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 * 1024 }, stderr: { maxBytes: 1024 * 1024 } },
+            graceMs: 3000,
+          })
+          handle.done.then(function (r) {
+            writeStatus({ whisperModelCached: true, whisperPrewarmAt: Date.now() }).catch(function () {})
+          }).catch(function () { /* prewarm failed; whisper 转写时脚本回退镜像下载 */ })
+        } catch (e) { /* best effort */ }
+      }
     }
+    // ---------- whisper 常驻 worker（2026-08-15：partial 预览提速，模型只加载一次） ----------
+    // 根因：partial 每次调用都重新加载模型（base 单次 3.3-3.9s，其中模型加载 ~2s）+ spawn 开销，
+    // 5s 间隔 + busy 串行 → 预览节奏远慢于实时。方案：常驻 --serve 进程（模型懒加载并缓存），
+    // stdin 行 JSON 任务 → stdout 行 JSON 响应，单次增量转写 ~0.8s。
+    let whisperWorker = null // { handle, dead, nextId, offset }
+    let workerChain = Promise.resolve() // RC1：whisper worker 总线单工 → 请求串行链
+    async function ensureWhisperWorker() {
+      if (whisperWorker && !whisperWorker.dead) return whisperWorker
+      const root = await guideDogRoot()
+      const script = root + '/.guide-dog/scripts/whisper_transcribe.py'
+      const cfg = loadConfig()
+      const py = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.python) || 'python3'
+      await ensureWhisperScript()
+      const h = subprocess.spawn({
+        argv: [py, script, '--serve'],
+        cwd: root + '/.guide-dog/tmp',
+        stdio: { stdin: 'pipe', stdout: { maxBytes: 8 * 1024 * 1024 }, stderr: { maxBytes: 1024 * 1024 } },
+        graceMs: 3000,
+      })
+      const w = { handle: h, dead: false, nextId: 1, offset: 0 }
+      whisperWorker = w
+      h.done.then(function () { if (whisperWorker === w) whisperWorker.dead = true }).catch(function () { if (whisperWorker === w) whisperWorker.dead = true })
+      return w
+    }
+    async function workerTranscribe(b64Path, model, language, timeoutMs) {
+      // RC1：worker 总线单工（共享 stdin/stdout/offset）——并发请求必须串行，
+      // 否则败者的响应行被他人轮询消费 → 60s 超时 → worker 被杀 → exited 级联。
+      const run = workerChain.then(function () { return doWorkerRequest(b64Path, model, language, timeoutMs) })
+      workerChain = run.then(function () {}, function () {})
+      return run
+    }
+    async function doWorkerRequest(b64Path, model, language, timeoutMs) {
+      const w = await ensureWhisperWorker()
+      const id = w.nextId++
+      try { w.handle.stdin.write(JSON.stringify({ id: id, b64Path: b64Path, model: model, language: language }) + '\n') } catch (e) { throw e }
+      const deadline = Date.now() + (timeoutMs || 45000)
+      while (Date.now() < deadline) {
+        if (w.dead) throw new Error('whisper worker exited')
+        try {
+          const read = w.handle.collected.stdout.readFrom(w.offset)
+          if (read && read.text) {
+            w.offset = read.nextOffset
+            const lines = read.text.split('\n')
+            for (let i = 0; i < lines.length; i++) {
+              const t = lines[i].trim()
+              if (!t) continue
+              let obj = null
+              try { obj = JSON.parse(t) } catch (e) { continue }
+              if (obj && obj.id === id) return obj
+            }
+          }
+        } catch (e) { throw e }
+        await sleep(150)
+      }
+      // 超时：杀掉 worker（下次调用自动重启）
+      try { w.handle.terminate() } catch (e) { /* ignore */ }
+      w.dead = true
+      throw new Error('whisper worker timeout')
+    }
+    ctx.effect(function () {
+      return function () {
+        if (whisperWorker && whisperWorker.handle) {
+          try { whisperWorker.handle.terminate() } catch (e) { /* ignore */ }
+        }
+      }
+    })
     async function transcribeImpl(args) {
       const cfg = loadConfig()
       const engine = cfg.voiceInput && cfg.voiceInput.engine
@@ -211,16 +473,31 @@ if __name__ == '__main__':
       const outFile = root + '/.guide-dog/tmp/whisper-' + Date.now() + '.out.json'
       const script = root + '/.guide-dog/scripts/whisper_transcribe.py'
       const py = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.python) || 'python3'
-      const model = (cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.model) || 'small'
+      // partial（实时预览转写）：用 base 模型加速（约 2-3x 实时，预览用途精度足够），
+      // 且不保留空结果诊断副本（避免静音片段累积 empty-*.webm）
+      const model = args.partial ? 'base' : ((cfg.voiceInput && cfg.voiceInput.whisper && cfg.voiceInput.whisper.model) || 'small')
       const lang = (args.language || (cfg.voiceInput && cfg.voiceInput.language) || 'auto')
       await runRaw('mkdir -p ' + quote(root + '/.guide-dog/tmp'), { timeoutMs: 10000 })
       const wrote = await writeTextFile(b64Path, args.audioB64)
-      if (!wrote) return { ok: false, error: 'config_write_failed', message: 'cannot write temp audio' }
+      if (!wrote) return { ok: false, error: 'stt_failed', message: 'cannot write temp audio' }
+      // 优先常驻 worker（2026-08-15：模型已加载，单次 ~0.8s；崩溃/超时自动 fallback 一次性 spawn）
+      if (subprocess) {
+        try {
+          const wr = await workerTranscribe(b64Path, model, lang, args.partial ? 20000 : 60000)
+          if (wr && typeof wr.ok === 'boolean') {
+            return echoGuard({ ok: wr.ok === true, text: wr.text, language: wr.language, error: wr.error, message: wr.message, durationMs: wr.durationMs }, args.sessionId || '')
+          }
+        } catch (e) {
+          console.log('[guide-dog] whisper worker failed, fallback one-shot: ' + String((e && e.message) || e))
+        }
+      }
       let handle = null
       try {
         await ensureWhisperScript()
+        const argvBase = [py, script, '--audio-b64-file', b64Path, '--delete-b64', '--model', model, '--language', lang, '--out-file', outFile, '--output', 'json']
+        if (args.partial) argvBase.push('--no-keep-empty')
         handle = subprocess.spawn({
-          argv: [py, script, '--audio-b64-file', b64Path, '--delete-b64', '--model', model, '--language', lang, '--out-file', outFile, '--output', 'json'],
+          argv: argvBase,
           cwd: root + '/.guide-dog/tmp',
           stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 * 1024 }, stderr: { maxBytes: 1024 * 1024 } },
           graceMs: 3000,
@@ -241,12 +518,24 @@ if __name__ == '__main__':
         if (!parsed || parsed.ok !== true) {
           return { ok: false, error: (parsed && parsed.error) || 'stt_failed', message: (parsed && parsed.message) || 'STT failed' }
         }
-        return { ok: true, text: parsed.text, language: parsed.language, durationMs: parsed.durationMs }
+        return echoGuard({ ok: true, text: parsed.text, language: parsed.language, durationMs: parsed.durationMs }, args.sessionId || '')
       } catch (e) {
         return { ok: false, error: 'stt_failed', message: String((e && e.message) || e).slice(0, 200) }
       } finally {
-        // 精确文件名清理（审查 M13：不用通配符，quote 会阻止 glob 展开）
-        await runRaw('rm -f ' + quote(b64Path) + ' ' + quote(outFile), { timeoutMs: 10000 }).catch(function () {})
+        // 精确文件名清理（M13：不用通配符；2026-08-15 修复：runRaw 的 rm 走沙箱 shell 被拒（home 只读）→ 改 subprocess 非沙箱删除）
+        if (subprocess) {
+          try {
+            const h = subprocess.spawn({
+              argv: ['rm', '-f', b64Path, outFile],
+              cwd: root + '/.guide-dog/tmp',
+              stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } },
+              graceMs: 3000,
+            })
+            h.done.catch(function () { /* ignore */ })
+          } catch (e) { /* ignore */ }
+        } else {
+          await runRaw('rm -f ' + quote(b64Path) + ' ' + quote(outFile), { timeoutMs: 10000 }).catch(function () {})
+        }
       }
     }
 
@@ -352,6 +641,14 @@ if __name__ == '__main__':
         const t = await fsSvc.resolve(abs)
         return await fsSvc.readBytes(t, undefined, maxBytes)
       } catch (e) { return null }
+    }
+    // M10: fsSvc.readBytes 无 offset，只读文件开头 maxBytes；
+    // readRange 经 shell (dd + head/tail + base64) 只读 [start, start+len)。
+    async function readRange(abs, start, len) {
+      if (!runRaw || !quote) return null
+      const r = await runRaw('dd if=' + quote(abs) + ' bs=4096 skip=' + Math.floor(start / 4096) + ' 2>/dev/null | head -c ' + (len + (start % 4096)) + ' | tail -c +' + ((start % 4096) + 1) + ' | base64 -w0', { timeoutMs: 30000 })
+      if (r.exitCode !== 0 || !r.stdout) return null
+      try { return Buffer.from(r.stdout.trim(), 'base64') } catch (e) { return null }
     }
     async function listDir(abs) {
       if (!fsSvc) return null
@@ -497,14 +794,15 @@ if __name__ == '__main__':
       const source = args.source === 'voice-mode' ? 'voice-mode' : 'tool'
       const sid = typeof args.sessionId === 'string' ? args.sessionId : ''
       const seq = typeof args.turnSeq === 'number' ? args.turnSeq : null
-      if (sid && seq !== null) {
-        const spoken = spokenTurns.get(sid) || new Set()
+      const spoken = (sid && seq !== null) ? (spokenTurns.get(sid) || new Set()) : null
+      if (spoken) {
         if (spoken.has(seq)) return { ok: true, skipped: true }
-        spoken.add(seq)
+        spoken.add(seq) // 预占去重（防同 turn 并发双 TTS）；任何失败路径释放（M1）
         spokenTurns.set(sid, spoken)
       }
+      const release = function () { if (spoken) spoken.delete(seq) }
       const text = String(args.text || '').trim()
-      if (!text) return { ok: false, error: 'bad_args', message: 'text is required' }
+      if (!text) { release(); return { ok: false, error: 'bad_args', message: 'text is required' } }
       await ensureMediaDir()
       const transformed = await transformText(text)
       const ttsCfg = (loadConfig().tts) || {}
@@ -517,13 +815,16 @@ if __name__ == '__main__':
       const abs = mediaDir + '/' + name
       const tts = await generateTts(transformed, voice, speed, lang, abs)
       if (!tts.ok) {
+        release()
         const msg = String(tts.error || '')
         return { ok: false, error: /timeout/i.test(msg) ? 'tts_timeout' : 'tts_failed', message: msg.slice(0, 300) }
       }
       const st = await statFile(abs)
-      if (!st) return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' }
+      if (!st) { release(); return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' } }
       await pushIndex({ name: name, kind: 'audio', prompt: text.slice(0, 200), voice: voice, ts: Date.now(), bytes: st.size || 0, source: source, turnSeq: seq, spoken: transformed.slice(0, 160) })
-      if (args.playOnHost) await playOnHost(abs)
+      // RC13：本机扬声器播放成功后登记文本——队列通道（语音模式/下行）消费即删，防双响
+      // RC14：注册双键——净化后文本与 downlink 匹配（markdown/URL 文本互斥生效）；transform.py 改写文本时净化键可能不完全一致，属可接受边缘
+      if (args.playOnHost) { const played = await playOnHost(abs); if (played) { markHostSpoken(sid, transformed); markHostSpoken(sid, sanitizeSpeechText(transformed)) } }
       return { ok: true, kind: 'audio', url: MEDIA_ROUTE + '/' + name, file: abs, voice: voice, bytes: st.size || 0 }
     }
     async function playOnHost(abs) {
@@ -536,7 +837,7 @@ if __name__ == '__main__':
       for (const p of ['afplay', 'play', 'ffplay']) {
         if (found.some(function (f) { return f.endsWith('/' + p) })) { player = p; break }
       }
-      if (!player) return
+      if (!player) return false
       const argv = player === 'ffplay'
         ? ['ffplay', '-nodisp', '-autoexit', '-hide_banner', '-loglevel', 'warning', abs]
         : [player, abs]
@@ -551,7 +852,8 @@ if __name__ == '__main__':
         handle.done.catch(function () {}).then(function () {
           if (players.get(abs) === handle) players.delete(abs)
         })
-      } catch (e) { /* playback is best effort */ }
+        return true
+      } catch (e) { return false }
     }
 
     // ---------- vision ----------
@@ -613,16 +915,14 @@ if __name__ == '__main__':
               if (!st) { res.writeHead(404); res.end(); return }
               const size = st.size || 0
               if (size > MAX_FILE_BYTES) { res.writeHead(413); res.end(); return }
-              const bytes = await readBytes(abs, size || MAX_FILE_BYTES)
-              if (!bytes) { res.writeHead(404); res.end(); return }
               const headers = { 'content-type': mime, 'accept-ranges': 'bytes', 'content-length': String(size) }
               let status = 200
-              let body = bytes
+              let rangeLen = -1 // -1 = 全量
+              let start = -1 // range 起点（rangeLen >= 0 时有效）
               const range = req.headers && req.headers.range ? String(req.headers.range) : ''
               if (range) {
                 const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
                 if (m && (m[1] || m[2])) {
-                  let start = 0
                   let end = size - 1
                   if (m[1] === '') {
                     start = Math.max(0, size - parseInt(m[2] || '0', 10))
@@ -634,14 +934,17 @@ if __name__ == '__main__':
                     res.writeHead(416, { 'content-range': 'bytes */' + size }); res.end(); return
                   }
                   end = Math.min(end, size - 1)
-                  body = bytes.slice(start, end + 1)
+                  rangeLen = end - start + 1
                   status = 206
                   headers['content-range'] = 'bytes ' + start + '-' + end + '/' + size
-                  headers['content-length'] = String(body.length)
+                  headers['content-length'] = String(rangeLen)
                 }
               }
+              // M10：只读所需区段，不全量缓冲（fsSvc.readBytes 无 offset，range 走 readRange）
+              const bytes = rangeLen >= 0 ? await readRange(abs, start, rangeLen) : await readBytes(abs, size || MAX_FILE_BYTES)
+              if (!bytes) { res.writeHead(404); res.end(); return }
               res.writeHead(status, headers)
-              res.end(req.method === 'HEAD' ? undefined : body)
+              res.end(req.method === 'HEAD' ? undefined : bytes)
             } catch (e) {
               try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
             }
@@ -651,6 +954,128 @@ if __name__ == '__main__':
         console.error('[guide-dog] route registration failed: ' + String(e))
         return function () {}
       }
+    })
+
+    // ============ RECORDER 页（Phase 1，Task 6b） ============
+    const RECORDER_HTML = `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Guide Dog 录音转写</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 16px;text-align:center}
+button{font-size:18px;padding:14px 28px;border-radius:10px;border:none;background:#4a7dff;color:#fff;cursor:pointer;margin:8px}
+#status{color:#888;margin:12px 0}#out{white-space:pre-wrap;background:#f4f4f4;border-radius:8px;padding:14px;min-height:60px;text-align:left;display:none}
+.err{color:#c0392b}</style></head><body>
+<h2>🎙 Guide Dog 录音转写</h2>
+<p>点击录音，说完后停止，文字会自动转写。</p>
+<button id="rec">开始录音</button><button id="cp" style="display:none">复制文本</button>
+<div id="status">空闲</div><div id="out"></div>
+<script>
+const b=document.getElementById('rec'),st=document.getElementById('status'),out=document.getElementById('out'),cp=document.getElementById('cp');
+let mr=null,chunks=[],recTimer=null;
+b.onclick=async()=>{
+  if(mr){mr.stop();return}
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:true});
+    mr=new MediaRecorder(s);chunks=[];
+    mr.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+    mr.onstop=async()=>{
+      clearTimeout(recTimer);recTimer=null;
+      const blob=new Blob(chunks,{type:'audio/webm'});
+      st.textContent='转写中…';
+      try{
+        const r=await fetch('/guide-dog/transcribe-upload',{method:'POST',body:blob});
+        const j=await r.json();
+        if(j.ok&&j.text){out.style.display='block';out.textContent=j.text;cp.style.display='inline-block';st.textContent='完成（'+(j.language||'')+'）'}
+        else{st.className='err';st.textContent=(j.message||j.error||'转写失败')}
+      }catch(e){st.className='err';st.textContent='网络错误：'+e}
+      s.getTracks().forEach(t=>t.stop());mr=null;b.textContent='开始录音';
+    };
+    mr.start(1000);b.textContent='停止';st.textContent='录音中…';st.className='';
+    recTimer=setTimeout(function(){if(mr){mr.stop()}},60000);
+  }catch(e){st.className='err';st.textContent='无法访问麦克风：'+e}
+};
+cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp.textContent='已复制'}catch(e){out.select();document.execCommand('copy');cp.textContent='已复制'}};
+</script></body></html>`
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'prefix',
+          path: '/guide-dog/recorder',
+          handler: async function (req, res) {
+            try {
+              const raw = String(req.url || '/').split('?')[0]
+              if (raw === '/guide-dog/recorder' && (req.method === 'GET' || req.method === 'HEAD')) {
+                res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+                res.end(RECORDER_HTML)
+                return
+              }
+              if (raw === '/guide-dog/transcribe-upload' && req.method === 'POST') {
+                const chunks = []
+                let total = 0
+                for await (const c of req) {
+                  chunks.push(c)
+                  total += c.length
+                  if (total > 20 * 1024 * 1024) { req.resume(); res.writeHead(413, { 'content-type': 'application/json' }); res.end('{"ok":false,"error":"bad_args","message":"audio too large"}'); return }
+                }
+                const all = new Uint8Array(total)
+                let off = 0
+                for (const c of chunks) { all.set(c, off); off += c.length }
+                const bin = new TextDecoder('latin1').decode(all)
+                const r = await transcribeImpl({ audioB64: btoa(bin), mime: 'audio/webm', sessionId: '', language: 'auto' })
+                res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+                res.end(JSON.stringify(r))
+                return
+              }
+              res.writeHead(404); res.end(); return
+            } catch (e) {
+              // M12：上传路径异常保护，绝不悬挂响应
+              try {
+                res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+                res.end(JSON.stringify({ ok: false, error: 'stt_failed', message: String((e && e.message) || e).slice(0, 200) }))
+              } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ============ CALL 上行（Phase 2，host） ============
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact',
+          path: '/guide-dog/call-transcribe',
+          handler: async function (req, res) {
+            try {
+              if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+              // 同源校验（M5 修订 2026-08-16）：Origin 必须等于 GUI 来源——按 Host 头推导
+              // （'http://' + req.headers.host，GUI 由 dsh web 同源托管）；无 Origin 头（curl）放行，
+              // 便于本地验收。不再用 guideDogRoot() 作 truthy 占位。
+              const origin = req.headers && req.headers.origin ? String(req.headers.origin) : ''
+              const hostHdr = req.headers && req.headers.host ? String(req.headers.host) : ''
+              if (origin && hostHdr && origin !== 'http://' + hostHdr) { res.writeHead(403); res.end(); return }
+              // 收集 body（≤20MB 硬上限）
+              const chunks = []
+              let total = 0
+              for await (const chunk of req) {
+                chunks.push(chunk)
+                total += chunk.length
+                if (total > 20 * 1024 * 1024) { res.writeHead(413); res.end(); return }
+              }
+              const b64 = Buffer.concat(chunks).toString('base64')
+              const r = await transcribeImpl({ audioB64: b64, mime: 'audio/webm', sessionId: req.headers && req.headers['x-session-id'] ? String(req.headers['x-session-id']) : '' })
+              if (r.ok) {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: true, text: r.text, language: r.language, durationMs: r.durationMs }))
+              } else {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: r.error, message: r.message || '' }))
+              }
+            } catch (e) {
+              try { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: 'stt_failed', message: String(e).slice(0, 200) })) } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
     })
 
     // ---------- prompt section: automatic invocation ----------
@@ -667,6 +1092,7 @@ if __name__ == '__main__':
             '- GENERATION: use guide_dog_image (images), guide_dog_video (video), guide_dog_music (music), guide_dog_speak (speech).',
             '- All generated media is also visible to the user in the web UI at /guide-dog/media/<file>; always include the returned url fields in your reply so the user can preview.',
             '- When the user asks to hear text spoken aloud, use guide_dog_speak.',
+            '- VOICE (TTS/播报): 语音播报由插件自动完成（语音/通话/无障碍模式）。不要调用 audio-conversation、speech-mmx、mmx 等技能来"启用/修复"语音。用户反馈听不到声音 = 浏览器/系统音频问题：让用户检查标签页音量与输出设备即可。用户明确要求朗读某段具体文字时用 guide_dog_speak 工具。',
           ].join('\n'),
         })
       } catch (e) {
@@ -675,14 +1101,47 @@ if __name__ == '__main__':
       }
     })
     if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide-dog-voice-mode', function (context) {
-        const cfg = loadConfig()
-        const sid = (context && (context.sessionId || (context.session && context.session.id))) || ''
-        const vm = cfg.voiceMode || {}
-        const effective = sid ? (vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default) : vm.default
-        if (!effective) return undefined
-        return '语音模式：开。本条回复会被自动朗读。保持回复文字与朗读内容一致，不要在回复中描述音频状态，不要重复播报。'
-      })
+      try {
+        const disp = systemPrompt.variable('guide_dog_voice_mode', function (context) {
+          const cfg = loadConfig()
+          const sid = (context && (context.sessionId || (context.session && context.session.id))) || ''
+          const vm = cfg.voiceMode || {}
+          const effective = sid ? (vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default) : vm.default
+          if (!effective) return undefined
+          return '语音模式：开。本条回复会被自动朗读。保持回复文字与朗读内容一致，不要在回复中描述音频状态，不要重复播报。'
+        })
+        if (typeof disp === 'function') ctx.effect(function () { return disp }) // M3：纳入生命周期
+      } catch (e) {
+        console.error('[guide-dog] voice mode variable failed: ' + String(e))
+      }
+    }
+    // ---- 共识优先 prompt 变量（Task 8 Step 4） ----
+    // 接线说明（实证）：cordis ctx.effect(execute) 会立即调用 execute 并把其返回的函数作为
+    // 生命周期 disposer；systemPrompt.variable() 本身已即时注册并返回 exact effect disposer，
+    // 若直接 ctx.effect(disp) 会立刻调用 disp → 变量被即刻注销。故沿用上方 M3 同款接线
+    // （ctx.effect(function () { return disp })）：disp 仅在 scope 注销时被调用。
+    if (systemPrompt && systemPrompt.variable) {
+      try {
+        const disp1 = systemPrompt.variable('guide_dog_call_consensus', function (context) {
+          const cfg = loadConfig()
+          const sid = context && context.sessionId ? String(context.sessionId) : ''
+          const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
+          const a11yOn = cfg.a11y && cfg.a11y.enabled
+          // C3（最终审稿）：与 consensusEnabled 同门——仅通话激活中的会话注入语音聊天措辞
+          if (!((callOn && isCallActive(sid)) || a11yOn)) return undefined
+          const a11yExtra = a11yOn ? '无障碍模式已开启：所有可能改变状态的操作（发送、删除、覆盖等）执行前都必须先简短说明并得到你的语音确认。' : ''
+          return '用户正通过语音和你对话。回复要简短、口语化，一句话一个意思；避免表格、代码块、标题符号和长列表，需要列举时说"第一…第二…"；先给结论再给细节；不清楚就问一句。写入/修改前先简短说明要做什么，等用户点头；用户随时可能提问或插话，认真回应。' + a11yExtra
+        })
+        if (typeof disp1 === 'function') ctx.effect(function () { return disp1 })
+      } catch (e) { /* ignore */ }
+      try {
+        const disp2 = systemPrompt.variable('guide_dog_a11y_constraints', function () {
+          const cfg = loadConfig()
+          if (!(cfg.a11y && cfg.a11y.enabled)) return undefined
+          return '无障碍模式：①破坏性操作必须先语音确认（"将删除 X，确定吗？请说确定或取消"）；②颜色/图标/布局一律用文字描述；③重要状态变化必须口头通知。'
+        })
+        if (typeof disp2 === 'function') ctx.effect(function () { return disp2 })
+      } catch (e) { /* ignore */ }
     }
 
     // ---------- tools ----------
@@ -1045,6 +1504,16 @@ if __name__ == '__main__':
     })
     ctx.effect(function () {
       try {
+        return harness.handle('guide-dog/tts-token', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: false, error: 'bad_args', message: 'sessionId required' }
+          const token = await issueTtsToken(sid)
+          return { ok: true, token: token }
+        })
+      } catch (e) { return function () {} }
+    })
+    ctx.effect(function () {
+      try {
         return harness.handle('guide-dog/beep', async function () {
           const rate = 8000, ms = 150, freq = 880
           const n = Math.floor(rate * ms / 1000)
@@ -1066,39 +1535,745 @@ if __name__ == '__main__':
         })
       } catch (e) { return function () {} }
     })
+    // ============ CALL 节（Phase 2，host） ============
+    const ttsTokens = new Map() // token -> { sessionId, exp }
+    const consent = new Map() // sessionId -> turnSeq（本轮已语音确认）
+    // C1 修复（2026-08-16 审稿）：consentPending 记录"用户刚说过确认词"的会话；
+    // 由 user 消息监听器（Task 8 Step 3b）置位，下一次 pre-execute 消费并 grantConsent。
+    const consentPending = new Set() // sessionId（等待写入放行）
+    const callActiveSessions = new Set() // sessionId（持久通话激活，startCall/stopCall 时置位，C4 修复）
+    async function issueTtsToken(sessionId) {
+      const token = 'gd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+      ttsTokens.set(token, { sessionId: String(sessionId), exp: Date.now() + 5 * 60 * 1000 })
+      return token
+    }
+    function consumeTtsToken(token, sessionId) {
+      if (!token || typeof token !== 'string') return false
+      const rec = ttsTokens.get(token)
+      if (!rec) return false
+      ttsTokens.delete(token) // 单次消费
+      if (rec.sessionId !== String(sessionId)) return false
+      if (rec.exp < Date.now()) return false
+      return true
+    }
+    function grantConsent(sid, turnSeq) { consent.set(String(sid), turnSeq) }
+    function hasConsent(sid, turnSeq) {
+      const v = consent.get(String(sid))
+      return typeof turnSeq === 'number' ? v === turnSeq : v !== undefined
+    }
+    // M10 语义说明（2026-08-16 审稿）：一次确认放行"本轮"全部写操作——grantConsent 在首次
+    // pre-execute 时以该 exec 的 turnSeq 授予；同一 assistant turn 内后续写工具共享同一
+    // exec.agent.turn → hasConsent 精确匹配通过。若 exec.agent.turn 为 null（探测未发现 turn），
+    // hasConsent 退化为"已授予即可"（v !== undefined），新用户回合前 clearConsent 兜底。
+    function clearConsent(sid) { consent.delete(String(sid)) }
+    function markConsentPending(sid) { consentPending.add(String(sid)) }
+    function consumeConsentPending(sid) { return consentPending.delete(String(sid)) }
+    function isCallActive(sid) { return callActiveSessions.has(String(sid)) }
+    // 定期清理过期 token（30s 检查，防泄漏）
+    // I3（2026-08-16 审稿）：host 侧 timerSvc.interval（callback 形式）未验证——
+    // 若 Task 4 探测确认 host interval 不可用，则改为 sleep 轮询（见下方注释替代）。
+    const tokenTimer = timerSvc && typeof timerSvc.interval === 'function'
+      ? timerSvc.interval(function () {
+          const now = Date.now()
+          ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+        }, 30000)
+      : null
+    if (tokenTimer) ctx.effect(tokenTimer)
+    // R2（2026-08-16 控制器裁定）：双路径清扫——interval 不可用时启动 sleep 轮询，
+    // 与上方 interval 分支互斥（仅一条路径运行）。
+    if (!tokenTimer) {
+      // 替代：sleep 轮询（Promise 形式，已验证）
+      ;(function tokenSweeper() {
+        sleep(30000).then(function () {
+          const now = Date.now()
+          ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+          tokenSweeper()
+        })
+      })()
+    }
+    // ---- 共识优先（spec §6.7） ----
+    const WRITE_TOOL_NAMES = ['write', 'edit']
+    // RC5（2026-08-17 验收）：`>>?` 分支误伤无害重定向——`2>/dev/null`、`>&`（2>&1 等）也被判为
+    // 破坏性写入 → 只读命令（如 cat /etc/timezone 2>/dev/null）被 needs_voice_confirmation 拦截。
+    // 排除 /dev/null 目标与 & 合并重定向；`echo x > file`、`>> file` 等真实写入仍拦截。
+    const DESTRUCTIVE_BASH_RE = /(^|\s|\||;|&&)(rm|mv|cp|truncate|dd|mkfs|git\s+push)\b|>>?(?!\s*(?:\/dev\/null\b|&))[\s\S]*$/m
+    function consensusSummary(name, args) {
+      try {
+        if (name === 'write') {
+          const p = args && args.file_path ? String(args.file_path) : '?'
+          const content = args && args.content ? String(args.content) : ''
+          return '写入文件 ' + p + '（' + content.length + ' 字符）'
+        }
+        if (name === 'edit') {
+          const p = args && args.file_path ? String(args.file_path) : '?'
+          const oldS = args && args.old_string ? String(args.old_string) : ''
+          return '修改文件 ' + p + '（替换 ' + oldS.length + ' 字符片段）'
+        }
+        if (name === 'bash') {
+          const cmd = args && args.command ? String(args.command) : ''
+          if (DESTRUCTIVE_BASH_RE.test(cmd)) return '执行命令：' + cmd.slice(0, 80)
+          return ''
+        }
+        return ''
+      } catch (e) { return '' }
+    }
+    const callActiveFlags = new Map() // sessionId -> boolean（瞬时：用户正在发声，Task 9 窗口期高灵敏上报）
     ctx.effect(function () {
       try {
-        return harness.handle('guide-dog/probe', async function (args) {
-          try {
-            const root = await guideDogRoot()
-            let cur = {}
-            const raw = await readTextFile(root + '/.guide-dog/probe.json')
-            if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-            await runRaw('mkdir -p ' + quote(root + '/.guide-dog'), { timeoutMs: 10000 })
-            const next = Object.assign({}, cur, (args && args.report) || {})
-            await writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(next, null, 2))
-            return { ok: true }
-          } catch (e) { return { ok: false, error: 'config_write_failed', message: String(e).slice(0, 200) } }
+        // C4 修复（2026-08-16 审稿）：call-active RPC 拆两用——
+        //   {active:true, kind:'session'} → callActiveSessions.add（持久激活，Task 7 startCall/stopCall 上报）
+        //   {active:true/false, kind:'speaking'} → callActiveFlags.set（瞬时发声，Task 9 共识窗口上报）
+        return harness.handle('guide-dog/call-active', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: false, error: 'bad_args' }
+          const kind = args && args.kind === 'session' ? 'session' : 'speaking'
+          const active = !!(args && args.active)
+          if (kind === 'session') {
+            if (active) {
+              callActiveSessions.add(String(sid))
+              // RC11：新通话 = 新队列——清掉挂断/刷新残留的旧条目，防陈旧内容重放
+              voiceQueue.delete(String(sid))
+              pendingFinal.delete(String(sid)) // RC13：同清中间文本缓冲（pendingFinal 在后文声明，RPC 回调运行时已初始化）
+            } else callActiveSessions.delete(String(sid))
+          } else {
+            callActiveFlags.set(String(sid), active)
+          }
+          return { ok: true }
         })
       } catch (e) { return function () {} }
     })
-    // variable context 形状探测：下次提示词组装时把 context 键列表并入 probe.json（审查 M7）
-    if (systemPrompt && systemPrompt.variable) {
-      systemPrompt.variable('guide-dog-probe-context', function (context) {
-        const root = guideRoot || ''
-        if (root) {
-          try {
-            readTextFile(root + '/.guide-dog/probe.json').then(function (raw) {
-              let cur = {}
-              if (raw) { try { cur = JSON.parse(raw) } catch (e) { /* ignore */ } }
-              cur.variableContextKeys = probeKeys(context)
-              return writeTextFile(root + '/.guide-dog/probe.json', JSON.stringify(cur, null, 2))
-            }).catch(function () {})
-          } catch (e) { /* ignore */ }
+    async function announceAndWait(sid, text) {
+      // 播报摘要（走同一 TTS 管线，source:'consensus'）；等待窗口；期间用户发声（speaking 置位）→ aborted
+      // C5 修复（2026-08-16 审稿）：① 摘要必须入 voiceQueue 且**带 consensus 标记**（speakImpl 只生成 mp3
+      //   不排队，旧代码直接 speakImpl → client 轮询取不到 → 用户听不到摘要、窗口永不开启）；
+      //   ② 只在生成完成后推最终条目（占位条目会被 client 先弹出——队列是 shift 语义）；
+      //   ③ 窗口在**摘要生成完成**后开始计时（client 播放到它需要 ~1-2s，窗口覆盖播放尾声与之后）；
+      //   ④ 窗口期监听 speaking 标志从 false 变 true（Task 9 开窗即上报的旧语义自噬，已改为仅真实发声上报）。
+      await serialSpeak(function () {
+        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'consensus' }).then(function (r) {
+          const q2 = voiceQueue.get(String(sid)) || []
+          if (r && r.ok && r.url) {
+            q2.push({ url: r.url, key: 'consensus:' + sid + ':' + Date.now(), consensus: true })
+            // RC17-F：共识摘要文本入回声缓冲（其 mp3 播放会被麦克风拾取）
+            pushAgentSpeech(String(sid), text, Date.now())
+          } else {
+            q2.push({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          }
+          if (q2.length > VOICE_QUEUE_MAX) q2.shift()
+          voiceQueue.set(String(sid), q2)
+        }).catch(function (e) {
+          const q3 = voiceQueue.get(String(sid)) || []
+          q3.push({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.shift()
+          voiceQueue.set(String(sid), q3)
+        })
+      })
+      const cfg = loadConfig()
+      const winMs = (cfg.call && cfg.call.consensus && cfg.call.consensus.summaryWindowMs) || 3000
+      const start = Date.now()
+      // 窗口开始：清瞬时标志，之后任何发声都会置 true → aborted
+      callActiveFlags.set(String(sid), false)
+      while (Date.now() - start < winMs) {
+        if (callActiveFlags.get(String(sid)) === true) return 'aborted'
+        await sleep(100)
+      }
+      return 'proceed'
+    }
+    function consensusEnabled(sid) {
+      const cfg = loadConfig()
+      const a11yOn = cfg.a11y && cfg.a11y.enabled
+      const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
+      // C3（最终审稿）：共识拦截仅对**通话激活中**的会话生效（spec §6.7 打字模式保持 Phase 1
+      // 现状）——write/edit/破坏性 bash 不再被未开通话的普通会话拦截
+      return !!(((callOn) && isCallActive(sid)) || a11yOn)
+    }
+    // C1 修复（2026-08-16 审稿）：user 确认词监听器——用户回复"确定/确认/可以/好"（普通回合内容）
+    // → markConsentPending(sid)；下一次 pre-execute 消费该 pending 并 grantConsent。
+    // 注意：监听 user 消息事件（Phase 1 的 session/event 监听的是 assistant/message，此处是 user 消息分支）。
+    const CONSENT_YES_RE = /^(确定|确认|可以|好的?|行|就这么办|继续)$/
+    const CONSENT_NO_RE = /^(取消|不行|不要|算了|停)$/
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'user/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid || !consensusEnabled(sid)) return
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join(' ').trim()
+        if (!text) return
+        const t = text.replace(/[，。！？\s]/g, '')
+        if (CONSENT_YES_RE.test(t)) markConsentPending(sid)
+        else if (CONSENT_NO_RE.test(t)) { clearConsent(sid); callActiveFlags.set(String(sid), false) }
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('tools/pre-execute', async function (exec, next) {
+      try {
+        // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
+        // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
+        // sessionId 推导：agent.session.id（T4 探针实证待确认；若证伪改为 agents 服务推导）
+        const sid = exec && exec.agent && exec.agent.session ? String(exec.agent.session.id || '') : ''
+        if (!sid || !consensusEnabled(sid)) return next()
+        const name = exec && exec.name ? String(exec.name) : ''
+        const args = exec && exec.arguments ? exec.arguments : {}
+        const isWrite = WRITE_TOOL_NAMES.indexOf(name) >= 0
+        const isDestructiveBash = name === 'bash' && DESTRUCTIVE_BASH_RE.test(String((args && args.command) || ''))
+        if (!isWrite && !isDestructiveBash) return next()
+        // 摘要：写工具强制；bash 仅破坏性命令
+        const summary = consensusSummary(name, args)
+        if (!summary) return next()
+        const turnSeq = exec.agent ? exec.agent.turn : null
+        // C1 修复：未共识但用户刚说过确认词 → 消费 pending 并授予本轮 consent（不拦截）
+        if (!hasConsent(sid, turnSeq) && consumeConsentPending(sid)) {
+          grantConsent(sid, turnSeq) // 原样存储：null → hasConsent 退化为"已授予"；数字 → 精确匹配
         }
-        return undefined
+        if (hasConsent(sid, turnSeq)) {
+          // 已共识：执行前摘要 + 打断窗口
+          const verdict = await announceAndWait(sid, '接下来' + summary)
+          if (verdict === 'aborted') return { kind: 'deny', reason: 'aborted_by_user' }
+          return next()
+        }
+        // 未共识：拦截，让模型语音提问
+        return { kind: 'deny', reason: 'needs_voice_confirmation' }
+      } catch (e) {
+        // spec §6.8：宁可拦错不可放错；口播原因（不静默）
+        try {
+          const sid = exec && exec.agent && exec.agent.session ? String(exec.agent.session.id || '') : ''
+          if (sid) serialSpeak(function () { return speakImpl({ text: '共识检查失败，已阻止本次操作', sessionId: sid, turnSeq: null, source: 'consensus' }).catch(function () { return null }) })
+        } catch (e2) { /* ignore */ }
+        return { kind: 'deny', reason: 'consensus_failed' }
+      }
+    })
+    // ---- 进度播报（spec §6.4；RC10 激进精简：仅播有效信息） ----
+    function progressPhrase(name) {
+      const map = { bash: '正在执行命令', read: '正在查找文件', grep: '正在查找文件', glob: '正在查找文件',
+        write: '正在修改文件', edit: '正在修改文件', web_search: '正在搜索网页',
+        guide_dog_image: '正在生成媒体', guide_dog_video: '正在生成媒体', guide_dog_music: '正在生成媒体', guide_dog_speak: '正在生成媒体',
+        skill: '正在调用技能' }
+      return map[name] || '正在执行操作'
+    }
+    const PROGRESS_SILENT = { read: 1, grep: 1, glob: 1, skill: 1 } // 静默类（Phase 3 自动播报同白名单基础）
+    const PROGRESS_MEDIA = { guide_dog_image: 1, guide_dog_video: 1, guide_dog_music: 1, guide_dog_speak: 1 } // RC10：生成媒体（耗时长，值得播）
+    // RC10（2026-08-17 验收）：激进精简——只播有意义的步骤：
+   //   write/edit（修改文件）、web_search（搜索）、媒体工具（生成媒体）、bash 仅破坏性命令
+    //   （与共识拦截同口径 DESTRUCTIVE_BASH_RE）；read/grep/glob/skill/未知工具静默——
+    //   不再播"正在执行操作"，多步任务不再连珠炮式播报。
+    function shouldAnnounce(name, args) {
+      if (PROGRESS_SILENT[name]) return false
+      if (name === 'write' || name === 'edit' || name === 'web_search') return true
+      if (PROGRESS_MEDIA[name]) return true
+      if (name === 'bash') return DESTRUCTIVE_BASH_RE.test(String((args && args.command) || ''))
+      return false // 未知工具静默
+    }
+    // RC10：同短语冷却去重——cooldownMs 内同短语不重复播（多步同类操作只报一次）
+    function progressDedupe(last, phrase, now, cooldownMs) {
+      if (last && last.phrase === phrase && now - last.ts < (cooldownMs || 4000)) return true
+      return false
+    }
+    const lastProgress = new Map() // sessionId -> {phrase, ts}：播报去重冷却状态
+    function callOrA11yActive(sid) {
+      const cfg = loadConfig()
+      // C4 修复：读持久 callActiveSessions（isCallActive），不再读瞬时 callActiveFlags
+      return !!((cfg.call && cfg.call.progress && isCallActive(sid)) || (cfg.a11y && cfg.a11y.enabled))
+    }
+    // RC10（2026-08-17 验收）：播报从 mp3 并入流式通道——不再 speakImpl 合成 mp3，
+    // 直接 unshift {stream:true} 条目：与回复句子同走唯一 WebAudio PCM 链、同一时间线 →
+    // 单播放器构造性串行（一条接一条，不可能重叠/爆音）；合成延迟由 client 播放时承担。
+    // 去重：同短语冷却窗口内跳过（出错文本唯一，天然不冲突）。
+    function announce(sid, text) {
+      const now = Date.now()
+      // RC14：30s 短语窗口——web_search 结果间隔 ~4.3s > 旧 4s → 连播 3 次
+      if (progressDedupe(lastProgress.get(String(sid)), text, now, 30000)) {
+        try { console.log('[gd-host] announce DEDUPE ' + text) } catch (e) { /* ignore */ }
+        return
+      }
+      lastProgress.set(String(sid), { phrase: text, ts: now })
+      const clean = sanitizeSpeechText(text)
+      if (!clean) return
+      const q2 = voiceQueue.get(String(sid)) || []
+      q2.unshift({ stream: true, text: clean, key: 'progress:' + String(sid) + ':' + clean })
+      if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+      voiceQueue.set(String(sid), q2)
+      // RC17-F：进度播报文本入回声缓冲（否则其回声可绕过拒收被提交）
+      pushAgentSpeech(String(sid), clean, Date.now())
+      try { console.log('[gd-host] announce ' + clean + ' qlen=' + q2.length) } catch (e) { /* ignore */ }
+    }
+    // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
+    // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
+    // sessionId 推导：agent.session.id（T4 探针实证待确认；若证伪改为 agents 服务推导）
+    ctx.on('agent/status', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (!sid || !callOrA11yActive(sid)) return
+        if (payload.status === 'running') announce(sid, '正在处理')
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('tools/result', function (exec, result) {
+      try {
+        const agent = exec && exec.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        const name = exec && exec.name ? String(exec.name) : ''
+        const args = exec && exec.arguments ? exec.arguments : {}
+        if (!sid || !callOrA11yActive(sid) || !shouldAnnounce(name, args)) return
+        const phrase = progressPhrase(name)
+        announce(sid, phrase)
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('agent/error', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (!sid || !callOrA11yActive(sid)) return
+        const err = payload.error || {}
+        announce(sid, '处理出错：' + String((err && err.message) || err).slice(0, 60))
+      } catch (e) { /* best effort */ }
+    })
+    // ---- 下行流式 TTS（spec §6.5，零 WebSocket） ----
+    // RC14：播报文本净化——URL/markdown/emoji/列表标记不朗读（通话模式不读网址）
+    // RC19：下行分句前把 markdown 结构转成句界——标题/列表项/有序项各自成句（行首转 '。'），
+    // 表格单元格 | → 逗号停顿，表格分隔行与 --- 分隔线整体丢弃（旧行为把 '--'/'|---|---|'
+    // 整行拿去 TTS，播成噪音；复测日志实证 38 句回复 3 个 '--' 空音）。纯符号行最终丢弃。
+    function sanitizeSpeechText(text) {
+      return String(text || '')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`[^`]*`/g, ' ')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // [标题](url) → 标题
+        .replace(/https?:\/\/[^\s，。！？!?）)]+/g, ' ') // 裸 URL（中文标点收尾）
+        .replace(/www\.[^\s，。！？!?）)]+/g, ' ')
+        .replace(/^\s*\|[\-:| ]+\|\s*$/gm, '') // 表格分隔行 |---|---| → 丢弃
+        .replace(/\|/g, '，') // 表格单元格 → 逗号停顿
+        .replace(/^\s*#{1,6}\s+/gm, '。') // 标题 → 句界
+        .replace(/^\s*(?:[-+*]|>\s*)\s*/gm, '。') // 列表/引用项 → 句界
+        .replace(/^\s*\d{1,3}[.、)]\s*/gm, '。') // 有序项 → 句界
+        .replace(/^\s*[=\-]{3,}\s*$/gm, '') // 分隔线 --- → 丢弃
+        .replace(/[*_~#]/g, ' ')
+        .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{00A9}\u{00AE}]/gu, ' ') // emoji 区段
+        .replace(/[ \t]{2,}/g, ' ')
+        .split('\n').map(function (ln) {
+          const t = ln.replace(/^[，\s]+|[，\s]+$/g, '').trim() // 边角只清逗号/空白，句末 '。' 保留
+          return /^[\s，。！？!?；;、—\-_=|]*$/.test(t) ? '' : t
+        }).filter(function (ln) { return ln !== '' }).join('\n')
+        .trim()
+    }
+    function splitSentences(text, splitChars, maxChars) {
+      if (!text) return []
+      const max = maxChars || 200
+      // RC14：'.' 不再按字符类拆分（URL/小数拆断）——智能规则：后跟空白+大写/CJK 才拆
+      const extra = String(splitChars || '').replace(/[\\\]]/g, '\\$&').replace(/[.\s]/g, '')
+      const re = new RegExp('[。！？!?；;' + extra + '][ \t]*|\\n+|(?:\\.)(?=[ \t]+[A-Z0-9\u4e00-\u9fff])', 'g')
+      // RC19：句界标记 '。' 独立成段（结构转换插入的句首标记）与纯符号残留一律跳过——
+      // 旧实现把 '。' 段拿去 TTS 播成无声/杂音（复测日志 20+ 个 '。' 段）
+      const pureSeg = /^[\s，。！？!?；;、—\-_=|]+$/
+      const out = []
+      let last = 0, m
+      while ((m = re.exec(text)) !== null) {
+        const seg = text.slice(last, m.index + m[0].length).trim().replace(/^[，\s]+|[，\s]+$/g, '')
+        if (seg && !pureSeg.test(seg)) out.push(seg)
+        last = m.index + m[0].length
+      }
+      const tail = text.slice(last).trim().replace(/^[，\s]+|[，\s]+$/g, '')
+      if (tail && !pureSeg.test(tail)) out.push(tail)
+      const res = []
+      for (const s of out) {
+        if (s.length <= max) res.push(s)
+        else for (let i = 0; i < s.length; i += max) res.push(s.slice(i, i + max))
+      }
+      return res
+    }
+    const speechStreamBusy = new Map() // sessionId -> bool
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact',
+          path: '/guide-dog/tts-stream',
+          handler: async function (req, res) {
+            try {
+              if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+              const url = new URL(String(req.url || '/'), 'http://local')
+              const token = url.searchParams.get('token') || ''
+              const sid = url.searchParams.get('sid') || ''
+              const text = url.searchParams.get('text') || ''
+              if (!sid || !text || !consumeTtsToken(token, sid)) { res.writeHead(403); res.end(); return }
+              if (speechStreamBusy.get(sid)) { res.writeHead(429); res.end(); return }
+              speechStreamBusy.set(sid, true)
+              const cfg = loadConfig()
+              const streamCfg = (cfg.call && cfg.call.stream) || {}
+              const format = streamCfg.format || 'pcm'
+              const sampleRate = streamCfg.sampleRate || 24000
+              // RC7（2026-08-17 验收）：默认 call.voice 为英文音色——中文文本用英文音色输出近削波
+              // 爆音（实测 peak 31358/rms 6006 vs 中文音色 5609/928）。与 speakImpl 同款 CJK 判定：
+              // 中文走 voiceZh，非中文走 call.voice。
+              const ttsCfg = loadConfig().tts || {}
+              const voice = hasCJK(text) ? (ttsCfg.voiceZh || 'Chinese (Mandarin)_Gentle_Youth') : ((cfg.call && cfg.call.voice) || 'English_expressive_narrator')
+              const speed = (cfg.call && cfg.call.speed) || 1.0
+              // RC19：流式 TTS 改非流式合成——根因实证（2026-08-17 复测）：
+              // MiniMax T2A 流式接口把整段音频随首事件与末尾 status=2 事件各发一遍（SSE 探针：
+              // '你好' event#1 hex=69036 + event#4 hex=69104），mmx --stream 全量拼接 →
+              // 每句话播两遍（转写实证 --stream '你好' → '你好你好'；非流式 → '你好'）。
+              // 客户端本就整段收齐后才起播（RC18 HTMLAudio），流式无延迟收益；
+              // 改 mmx 非流式 --out 文件合成（speakImpl 同款通路），音频只出现一次。
+              if (req.method === 'HEAD') { speechStreamBusy.delete(sid); res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' }); res.end(); return }
+              let tmp = ''
+              try {
+                const root = await guideDogRoot()
+                const tmpDir = root + '/.guide-dog/tmp'
+                tmp = tmpDir + '/tts-' + String(Date.now()) + '-' + String(Math.floor(Math.random() * 1000000)) + '.pcm'
+                await runRaw('mkdir -p ' + quote(tmpDir), { timeoutMs: 10000 })
+                const syn = await mmx(['speech', 'synthesize', '--text', text, '--format', format, '--sample-rate', String(sampleRate), '--voice', voice, '--speed', String(speed), '--out', tmp], { timeoutMs: 120000 })
+                const data = syn.ok ? await readBytes(tmp, MAX_FILE_BYTES) : null
+                try { await runRaw('rm -f ' + quote(tmp), { timeoutMs: 10000 }) } catch (e) { /* ignore */ }
+                if (!data || !data.length) {
+                  // I1 语义保持：失败响应必须结束且不双写 head
+                  try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+                  return
+                }
+                res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' })
+                try { res.end(data) } catch (e) { /* ignore */ }
+              } catch (e) {
+                if (tmp) { try { await runRaw('rm -f ' + quote(tmp), { timeoutMs: 10000 }) } catch (e2) { /* ignore */ } }
+                try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+              } finally {
+                speechStreamBusy.delete(sid)
+              }
+            } catch (e) {
+              try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+    // 下行主通道：assistant 消息 → 分句 → 流条目入队列（client 播放器识别 stream 条目走 GET）
+    // RC11：按 (turn,step) 去重——同一事件重复/重放时不重复入队
+    const lastStreamTurn = new Map() // sessionId -> 'turn:step'
+    // RC13：只播回合最终消息——中间步骤（带 tool-call 块）只缓冲不播；turn/end 兜底
+    const pendingFinal = new Map() // sessionId -> { turn, text }（中间文本最后一条为准）
+    function streamTurnKey(turn, step) { return String(turn) + ':' + String(step) }
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'assistant/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const callActive = isCallActive(sid) // C4 修复：持久激活（Task 7 startCall/stopCall 上报）
+        const a11yOn = cfg.a11y && cfg.a11y.enabled
+        if (!callActive && !a11yOn) return // 仅通话/a11y 会话走流式；语音模式走 Phase 1 队列
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
+        if (!text) return
+        // RC13（三路评审定案）：中间步骤的 assistant/message 必带 tool-call 块（dsh-agent-loop
+        // step()：无 tool-call 即返回 completed）——逐 step 播放 = "同一内容反复播报"。带
+        // tool-call 的消息：文本入 pendingFinal（只留最后一条），本回合最终消息缺失时由
+        // turn/end 监听兜底播放（终结型工具回合不静音）。
+        const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
+        if (hasToolCall) {
+          if (text) pendingFinal.set(sid, { turn: data.turn, text: text })
+          return
+        }
+        pendingFinal.delete(sid)
+        // RC13（Task 3）：双通道互斥——本机扬声器已播（guide_dog_speak playOnHost）的文本不再入队
+        // RC14：按净化后文本匹配——downlink 文本含 markdown/URL 净化后才与 speakImpl 注册键一致
+        if (wasHostSpoken(sid, sanitizeSpeechText(text))) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(text).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
+        // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队
+        const tkey = streamTurnKey(data.turn, data.step)
+        const now3 = Date.now()
+        if (tkey !== 'undefined:undefined') {
+          if (lastStreamTurn.get(sid) === tkey) return
+          lastStreamTurn.set(sid, tkey)
+        } else {
+          // RC15：turn/step 缺失 → 按净化文本短窗口去重（事件重放防御：同句 10s 内不重复入队）
+          const pc = sanitizeSpeechText(text)
+          if (pc && replayDup(lastStreamText.get(sid), pc, now3, 10000)) {
+            try { console.log('[gd-host] skip replay text=' + String(pc).slice(0, 20)) } catch (e) { /* ignore */ }
+            return
+          }
+          if (pc) lastStreamText.set(sid, { text: pc, at: now3 })
+        }
+        const streamCfg = (cfg.call && cfg.call.stream) || {}
+        const clean = sanitizeSpeechText(text)
+        if (!clean) return
+        const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const q = voiceQueue.get(sid) || []
+        sentences.forEach(function (s) {
+          // RC14：诊断埋点——同句已在队列则告警（仅日志，不丢弃）
+          const dup = q.some(function (e) { return e.text === s })
+          if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
+          q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) })
+          // RC17：回声拒收缓冲——agent 即将播报的句子入缓冲（转写回声比对用）
+          pushAgentSpeech(sid, s, Date.now())
+        })
+        // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
+        while (q.length > VOICE_QUEUE_MAX) q.pop()
+        voiceQueue.set(sid, q)
+        // RC12 诊断日志（DSH 终端可见）；RC14：补来源标签（downlink 入队）
+        try { console.log('[gd-host] enqueue from=downlink n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
+      } catch (e) { /* best effort */ }
+    })
+    // RC13：回合结束兜底——本回合无可播最终消息（终结型工具回合：最后一条 assistant/message
+    // 带 tool-call 块被过滤）时，把 pendingFinal 缓冲的中间文本播出去，避免整回合静音。
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'turn/end') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        if (!isCallActive(sid) && !(cfg.a11y && cfg.a11y.enabled)) return
+        const turn = (typeof (event.data && event.data.turn) === 'number') ? event.data.turn : null
+        if (turn === null) return
+        const pend = pendingFinal.get(sid)
+        if (!pend || pend.turn !== turn || !pend.text) return
+        pendingFinal.delete(sid)
+        // RC14：本机已播（guide_dog_speak playOnHost）不再兜底入队
+        if (wasHostSpoken(sid, sanitizeSpeechText(pend.text))) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(pend.text).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
+        const streamCfg = (cfg.call && cfg.call.stream) || {}
+        const clean = sanitizeSpeechText(pend.text)
+        if (!clean) return
+        const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const q = voiceQueue.get(sid) || []
+        sentences.forEach(function (s) {
+          // RC14：诊断埋点——同句已在队列则告警（仅日志，不丢弃）
+          const dup = q.some(function (e) { return e.text === s })
+          if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
+          q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) })
+          // RC17：回声拒收缓冲——agent 即将播报的句子入缓冲（转写回声比对用）
+          pushAgentSpeech(sid, s, Date.now())
+        })
+        // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
+        while (q.length > VOICE_QUEUE_MAX) q.pop()
+        voiceQueue.set(sid, q)
+        try { console.log('[gd-host] enqueue from=turnend n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
+      } catch (e) { /* best effort */ }
+    })
+    // ---- 容错（spec §6.8） ----
+    const lastAgentEvent = new Map() // sessionId -> ts
+    ctx.on('agent/status', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (sid) lastAgentEvent.set(sid, Date.now())
+      } catch (e) { /* ignore */ }
+    })
+    ctx.on('tools/result', function (exec) {
+      try {
+        const agent = exec && exec.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (sid) lastAgentEvent.set(sid, Date.now())
+      } catch (e) { /* ignore */ }
+    })
+    function heartbeatCheck() {
+      const now = Date.now()
+      // C4 修复：遍历持久激活集合（callActiveSessions），不再读瞬时 callActiveFlags
+      callActiveSessions.forEach(function (sid) {
+        const last = lastAgentEvent.get(String(sid)) || now
+        if (now - last > 120000) {
+          lastAgentEvent.set(String(sid), now) // 防重复轰炸
+          // RC10：与 announce 同机制——流条目（单通道串行），不再 speakImpl 合成 mp3
+          const q2 = voiceQueue.get(String(sid)) || []
+          q2.unshift({ stream: true, text: '仍在处理，请稍候', key: 'hb:' + String(sid) })
+          if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+          voiceQueue.set(String(sid), q2)
+          // RC17-F：心跳播报文本入回声缓冲
+          pushAgentSpeech(String(sid), '仍在处理，请稍候', Date.now())
+        }
       })
     }
+    // R2（2026-08-16 控制器裁定）：双路径心跳——interval 可用走 timerSvc.interval
+    // （disposer 挂 ctx.effect），否则 sleep 递归清扫；两条路径互斥，仅一条运行。
+    // T3 守护：timerSvc 为 null 时 sleep 路径绝不启动（sleep 早退 → Promise 立即 resolve → 忙循环）。
+    function startSleepSweeper() {
+      // 前置分号防 ASI 合并（IIFE 语句）
+      ;(function hb() {
+        sleep(30000).then(function () {
+          heartbeatCheck()
+          hb()
+        })
+      })()
+    }
+    const heartbeatTimer = timerSvc && typeof timerSvc.interval === 'function'
+      ? timerSvc.interval(heartbeatCheck, 30000)
+      : (timerSvc ? startSleepSweeper() : null)
+    if (heartbeatTimer) ctx.effect(heartbeatTimer)
+    ctx.effect(function () {
+      try {
+        return harness.handle('guide-dog/call-command', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          const cmd = args && args.cmd ? String(args.cmd) : ''
+          if (!sid || !cmd) return { ok: false, error: 'bad_args' }
+          if (cmd === 'clear-queue') { voiceQueue.delete(sid); return { ok: true } }
+          // RC11：打断直达 agent——steer 作为 next-step 输入注入运行中的回合（下一个 step
+          // 边界消费；DSH 无 step-only abort）。消息形状对齐 dsh-llm UserMessage。
+          if (cmd === 'interrupt') {
+            const text = args && typeof args.text === 'string' ? args.text.trim() : ''
+            if (!text) return { ok: false, error: 'bad_args' }
+            const agentsSvc = ctx.get('agents')
+            const agent = agentsSvc && typeof agentsSvc.get === 'function' ? agentsSvc.get(sid) : null
+            if (agent && typeof agent.steer === 'function') {
+              try {
+                const msg = { id: 'gd-interrupt:' + Date.now() + ':' + Math.random().toString(36).slice(2, 8), role: 'user', content: [{ type: 'text', text: text }], source: { kind: 'user' } }
+                await agent.steer(msg)
+                return { ok: true, delivered: true }
+              } catch (e) {
+                return { ok: false, error: 'steer_failed', message: String(e).slice(0, 200) }
+              }
+            }
+            return { ok: false, error: 'agent_unavailable' }
+          }
+          return { ok: true }
+        })
+      } catch (e) { return function () {} }
+    })
+    // ============ VOICE MODE 节（Phase 1，host） ============
+    // 事件形状（决策门 probe2.json 回填）：
+    //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
+    //   - 文本提取: const data = event.data || {}；content 取 data.content（或 data.message.content）blocks；
+    //     text = content 中 type==='text' 的 b.text 拼接
+    //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
+    const VOICE_QUEUE_MAX = 40 // RC14：40 上限（净化后句子数骤减；超长回复截尾不截头）
+    const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
+    // RC15：回队核心（纯函数，供 RPC 与 repro 复用）——同 key 已在队则不重复插入；超出上限截尾
+    function requeueEntry(q, entry, max) {
+      const dup = q.some(function (e) { return e.key === entry.key })
+      if (!dup) q.unshift(entry)
+      while (q.length > max) q.pop()
+      return { q: q, dup: dup }
+    }
+    const lastStreamText = new Map() // sessionId -> {text, at}（RC15：turn/step 缺失时的事件重放去重）
+    const lastVoiceText = new Map() // sessionId -> {text, at}（RC15：语音模式同文本短窗口去重）
+    // RC15：事件重放去重判定（纯函数，供两处监听与 repro 复用）——同文本且在窗口内 → true（应跳过）
+    function replayDup(prev, text, now, windowMs) {
+      return !!(prev && prev.text === text && (now - prev.at) < windowMs)
+    }
+    // RC17：回声拒收——agent 最近播报文本缓冲（sessionId -> [{t, at}]；每句入队时推送，≤8 条）
+    // 背景：无 AEC 环境（RDP 虚拟麦克风/立体声混音回环设备）下，麦克风拾取 agent 自己的播报，
+    // VAD 视为用户发声 → 转写出的正是 agent 自己的话 → 提交回去 → 自问自答死循环。
+    // 防线：转写文本与最近播报等长命中或 ≥6 字符包含命中 → 判为回声，拒绝提交。
+    const lastAgentSpeech = new Map() // sessionId -> Array<{t, at}>
+    function pushAgentSpeech(sid, text, now) {
+      if (!sid || !text) return
+      const arr = lastAgentSpeech.get(sid) || []
+      arr.push({ t: text, at: now })
+      while (arr.length > 8) arr.shift()
+      lastAgentSpeech.set(sid, arr)
+    }
+    function echoMatch(trans, recent) {
+      const t = String(trans || '').trim()
+      if (!t || !recent || !recent.length) return false
+      for (let i = 0; i < recent.length; i++) {
+        const r = String((recent[i] && recent[i].t) || '')
+        if (!r) continue
+        if (r === t) return true
+        if (t.length >= 6 && (r.indexOf(t) >= 0 || t.indexOf(r) >= 0)) return true
+      }
+      // RC17-F：字符二元组覆盖率（抗 ASR 变体/片段回声）——转写 ≥50% 的二元组出现在最近播报任一文本 → 回声
+      const grams = new Set()
+      for (let i = 0; i + 2 <= t.length; i++) grams.add(t.slice(i, i + 2))
+      if (grams.size < 6) return false
+      let hit = 0
+      for (const g of grams) {
+        for (let j = 0; j < recent.length; j++) {
+          if (String((recent[j] && recent[j].t) || '').indexOf(g) >= 0) { hit++; break }
+        }
+      }
+      return (hit / grams.size) >= 0.5
+    }
+    function echoGuard(result, sid) {
+      if (result && result.ok && sid && lastAgentSpeech.has(sid)) {
+        if (echoMatch(result.text, lastAgentSpeech.get(sid))) {
+          try { console.log('[gd-host] echo_reject sid=' + sid + ' text=' + String(result.text).slice(0, 20)) } catch (e) { /* ignore */ }
+          return { ok: false, error: 'echo_reject', message: 'echo of agent speech' }
+        }
+      }
+      return result
+    }
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'assistant/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const vm = cfg.voiceMode || {}
+        const effective = vm.sessions && vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
+        if (!effective) return
+        if (isCallActive(sid) || (loadConfig().a11y && loadConfig().a11y.enabled)) return // Phase 2：通话/a11y 由流式通道接管，防双播
+        const seq = (typeof event.seq === 'number') ? event.seq : null // M11：缺失时不参与去重（speakImpl 对 null 不去重）
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
+        if (!text) return
+        const clean = sanitizeSpeechText(text)
+        if (!clean) return
+        // RC13：语音模式同样只播回合最终消息——"非通话语音模式也反复播放同一内容"同根因
+        // （逐 step 播近同文案）。带 tool-call 的中间消息直接跳过（语音模式终结工具回合
+        // 极少见，不设 turn/end 兜底）。
+        const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
+        if (hasToolCall) return
+        // RC15：语音模式同文本短窗口去重（事件重放/agent 复述 → 复读机防御；10s 窗口）
+        const now4 = Date.now()
+        if (replayDup(lastVoiceText.get(sid), clean, now4, 10000)) {
+          try { console.log('[gd-host] skip voice-dup text=' + String(clean).slice(0, 20)) } catch (e) { /* ignore */ }
+          return
+        }
+        lastVoiceText.set(sid, { text: clean, at: now4 })
+        // RC13（Task 3）：双通道互斥
+        if (wasHostSpoken(sid, clean)) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(clean).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
+        // 异步串行 TTS，不阻塞事件循环
+        serialSpeak(function () {
+          return speakImpl({ text: clean, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
+            const q = voiceQueue.get(sid) || []
+            if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
+            // M6：错误项统一 { error: <码>, message: <人读文本> }，client 优先显示 message
+            else if (r && !r.ok) q.push({ error: (r.error || 'tts_failed'), message: (r.message || '') })
+            if (q.length > VOICE_QUEUE_MAX) q.shift()
+            voiceQueue.set(sid, q)
+          }).catch(function (e) {
+            // M8：绝不静默 —— speakImpl reject 也入错误项（重新取 map，避免陈旧引用）
+            const q = voiceQueue.get(sid) || []
+            q.push({ error: 'tts_failed', message: String((e && e.message) || e).slice(0, 200) })
+            if (q.length > VOICE_QUEUE_MAX) q.shift()
+            voiceQueue.set(sid, q)
+          })
+        })
+      } catch (e) { /* listener is best effort */ }
+    })
+    ctx.effect(function () {
+      try {
+        const offRequeue = harness.handle('guide-dog/voice-requeue', async function (args) {
+          try {
+            const sid = args && args.sessionId ? String(args.sessionId) : ''
+            const entry = args && args.entry
+            if (!sid || !entry || !entry.key) return { ok: false, error: 'bad_args' }
+            const q = voiceQueue.get(sid) || []
+            const out = requeueEntry(q, entry, VOICE_QUEUE_MAX)
+            voiceQueue.set(sid, out.q)
+            try { console.log('[gd-host] requeue sid=' + sid + ' key=' + String(entry.key).slice(0, 24) + ' dup=' + out.dup) } catch (e) { /* ignore */ }
+            return { ok: true, dup: out.dup }
+          } catch (e) { return { ok: false, error: String((e && e.message) || e) } }
+        })
+        const offQueue = harness.handle('guide-dog/voice-queue', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: true, entry: null }
+          const q = voiceQueue.get(sid) || []
+          const entry = q.length ? q.shift() : null
+          if (!q.length) voiceQueue.delete(sid)
+          if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?') + ' remain=' + q.length) } catch (e) { /* ignore */ } }
+          return { ok: true, entry: entry }
+        })
+        return function () {
+          try { if (offRequeue) offRequeue() } catch (e) { /* ignore */ }
+          try { if (offQueue) offQueue() } catch (e) { /* ignore */ }
+        }
+      } catch (e) { return function () {} }
+    })
 
     // ---------- RPC handlers (client -> host) ----------
     ctx.effect(function () {

@@ -1,0 +1,15 @@
+{
+  "name": "dsh-guide-dog-autoload",
+  "version": "0.1.0",
+  "description": "DSH host plugin: auto-deploy the Guide Dog dynamic Cordis plugin (gdog-*) from disk sources whenever an agent session is created. Recovers the plugin after every DSH restart (dynamic plugin definitions are process-local).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}
