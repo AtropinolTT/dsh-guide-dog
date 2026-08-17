@@ -3,6 +3,8 @@
 [![dsh-recommend](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.certified.json)](https://github.com/zp-home/dsh-recommend)
 [![dsh score](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzp-home%2Fdsh-recommend%2Fmain%2Fdata%2Fbadges%2FAtropinolTT__dsh-guide-dog.json)](https://github.com/zp-home/dsh-recommend)
 
+**English** | [简体中文](README.zh-CN.md)
+
 A dynamic Cordis plugin that gives DeepSeek Harness multimodal superpowers through
 the [mmx CLI](https://www.npmjs.com/package/mmx-cli) (MiniMax):
 
@@ -50,6 +52,7 @@ this README; the score badge updates automatically on every registry sync.
 | `bundle/` | Static web-profile bundle generated from the two halves (`deploy/convert_bundle.py`) |
 | `deploy/` | `convert_bundle.py` (source → bundle) and `publish.py` (bundle → `~/.dsh/dsh-guide-dog` + web profile registration) |
 | `README.md` | This file |
+| `README.zh-CN.md` | Simplified-Chinese version of this README |
 
 ## Deploy (static web-profile bundle — current)
 
@@ -149,9 +152,9 @@ Settings → **Guide Dog** (id `guide-dog`):
 
 - **Auth** — `mmx auth status` result with the key masked (`sk-c…xxxx`); never
   logged in full.
-- **语音模式（Voice mode）** — global default on/off radios (per-session
-  override lives on the small speaker button at the input's bottom-left).
-- **语音输入（Voice input）** — STT engine select (whisper / sherpa / minimax),
+- **Voice mode** — global default on/off radios (per-session override lives on
+  the small speaker button at the input's bottom-left).
+- **Voice input** — STT engine select (whisper / sherpa / minimax),
   recognition language (auto/zh/en), input device select (defaults to the
   system default), and auto-send-after-recognition checkbox.
 - **STT** — faster-whisper availability + version/python, and the whisper model
@@ -175,7 +178,7 @@ Settings → **Guide Dog** (id `guide-dog`):
   (`--dsw-alias-*`), inheriting the app font:
   - small **speaker** icon — click toggles the per-session voice-mode override
     (`guide-dog/set-config` with `voiceMode.sessions`); hover tooltip shows
-    "语音模式提示：开/关 · 全局默认：开/关".
+    "Voice mode: on/off · Global default: on/off".
   - **language dropdown** — recognition language detection (auto/zh/en).
   - **mic** icon — record → transcribe → insert (feather-style SVG; recording
     state pulses red with a second counter).
@@ -191,7 +194,7 @@ Settings → **Guide Dog** (id `guide-dog`):
   `no_device`, `empty_speech`, `stt_failed`, `stt_timeout`,
   `engine_unavailable`, `insert_failed` (never silent).
 - **Recorder page** — sandboxed clients that cannot record in-page get a
-  `🎙 打开录音页` link to the standalone `/guide-dog/recorder` page
+  `🎙 Open recorder page` link to the standalone `/guide-dog/recorder` page
   (GET serves a self-contained HTML recorder; POST
   `/guide-dog/transcribe-upload` accepts raw `audio/webm`, 20 MB cap, and runs
   the same `transcribeImpl`).
@@ -258,134 +261,197 @@ Manual checks (after deploy): click the speaker button (voice mode on, turns
 green) → send a message → the assistant reply is spoken automatically; switch
 sessions mid-playback → the clip continues to the end and is NOT replayed;
 use the mic button → recognized text appears in the input box; Settings →
-Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
+Guide Dog shows the Voice mode / Voice input / STT blocks.
 
-## Phase 2 — call mode (通话模式)
+## Phase 2 — call mode
 
 ### Feature list
 
-- **零 WebSocket 双通道** — 上行整段 POST `/guide-dog/call-transcribe`
-  （webm/opus，≤20MB，复用 Phase 1 `transcribeImpl` 与本地 whisper 管线）
-  → `{ok, text, language, durationMs}`；下行 `GET /guide-dog/tts-stream`
-  走 chunked HTTP 流（host 按句 spawn `mmx speech synthesize --stream
-  --format pcm --sample-rate 24000`，stdout 管道增量喂 `res.write`；client
-  用 `fetch().body.getReader()` 读流 → PCM→WAV → Web Audio 无缝调度）。
-  传输层无 WebSocket 新协议面，浏览器与 CLI 复用同一管线。
-- **VAD 自动 + 按住说话（PTT）** — 默认 VAD（`call.mode='vad'`）：
-  MediaRecorder（`audio/webm;codecs=opus`，250ms timeslice 整通录音）+
-  并行 AnalyserNode 能量检测（RMS ≥ `vad.threshold`、静音 `vad.silenceMs`
-  判定说话结束、`vad.minSpeechMs` 最短语音、`vad.maxSegmentSeconds` 单段
-  上限）——说话-停顿-说话自动成两段回合；面板可切换 `ptt` 按住说话
-  （按住麦克风说话、松开即发送；VAD 参数不参与端点判定，仅做打断监测）。
-- **共识优先（Consensus-first，核心交互范式）** — 仅通话/a11y 开启时生效，
-  打字模式保持 Phase 1 现状：prompt 软约束（`guide_dog_call_consensus`
-  systemPrompt variable，聊天式措辞：先理解意图、不清楚就问、写入/修改前
-  说明并等用户点头）+ 机制硬保证（`tools/pre-execute` 瀑布拦截：write/edit
-  与 bash 破坏性命令启发式 rm/mv/cp/truncate/dd/覆盖重定向/git push 等 →
-  未确认返回 `{kind:'deny', reason:'needs_voice_confirmation'}`，模型语音
-  提问；用户确认词命中 → 本轮放行；每次执行前 host 用工具入参生成一句话
-  摘要直接 TTS 播报（不走模型），随后开启 `consensus.summaryWindowMs` 打断
-  窗口，窗口内用户发声即中止本次执行——工具物理上尚未启动）。拦截器自身
-  失败 → 拒绝并口播"共识检查失败"（宁可拦错不可放错，spec §6.8）。
-- **进度播报（精简原则，RC10）** — 仅播有效信息：`agent/status`
-  （running → "正在处理"）、`tools/result`（工具名→短语：write/edit→
-  "正在修改文件"、web_search→"正在搜索网页"、
-  guide_dog_image/video/music/speak→"正在生成媒体"、
-  bash 仅破坏性命令（与共识拦截同口径 DESTRUCTIVE_BASH_RE）→"正在执行命令"；
-  read/grep/glob/skill/非破坏性 bash/未知工具静默）、`agent/error`
-  （"处理出错：<短原因>"）；同短语 4s 冷却去重（多步同类操作只报一次）；
-  通话中 >120s 无任何事件 → 心跳播报"仍在处理，请稍候"。播报与回复朗读
-  共用队列：播报优先（队首）、回复让路；播报走**流式通道**
-  （与回复同一 WebAudio PCM 链）→ 单播放器构造性串行，一条接一条，不可能重叠。
-- **流式 TTS** — 回复文本按句切分（`stream.sentenceSplit` 字符集
-  `。！？.!?\n`；`stream.maxSentenceChars` 超长句强制截断）逐句合成；每句
-  经 `guide-dog/tts-token` 重新签发一次性 token（单次消费、5 分钟有效、
-  绑定 sessionId）；句间预合成（当前句播放期间 client 提前请求下一句流，解码帧
-  按播放时间链无缝追加调度——前一句未播完即续接下一句，长回复完整朗读、播放
-  间隙 ≤400ms）。
-  实测中文短句首字节 ~600ms，满足"首音频 <1.5s"判据。
-  **只播回合最终消息（RC13）**：中间步骤的 assistant 消息（带工具调用块）不入队——逐 step 播放近同文案是"同一内容反复播报"的根因；中间步骤由进度播报覆盖。终结型工具回合（最后一条消息仍带工具调用）由 turn/end 兜底播缓冲文本，不静音。
-- **打断（Barge-in）** — VAD 检测到播放中用户发声（≥ `vad.interruptMinMs`
-  300ms 防误触）→ 浏览器立即停止播放并清空未播缓冲 → 停播为 10ms 淡出
-  （RC13）——`src.stop()` 硬切会在句切断处产生咔哒爆音。打断后的首个
-  转写段经 `interrupt` RPC 直达当前回合（`agent.steer`，RC11），不排队成
-  新回合 → abort 当前
-  `tts-stream` fetch → 新语音自然成为下一回合（Pipecat InterruptionFrame
-  语义）。
-- **语音命令** — 通话转写命中命令表（暂停、恢复、重复/再说一遍、慢一点/快一点、
-  看看屏幕〔Phase 3 桩〕）→ 本地执行且不提交到对话（停/继续 是共识确认词，不
-  占用命令表、原样放行到 agent）；
-  `guide-dog/call-command` RPC 提供 `clear-queue` 等 host 侧命令。
-- **双通道互斥（RC13）** — `guide_dog_speak(playOnHost=true)` 已在本机扬声器播过的文本，不再经语音模式/通话队列通道重播（消费即删，同文本只挡一次）——消除"本机 + 浏览器双响"。
-- **容错** — 流中断自动重连一次（按 (sid,text) 5s 内至多重试一次、429 不重试；每句重新取 token；失败 toast 提示
-  "播放中断"）；STT 失败不提交 + 提示音 + toast；TTS 失败文字照常落地 +
-  失败提示音 + 面板错误状态（绝不静默）；共识拦截器失败保守拒绝并口播原因。
-  通话转写/打断/轮询的会话归属在发起通话时一次性捕获（RC13）——多会话切换不再串台。
+- **WebSocket-free dual channel** — uplink is a whole-clip POST
+  `/guide-dog/call-transcribe` (webm/opus, ≤20MB, reuses the Phase 1
+  `transcribeImpl` and the local whisper pipeline) → `{ok, text, language,
+  durationMs}`; downlink is `GET /guide-dog/tts-stream` over a chunked HTTP
+  stream (the host spawns `mmx speech synthesize --stream --format pcm
+  --sample-rate 24000` per sentence and pipes stdout incrementally into
+  `res.write`; the client reads the stream with `fetch().body.getReader()`
+  → PCM→WAV → seamless Web Audio scheduling). No new WebSocket protocol
+  surface on the transport layer; browser and CLI reuse the same pipeline.
+- **Automatic VAD + push-to-talk (PTT)** — default VAD (`call.mode='vad'`):
+  MediaRecorder (`audio/webm;codecs=opus`, 250ms timeslice, continuous
+  recording) + a parallel AnalyserNode energy detector (RMS ≥
+  `vad.threshold`; silence for `vad.silenceMs` ends an utterance;
+  `vad.minSpeechMs` minimum speech; `vad.maxSegmentSeconds` per-segment cap)
+  — speak-pause-speak automatically becomes two turns; the panel can switch
+  to `ptt` push-to-talk (hold the mic to talk, release to send; VAD
+  parameters do not participate in endpointing, only in interruption
+  monitoring).
+- **Consensus-first (core interaction paradigm)** — active only when
+  call/a11y is on; typing mode keeps the Phase 1 behavior: a prompt soft
+  constraint (`guide_dog_call_consensus` systemPrompt variable, conversational
+  wording: understand intent first, ask when unclear, explain before
+  writing/modifying and wait for the user's go-ahead) plus a mechanical hard
+  guarantee (`tools/pre-execute` waterfall interception: write/edit and
+  destructive-bash heuristics rm/mv/cp/truncate/dd/overwriting-redirect/git
+  push etc. → unconfirmed returns `{kind:'deny', reason:
+  'needs_voice_confirmation'}` and the model asks by voice; user confirmation
+  keywords hit → released for this turn; before every execution the host
+  TTS-broadcasts a one-sentence summary built from the tool args (not through
+  the model), then opens a `consensus.summaryWindowMs` interruption window;
+  speech inside the window aborts the execution — the tool has physically not
+  started). Interceptor failure → deny and announce "consensus check failed"
+  (better to block wrongly than to allow wrongly, spec §6.8).
+- **Progress announcements (minimalist principle, RC10)** — only useful
+  information is announced: `agent/status` (running → "processing"),
+  `tools/result` (tool name → phrase: write/edit → "modifying files",
+  web_search → "searching the web", guide_dog_image/video/music/speak →
+  "generating media", bash only for destructive commands (the same
+  DESTRUCTIVE_BASH_RE as consensus) → "running a command"; read/grep/glob/
+  skill/non-destructive bash/unknown tools stay silent), `agent/error`
+  ("processing failed: <short reason>"); same-phrase 4s cooldown dedupe
+  (multi-step same-kind operations announced once); >120s without any event
+  during a call → heartbeat "still processing, please wait". Announcements
+  and reply playback share one queue: announcements first (queue head),
+  replies yield; announcements go through the **streaming channel** (the same
+  WebAudio PCM chain as replies) → constructive serialization on a single
+  player, one after another — overlap is impossible.
+- **Streaming TTS** — reply text is split per sentence (`stream.sentenceSplit`
+  charset `。！？.!?\n`; `stream.maxSentenceChars` force-truncates over-long
+  sentences) and synthesized sentence by sentence; each sentence gets a fresh
+  one-time token via `guide-dog/tts-token` (single-use, 5-minute validity,
+  bound to sessionId); pre-synthesis between sentences (while the current
+  sentence plays, the client requests the next sentence's stream ahead of
+  time and appends decoded frames seamlessly on the playback-time chain — the
+  next sentence continues before the previous one finishes; long replies are
+  read in full with ≤400ms gaps). Measured ~600ms to first byte for short
+  Chinese sentences, satisfying the "first audio <1.5s" criterion.
+  **Only the turn's final message is played (RC13)**: intermediate assistant
+  messages (with tool-call blocks) are not enqueued — playing near-identical
+  text per step was the root cause of "the same content repeated";
+  intermediate steps are covered by progress announcements. A terminal tool
+  turn (the last message still has tool calls) is covered by the turn/end
+  fallback that plays the buffered text — never silent.
+- **Barge-in** — VAD detects user speech during playback (≥
+  `vad.interruptMinMs` 300ms to avoid false triggers) → the browser
+  immediately stops playback and clears the unplayed buffer → the stop is a
+  10ms fade-out (RC13) — `src.stop()` hard cuts click at sentence boundaries.
+  The first transcript segment after the interruption goes straight to the
+  current turn via the `interrupt` RPC (`agent.steer`, RC11) instead of
+  queueing as a new turn → abort the current `tts-stream` fetch → the new
+  speech naturally becomes the next turn (Pipecat InterruptionFrame
+  semantics).
+- **Voice commands** — call transcriptions that hit the command table (pause,
+  resume, repeat/say-again, slower/faster, look-at-screen [Phase 3 stub])
+  execute locally and are not submitted to the conversation (stop/continue
+  are consensus confirmation words, not in the command table — they pass
+  through to the agent unchanged); `guide-dog/call-command` RPC provides
+  host-side commands such as `clear-queue`.
+- **Dual-channel mutual exclusion (RC13)** — text already spoken on the host
+  speakers via `guide_dog_speak(playOnHost=true)` is not replayed through the
+  voice-mode/call queue channels (consumed on use, the same text blocked
+  once) — eliminates the "host + browser double sound".
+- **Fault tolerance** — a stream interruption auto-reconnects once (at most
+  one retry per (sid,text) within 5s, no retry on 429; a fresh token per
+  sentence; failure toast "playback interrupted"); STT failure does not
+  submit + beep + toast; TTS failure still lands the text + failure beep +
+  panel error state (never silent); consensus-interceptor failure denies
+  conservatively and announces the reason. Session ownership for call
+  transcription/interruption/polling is captured once when the call starts
+  (RC13) — multi-session switching no longer cross-talks.
 
-### RC14 修复（2026-08-17）：播报内容选择 + 队列截尾 + 进度去重 + 双播定位
+### RC14 fixes (2026-08-17): announcement content selection + queue tail-truncation + progress dedupe + double-play pinpointing
 
-- **播报内容净化（`sanitizeSpeechText`，F1）** — 入队前对回复文本做一次 markdown/URL/emoji
-  剥离：`[标题](url)` 保留标题去 URL；裸 URL（`https?://`、`www.`）整段移除；行首列表/引用
-  标记（`-`/`+`/`*`/`>`）与行首有序列表标记（`1.` `1、` `1)`）剥除；`**加粗**`/`` ` ``/`` ``` ``
-  等 markdown 标记剥除；emoji 区段（`U+1F000-U+1FAFF` 等）剥除。通话场景只朗读人话，不读
-  网址/`**`/`-`/📢 等元字符，避免"thepaper/newsD/weather.com"这类 URL 碎片被打散朗读。
-- **智能分句（`splitSentences`，F2）** — 默认分隔符 `'。！？.!?\n'` 中的 `.` 改为智能规则：
-  仅当 `.` 后**紧跟空白+大写字母/数字/CJK** 才拆（`'Hello. Next'` 拆成 2 句；`'8.17 的上海'`
-  保持 1 句；URL 内部的 `.` 不会被打断）。中文分隔集合追加 `；;`，避免 `…；` 把一句中文回复
-  拆成两半。
-- **队列上限 40 截尾（`VOICE_QUEUE_MAX`，F3）** — 由 10 提到 40，**丢队尾保内容**：
-  超限时 `while (q.length > VOICE_QUEUE_MAX) q.pop()`（先入内容优先；旧 `splice(0, …)`
-  从队头删的策略会把主内容先裁掉，保留 URL 碎片）。announce/hb 的 progress 仍用 `pop()`
-  （unshift 到队首，progress 优先）。
-- **进度短语 30s 去重窗口（F4）** — `announce` 的 `progressDedupe` 冷却由 4s 延长到 30s：
-  web_search 多次结果间隔 ~4.3s 时不会连播 3 次「正在搜索网页」。`progressDedupe` 函数
-  本体未动；`repro-progress.js` 语义保持。
-- **双通道互斥按净化后文本匹配（F5）** — `wasHostSpoken` / `markHostSpoken` 统一使用
-  `sanitizeSpeechText` 处理后的文本作为键：downlink、turn-end flush、voice-mode 三处
-  `wasHostSpoken` 都按净化键匹配；`speakImpl` 在 `playOnHost` 成功后同时注册原始键与
-  净化键（双键），下游任一通道都能正确去重。已知边界：transform.py 改写文本时两个键
-  可能不完全一致（属可接受边缘）。
-- **诊断埋点（F6，一次复测定位"读两遍"）** — 零行为变更，只加日志：
-  - host（`[gd-host]`，DSH 终端可见）：
-    `enqueue from=downlink|turnend|voice-mode|consensus|announce|heartbeat n=... qlen=...`、
-    `shift key=... remain=...`、`skip host-spoken sid=... text=...`、`QUEUE-DUP text=...`。
-  - client（`[gd]`，浏览器 DevTools）：
-    `playStreamEntry ... times=...`（每次播放按 `entry.key || entry.text` 累加计数）、
-    `PLAY-SUMMARY key=N | ...`（队列空时汇总当前所有计数后清空）。
-  - 复测定标（RC15 走向依据）：`QUEUE-DUP` → host 双入队；`PLAY-SUMMARY key=2` → client 双播；
-    两者皆无但仍两遍 → tts-stream 音频双写；`enqueue from=` 同源两次同文本 → 事件重放。
+- **Announcement sanitization (`sanitizeSpeechText`, F1)** — before
+  enqueueing, reply text goes through a markdown/URL/emoji strip:
+  `[title](url)` keeps the title, drops the URL; bare URLs (`https?://`,
+  `www.`) are removed entirely; leading list/quote markers (`-`/`+`/`*`/`>`)
+  and leading ordered-list markers (`1.` `1、` `1)`) are stripped; markdown
+  markers such as `**bold**` and backticks are stripped; emoji ranges
+  (`U+1F000-U+1FAFF` etc.) are stripped. Call mode reads only human language
+  — no URLs/`**`/`-`/📢 metacharacters, so URL fragments like
+  "thepaper/newsD/weather.com" are no longer read out in pieces.
+- **Smart sentence splitting (`splitSentences`, F2)** — in the default
+  separators `'。！？.!?\n'`, `.` follows a smart rule: split only when `.` is
+  followed by whitespace + an uppercase letter/digit/CJK (`'Hello. Next'` → 2
+  sentences; `'8.17 的上海'` stays 1; dots inside URLs are never split). The
+  Chinese separator set gains `；;` so `…；` no longer cuts one Chinese reply
+  into two halves.
+- **Queue cap 40 with tail truncation (`VOICE_QUEUE_MAX`, F3)** — raised
+  10→40, **drop from the tail to keep content**: on overflow `while
+  (q.length > VOICE_QUEUE_MAX) q.pop()` (first-in content wins; the old
+  `splice(0, …)` head-removal strategy cut the main content first while
+  keeping URL fragments). announce/hb progress still use `pop()` (unshifted
+  to the queue head, progress first).
+- **30s progress-phrase dedupe window (F4)** — `announce`'s `progressDedupe`
+  cooldown extended 4s→30s: web_search results ~4.3s apart no longer announce
+  "searching the web" three times. The `progressDedupe` function body is
+  untouched; `repro-progress.js` semantics preserved.
+- **Dual-channel mutual exclusion by sanitized text (F5)** —
+  `wasHostSpoken` / `markHostSpoken` uniformly use
+  `sanitizeSpeechText`-processed text as the key: all three `wasHostSpoken`
+  call sites (downlink, turn-end flush, voice-mode) match on the sanitized
+  key; `speakImpl` registers both the raw and the sanitized key after a
+  successful `playOnHost` (double key) so any downstream channel dedupes
+  correctly. Known edge: when transform.py rewrites the text the two keys may
+  differ slightly (acceptable edge).
+- **Diagnostic instrumentation (F6, one-shot retest to pinpoint "reading
+  twice")** — zero behavior change, logs only:
+  - host (`[gd-host]`, visible in the DSH terminal):
+    `enqueue from=downlink|turnend|voice-mode|consensus|announce|heartbeat n=... qlen=...`,
+    `shift key=... remain=...`, `skip host-spoken sid=... text=...`,
+    `QUEUE-DUP text=...`.
+  - client (`[gd]`, browser DevTools): `playStreamEntry ... times=...`
+    (accumulates per `entry.key || entry.text` on each play),
+    `PLAY-SUMMARY key=N | ...` (when the queue empties, summarizes all current
+    counts then clears).
+  - Retest calibration (basis for the RC15 direction): `QUEUE-DUP` → host
+    double-enqueue; `PLAY-SUMMARY key=2` → client double-play; neither but
+    still twice → tts-stream double audio write; `enqueue from=` same source
+    twice with the same text → event replay.
 
-### RC15 修复（2026-08-17）：持久播放器 + 手势解锁 + 失败回队 + 事件重放去重
+### RC15 fixes (2026-08-17): persistent player + gesture unlock + failed-entry requeue + event-replay dedupe
 
-- **持久语音播放器（`playVoiceEntry`，F1）** — 语音模式播放从「每次 new Audio() +
-  临时 URL」改为 **fetch + Blob + 单元素复用**：整段音频一次 fetch 到 `Blob`，
-  经 `URL.createObjectURL` 绑定到**唯一** `<audio>` 元素，后续条目只替换 `src`
-  与播放回调，不再反复创建/销毁 Audio 对象——消灭 `ERR_CONTENT_LENGTH_MISMATCH`
-  引起的重试风暴（每次重建 Audio 都会重放 mismatch 前的部分内容，长音频时表现为
-  「反复重播 + 卡顿」）。
-- **手势解锁 + 被拦挂起重试（F2）** — 浏览器自动播放策略下首次播放可能被拦
-  （`play()` rejected）：进入「待播放挂起」状态，绑定首次用户手势
-  （`click`/`keydown`/`touchstart`，capture 阶段、常驻监听）后自动继续；
-  被拦条目不再丢弃，手势后重放。`stopCurrent` 中断时正确释放 `busy` 并回队
-  （防 busy 死锁吞条目）。
-- **失败回队 RPC（`voice-requeue`，F3）** — 播放失败（解码/网络/被拦）时 client
-  调 host `voice-requeue` RPC 把该条目重新入队（`requeueEntry` 纯函数：新文本插队、
-  重复文本跳过、队尾 pop 截断），每条目最多重试 3 次（`attempts` map）——不再丢内容。
-- **事件重放 10s 文本窗口去重（`replayDup`，F4）** — host 对「通话下行 + 语音模式」
-  两通道的 enqueue 增加 10s 窗口的 last-text 去重（`lastStreamText`/`lastVoiceText`
-  双 map）：同文本 10s 内再次入队直接跳过（`[gd-host] skip replay text=` /
-  `[gd-host] skip voice-dup text=` 埋点）。根因：语音模式 + 通话下行的事件重放会让
-  同一文本入队两次——男声回复「7 遍」即该窗口缺失所致。
-- **url 条目播放计数（F5）** — `PLAY-SUMMARY` 汇总日志覆盖语音模式条目
-  （`playCounts` 按 `entry.key || entry.url` 计数，队列空时汇总清空）——url 条目
-  的播放次数可追踪，复测定位不再靠猜。
-- **构建标记** — 客户端 build tag 升级为 `rc15-20260817`（`plugin-client.js` 源与
-  `bundle/lib/client.js` 同步；硬刷新后 DevTools 控制台可见该行）。
+- **Persistent voice player (`playVoiceEntry`, F1)** — voice-mode playback
+  changed from "new Audio() + temporary URL each time" to **fetch + Blob +
+  single-element reuse**: the whole clip is fetched once into a `Blob`, bound
+  via `URL.createObjectURL` to a **single** `<audio>` element; later entries
+  only replace `src` and the playback callbacks — no more repeated
+  Audio-object creation/destruction, which eliminates the
+  `ERR_CONTENT_LENGTH_MISMATCH` retry storm (each Audio rebuild replays the
+  pre-mismatch portion; with long audio this looked like "repeated replay +
+  stutter").
+- **Gesture unlock + blocked-pending retry (F2)** — under the browser
+  autoplay policy the first play may be blocked (`play()` rejected): enter a
+  "pending playback" state, bind the first user gesture
+  (`click`/`keydown`/`touchstart`, capture phase, persistent listener) and
+  continue automatically; blocked entries are no longer dropped — they replay
+  after the gesture. `stopCurrent` now correctly releases `busy` and requeues
+  (prevents a busy deadlock from swallowing entries).
+- **Failed-entry requeue RPC (`voice-requeue`, F3)** — on playback failure
+  (decode/network/blocked) the client calls the host `voice-requeue` RPC to
+  re-enqueue the entry (`requeueEntry` pure function: new text inserts,
+  duplicate text skips, tail pop truncates), max 3 retries per entry
+  (`attempts` map) — no more lost content.
+- **Event-replay 10s text-window dedupe (`replayDup`, F4)** — host enqueue
+  for the "call downlink + voice mode" channels gains a 10s last-text dedupe
+  window (`lastStreamText`/`lastVoiceText` maps): the same text enqueued
+  again within 10s is skipped (`[gd-host] skip replay text=` /
+  `[gd-host] skip voice-dup text=` instrumentation). Root cause: event
+  replay on voice mode + call downlink enqueued the same text twice — the
+  male-voice reply repeated "7 times" because this window was missing.
+- **url-entry play counts (F5)** — `PLAY-SUMMARY` summary logs cover
+  voice-mode entries (`playCounts` keyed by `entry.key || entry.url`,
+  summarized and cleared when the queue empties) — url-entry play counts are
+  trackable; retest pinpointing no longer relies on guessing.
+- **Build marker** — the client build tag was bumped to `rc15-20260817` at
+  the time (`plugin-client.js` source and `bundle/lib/client.js` in sync;
+  visible in the DevTools console after a hard refresh; since superseded —
+  the current tag is `rc20-20260817`).
 
-### config.json schema（Phase 2：call / a11y）
+### config.json schema (Phase 2: call / a11y)
 
-Phase 1 的 config（`~/.dsh/guide-dog/.guide-dog/config.json`）基础上新增，
-全部可选、深合并默认值（spec §4 复制）：
+New keys added on top of the Phase 1 config
+(`~/.dsh/guide-dog/.guide-dog/config.json`); all optional, deep-merged over
+defaults (spec §4 copy):
 
 ```json
 {
@@ -419,55 +485,69 @@ Phase 1 的 config（`~/.dsh/guide-dog/.guide-dog/config.json`）基础上新增
 }
 ```
 
-- `call.mode`: `vad`（默认，自动端点检测）| `ptt`（按住说话）。
-- `call.vad.method`: `energy`（Phase 2 v1，RMS 能量阈值；背景噪声大时调高
-  `threshold`）→ 升级位 `silero`（web-vad 浏览器 WASM）/ `sherpa`
-  （VAD+ASR 一体）。
-- `call.stream.format/sampleRate`: `mmx speech synthesize --stream` 参数
-  （s16le 单声道 PCM；24000 为显式覆盖值，mmx 自身默认 32000）。
-- `call.consensus`: `enabled` 开关共识优先（仅通话/a11y 生效）；
-  `summaryWindowMs` 摘要播报后等待用户打断的窗口。
-- `a11y`: Phase 3 无障碍模式配置（本阶段仅 `enabled` 参与通话流式/共识
-  判定；`autoNarrate`/`visionCloud`/`summaryFirst` 为 Phase 3 预留）。
+- `call.mode`: `vad` (default, automatic endpointing) | `ptt` (push-to-talk).
+- `call.vad.method`: `energy` (Phase 2 v1, RMS energy threshold; raise
+  `threshold` in noisy environments) → upgrade slot `silero` (web-vad
+  browser WASM) / `sherpa` (VAD+ASR integrated).
+- `call.stream.format/sampleRate`: `mmx speech synthesize --stream` args
+  (s16le mono PCM; 24000 is the explicit override — mmx's own default is
+  32000).
+- `call.consensus`: `enabled` toggles consensus-first (effective only in
+  call/a11y); `summaryWindowMs` is the window that waits for the user to
+  interrupt after the summary announcement.
+- `a11y`: Phase 3 accessibility-mode config (this stage only `enabled`
+  participates in the call streaming/consensus decisions;
+  `autoNarrate`/`visionCloud`/`summaryFirst` are reserved for Phase 3).
 
 ### Routes (Phase 2)
 
 | Method & Path | Purpose |
 |---|---|
-| `POST /guide-dog/call-transcribe` | 上行：整段音频（client 以 raw `audio/webm` body 发送，`x-session-id` 头；host 对整段请求体 base64 后交 whisper），≤20MB 硬上限；host 复用 Phase 1 `transcribeImpl` → `{ok, text, language, durationMs}` |
-| `GET /guide-dog/tts-stream?token=…&sid=…&text=<句>` | 下行：chunked PCM 音频流（`content-type: audio/pcm`，`cache-control: no-store`）；需 `guide-dog/tts-token` 签发的一次性 token——无/错 token → 403，该会话有在途流 → 429 |
+| `POST /guide-dog/call-transcribe` | Uplink: whole-clip audio (the client sends a raw `audio/webm` body with an `x-session-id` header; the host base64s the whole body and hands it to whisper), hard cap ≤20MB; the host reuses the Phase 1 `transcribeImpl` → `{ok, text, language, durationMs}` |
+| `GET /guide-dog/tts-stream?token=…&sid=…&text=<sentence>` | Downlink: chunked PCM audio stream (`content-type: audio/pcm`, `cache-control: no-store`); requires a one-time token issued by `guide-dog/tts-token` — missing/wrong token → 403, in-flight stream for that session → 429 |
 
-RPC 风格接口（`tts-token` / `call-active` / `call-command`）走同一 JSON POST
-兼容层，物理 URL 为 `/guide-dog/api/guide-dog/<name>`（双重前缀，同 Phase 1
-`guide-dog/status` 示例）——见下方 RPC surface 表新增三行。
+RPC-style endpoints (`tts-token` / `call-active` / `call-command`) go through
+the same JSON POST compatibility layer; their physical URL is
+`/guide-dog/api/guide-dog/<name>` (double prefix, same as the Phase 1
+`guide-dog/status` example) — see the three new rows in the RPC surface table
+below.
 
 ### Verification
 
 ```
-node --check bundle/lib/index.js && node --check bundle/lib/client.js       # bundle 语法 ×2
+node --check bundle/lib/index.js && node --check bundle/lib/client.js       # bundle syntax ×2
 curl -s -X POST http://127.0.0.1:3080/guide-dog/call-transcribe \
-  -H 'content-type: application/json' -d '{}' | head -5                    # 上行路由可达（空音频 → 错误 JSON）
+  -H 'content-type: application/json' -d '{}' | head -5                    # uplink route reachable (empty audio → error JSON)
 curl -s -o /dev/null -w '%{http_code}\n' \
-  'http://127.0.0.1:3080/guide-dog/tts-stream?token=bad&sid=x&text=hi'      # 无有效 token → 403
+  'http://127.0.0.1:3080/guide-dog/tts-stream?token=bad&sid=x&text=hi'      # invalid token → 403
 ```
 
-Manual acceptance checklist（完整判据见 `specs/2026-08-14-guide-dog-v2-design.md`
-§6.9，部署并重启 DSH 后逐项验证）：
+Manual acceptance checklist (full criteria in
+`specs/2026-08-14-guide-dog-v2-design.md` §6.9; verify item by item after
+deploying and restarting DSH):
 
-1. VAD：说话-停顿-说话两段分别成回合；静音判定不误切（`threshold` 可调）。
-2. 回合循环：语音 → 转写 → 提交 → agent 执行（含工具调用）→ 回复朗读，
-   端到端可完成一次"用语音让 agent 生成图片/搜索"。
-3. 打断：播放中说话即停，下一回合正常。
-4. 进度播报：agent 执行工具期间至少播报一次阶段状态。
-5. 流安全：非白名单 Origin 与无/错 token 拒绝；断流重连后恢复。
-6. 全量流式：长回复完整朗读；"重复/暂停/慢一点"命令生效；首音频延迟 ≤1.5s、
-   播放间隙 ≤400ms（实测）。
-7. 共识优先：语音"把 README 的 X 改成 Y"→ 不立即执行 → 语音确认 → 确认后
-   每次写操作前听到简短摘要 → 摘要期间说话 → 该次执行被中止、用户语音成为
-   新回合；未确认时 write/edit 被拦截（检查 `tools/pre-execute` 拦截路径）。
-8. 意图模糊（如"改一下那个文件"无上下文）→ agent 语音追问关键问题，不臆测
-   执行；用户反问"为什么要改？"→ agent 语音解释。
-9. PTT：按住说话/松开发送；VAD 模式下模式开关切换生效。
+1. VAD: speak-pause-speak becomes two separate turns; silence detection does
+   not cut wrongly (`threshold` adjustable).
+2. Turn loop: voice → transcription → submit → agent execution (incl. tool
+   calls) → reply read aloud; an end-to-end "use voice to have the agent
+   generate an image / search" completes.
+3. Barge-in: speaking during playback stops it; the next turn works.
+4. Progress announcements: at least one stage announcement while the agent
+   runs a tool.
+5. Stream safety: non-allowlisted Origin and missing/wrong tokens rejected;
+   recovery after a dropped-stream reconnect.
+6. Full streaming: long replies read in full; "repeat / pause / slower"
+   commands work; first-audio latency ≤1.5s, playback gaps ≤400ms (measured).
+7. Consensus-first: voice "change X in README to Y" → not executed
+   immediately → voice confirmation → after confirmation a short summary is
+   heard before every write; speaking during the summary aborts that
+   execution and the user's speech becomes a new turn; an unconfirmed
+   write/edit is blocked (check the `tools/pre-execute` interception path).
+8. Ambiguous intent (e.g. "change that file" without context) → the agent
+   asks the key question by voice instead of guessing; the user asking "why
+   change it?" → the agent explains by voice.
+9. PTT: hold to talk / release to send; the mode switch takes effect in VAD
+   mode.
 
 ## RPC surface (Client → Host)
 
@@ -504,10 +584,11 @@ Manual acceptance checklist（完整判据见 `specs/2026-08-14-guide-dog-v2-des
   `mmx auth login --api-key sk-…` (or `export MINIMAX_API_KEY=…`).
 - **Sandbox denial** — the tool error reports `denied: true`; keep media inside
   the workspace (the plugin already does).
-- **`MiniMax-H3` returns "TokenPlan 或 Credit 暂不支持 MiniMax-H3 系列模型"** —
-  the account's MiniMax plan does not include the H3 model family. Use
-  `model: "MiniMax-Hailuo-2.3"` (legacy V1) or upgrade the plan. The plugin
-  surfaces the API error verbatim, so this is visible in the tool result.
+- **`MiniMax-H3` returns "TokenPlan or Credit does not yet support the
+  MiniMax-H3 model family"** — the account's MiniMax plan does not include the
+  H3 model family. Use `model: "MiniMax-Hailuo-2.3"` (legacy V1) or upgrade
+  the plan. The plugin surfaces the API error verbatim (the message may appear
+  in Chinese), so this is visible in the tool result.
 - **Video never finishes** — the poll loop honors the call's abort signal and
   times out after 15 minutes; re-run with a shorter `duration` or different
   `model`.
