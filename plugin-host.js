@@ -1094,7 +1094,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const sid = context && context.sessionId ? String(context.sessionId) : ''
           const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
           const a11yOn = cfg.a11y && cfg.a11y.enabled
-          if (!callOn && !a11yOn) return undefined
+          // C3（最终审稿）：与 consensusEnabled 同门——仅通话激活中的会话注入语音聊天措辞
+          if (!((callOn && isCallActive(sid)) || a11yOn)) return undefined
           const a11yExtra = a11yOn ? '无障碍模式已开启：所有可能改变状态的操作（发送、删除、覆盖等）执行前都必须先简短说明并得到你的语音确认。' : ''
           return '用户正通过语音和你对话，像和合作伙伴讨论一样：先理解意图，不清楚就问（问多少看实际情况，语音通道保持简洁）；主动说明关键信息；写入/修改前先简短说明要做什么，等用户点头；用户随时可能提问或插话，认真回应。' + a11yExtra
         })
@@ -1640,7 +1641,9 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       const cfg = loadConfig()
       const a11yOn = cfg.a11y && cfg.a11y.enabled
       const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
-      return !!(a11yOn || callOn)
+      // C3（最终审稿）：共识拦截仅对**通话激活中**的会话生效（spec §6.7 打字模式保持 Phase 1
+      // 现状）——write/edit/破坏性 bash 不再被未开通话的普通会话拦截
+      return !!(((callOn) && isCallActive(sid)) || a11yOn)
     }
     // C1 修复（2026-08-16 审稿）：user 确认词监听器——用户回复"确定/确认/可以/好"（普通回合内容）
     // → markConsentPending(sid)；下一次 pre-execute 消费该 pending 并 grantConsent。
@@ -1824,12 +1827,15 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
                 await handle.done
                 try { res.end() } catch (e) { /* ignore */ }
               } catch (e) {
-                try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+                // I1（最终审稿）：writeHead(200) 已发出时 spawn 失败 → 再 writeHead(500) 抛
+                // ERR_HTTP_HEADERS_SENT（被吞）且响应永不 end → client fetch 挂死。加
+                // headersSent 守卫并保证响应一定结束。
+                try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
               } finally {
                 speechStreamBusy.delete(sid)
               }
             } catch (e) {
-              try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+              try { if (!res.headersSent) res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
             }
           },
         })
