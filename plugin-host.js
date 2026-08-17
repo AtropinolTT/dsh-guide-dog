@@ -24,6 +24,27 @@ return {
     let indexChain = Promise.resolve()
     const players = new Map()
     const spokenTurns = new Map() // sessionId -> Set<turnSeq>
+    // RC13（三路评审定案）：双通道互斥——playOnHost 已在本机扬声器播放的文本，不得再经
+    // voice-mode/downlink 队列通道播一遍（本机 + 浏览器双响）。消费即删（同文本只挡一次，
+    // 用户合法要求重复播放不受影响）。
+    const hostSpoken = new Map() // sessionId -> Map<normalizedText, true>
+    function normSpeech(s) { return String(s || '').replace(/\s+/g, ' ').trim() }
+    function markHostSpoken(sid, text) {
+      const k = normSpeech(text)
+      if (!k) return
+      let m = hostSpoken.get(String(sid))
+      if (!m) { m = new Map(); hostSpoken.set(String(sid), m) }
+      m.set(k, true)
+    }
+    function wasHostSpoken(sid, text) {
+      const m = hostSpoken.get(String(sid))
+      if (!m) return false
+      const k = normSpeech(text)
+      if (!k || !m.has(k)) return false
+      m.delete(k) // 消费一次
+      if (!m.size) hostSpoken.delete(String(sid))
+      return true
+    }
 
     console.log('[guide-dog] apply shell=' + !!shell + ' fs=' + !!fsSvc + ' webServer=' + !!webServer + ' sandboxPolicy=' + !!sandboxPolicy + ' systemPrompt=' + !!systemPrompt + ' subprocess=' + !!subprocess + ' timer=' + !!timerSvc)
 
@@ -801,7 +822,8 @@ if __name__ == '__main__':
       const st = await statFile(abs)
       if (!st) { release(); return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' } }
       await pushIndex({ name: name, kind: 'audio', prompt: text.slice(0, 200), voice: voice, ts: Date.now(), bytes: st.size || 0, source: source, turnSeq: seq, spoken: transformed.slice(0, 160) })
-      if (args.playOnHost) await playOnHost(abs)
+      // RC13：本机扬声器播放成功后登记文本——队列通道（语音模式/下行）消费即删，防双响
+      if (args.playOnHost) { const played = await playOnHost(abs); if (played) markHostSpoken(sid, transformed) }
       return { ok: true, kind: 'audio', url: MEDIA_ROUTE + '/' + name, file: abs, voice: voice, bytes: st.size || 0 }
     }
     async function playOnHost(abs) {
@@ -814,7 +836,7 @@ if __name__ == '__main__':
       for (const p of ['afplay', 'play', 'ffplay']) {
         if (found.some(function (f) { return f.endsWith('/' + p) })) { player = p; break }
       }
-      if (!player) return
+      if (!player) return false
       const argv = player === 'ffplay'
         ? ['ffplay', '-nodisp', '-autoexit', '-hide_banner', '-loglevel', 'warning', abs]
         : [player, abs]
@@ -829,7 +851,8 @@ if __name__ == '__main__':
         handle.done.catch(function () {}).then(function () {
           if (players.get(abs) === handle) players.delete(abs)
         })
-      } catch (e) { /* playback is best effort */ }
+        return true
+      } catch (e) { return false }
     }
 
     // ---------- vision ----------
@@ -1906,6 +1929,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           return
         }
         pendingFinal.delete(sid)
+        // RC13（Task 3）：双通道互斥——本机扬声器已播（guide_dog_speak playOnHost）的文本不再入队
+        if (wasHostSpoken(sid, text)) return
         // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队（"同一内容重复播放"贡献因子）
         const tkey = streamTurnKey(data.turn, data.step)
         if (tkey !== 'undefined:undefined' && lastStreamTurn.get(sid) === tkey) return
@@ -2047,6 +2072,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         // 极少见，不设 turn/end 兜底）。
         const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
         if (hasToolCall) return
+        // RC13（Task 3）：双通道互斥
+        if (wasHostSpoken(sid, text)) return
         // 异步串行 TTS，不阻塞事件循环
         serialSpeak(function () {
           return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
