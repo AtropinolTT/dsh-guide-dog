@@ -115,4 +115,18 @@ if (echoSrc) {
   ok(echoMatch('天气不错', [{ t: '今天天气不错', at: 0 }]) === false, 'echoMatch short contain no hit')
 }
 
+// ---- 静态契约（RC17-F：缓冲补全 + 起播作废段 + 窗口诊断） ----
+ok(host.includes("pushAgentSpeech(String(sid), clean, Date.now())"), 'host progress echo buffer')
+ok(host.includes("pushAgentSpeech(String(sid), '仍在处理，请稍候', Date.now())"), 'host hb echo buffer')
+ok(host.includes("pushAgentSpeech(String(sid), text, Date.now())"), 'host consensus echo buffer')
+ok(client.includes('RC17-F：起播瞬间若有活动段'), 'client abort segment at speak start')
+ok(client.includes('windowLogged'), 'client echo window diag')
+
+// ---- 行为（RC17-F：模糊匹配） ----
+if (echoSrc) {
+  const echoMatch = new Function('return ' + echoSrc)()
+  ok(echoMatch('原码变更正在处理', [{ t: '源码变更正在处理中，请稍候', at: 0 }]) === true, 'echoMatch fuzzy bigram')
+  ok(echoMatch('今天上海有雨明天放晴', [{ t: '明天北京下雪', at: 0 }]) === false, 'echoMatch different text no hit')
+}
+
 process.exit(fail === 0 ? 0 : 1)
