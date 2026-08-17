@@ -910,7 +910,8 @@ if __name__ == '__main__':
       if (!st) { release(); return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' } }
       await pushIndex({ name: name, kind: 'audio', prompt: text.slice(0, 200), voice: voice, ts: Date.now(), bytes: st.size || 0, source: source, turnSeq: seq, spoken: transformed.slice(0, 160) })
       // RC13：本机扬声器播放成功后登记文本——队列通道（语音模式/下行）消费即删，防双响
-      if (args.playOnHost) { const played = await playOnHost(abs); if (played) markHostSpoken(sid, transformed) }
+      // RC14：注册双键——净化后文本与 downlink 匹配（markdown/URL 文本互斥生效）；transform.py 改写文本时净化键可能不完全一致，属可接受边缘
+      if (args.playOnHost) { const played = await playOnHost(abs); if (played) { markHostSpoken(sid, transformed); markHostSpoken(sid, sanitizeSpeechText(transformed)) } }
       return { ok: true, kind: 'audio', url: MEDIA_ROUTE + '/' + name, file: abs, voice: voice, bytes: st.size || 0 }
     }
     async function playOnHost(abs) {
@@ -1864,16 +1865,19 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     // 去重：同短语冷却窗口内跳过（出错文本唯一，天然不冲突）。
     function announce(sid, text) {
       const now = Date.now()
-      if (progressDedupe(lastProgress.get(String(sid)), text, now)) {
+      // RC14：30s 短语窗口——web_search 结果间隔 ~4.3s > 旧 4s → 连播 3 次
+      if (progressDedupe(lastProgress.get(String(sid)), text, now, 30000)) {
         try { console.log('[gd-host] announce DEDUPE ' + text) } catch (e) { /* ignore */ }
         return
       }
       lastProgress.set(String(sid), { phrase: text, ts: now })
+      const clean = sanitizeSpeechText(text)
+      if (!clean) return
       const q2 = voiceQueue.get(String(sid)) || []
-      q2.unshift({ stream: true, text: text, key: 'progress:' + String(sid) + ':' + text })
+      q2.unshift({ stream: true, text: clean, key: 'progress:' + String(sid) + ':' + clean })
       if (q2.length > VOICE_QUEUE_MAX) q2.pop()
       voiceQueue.set(String(sid), q2)
-      try { console.log('[gd-host] announce ' + text + ' qlen=' + q2.length) } catch (e) { /* ignore */ }
+      try { console.log('[gd-host] announce ' + clean + ' qlen=' + q2.length) } catch (e) { /* ignore */ }
     }
     // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
     // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
@@ -1907,24 +1911,41 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       } catch (e) { /* best effort */ }
     })
     // ---- 下行流式 TTS（spec §6.5，零 WebSocket） ----
+    // RC14：播报文本净化——URL/markdown/emoji/列表标记不朗读（通话模式不读网址）
+    function sanitizeSpeechText(text) {
+      return String(text || '')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`[^`]*`/g, ' ')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // [标题](url) → 标题
+        .replace(/https?:\/\/[^\s，。！？!?）)]+/g, ' ') // 裸 URL（中文标点收尾）
+        .replace(/www\.[^\s，。！？!?）)]+/g, ' ')
+        .replace(/^\s*(?:[-+*]|>\s*)\s*/gm, ' ') // 行首列表/引用标记
+        .replace(/^\s*\d{1,3}[.、)]\s*/gm, ' ') // 行首有序列表标记
+        .replace(/[*_~#|]/g, ' ')
+        .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{00A9}\u{00AE}]/gu, ' ') // emoji 区段
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\s+$/g, '')
+        .trim()
+    }
     function splitSentences(text, splitChars, maxChars) {
       if (!text) return []
-      const chars = splitChars || '。！？.!?\n'
-      const esc = chars.replace(/[\\\]]/g, '\\$&')
-      const re = new RegExp('[' + esc + ']', 'g')
+      const max = maxChars || 200
+      // RC14：'.' 不再按字符类拆分（URL/小数拆断）——智能规则：后跟空白+大写/CJK 才拆
+      const extra = String(splitChars || '').replace(/[\\\]]/g, '\\$&').replace(/[.\s]/g, '')
+      const re = new RegExp('[。！？!?；;' + extra + '][ \t]*|\\n+|(?:\\.)(?=[ \t]+[A-Z0-9\u4e00-\u9fff])', 'g')
       const out = []
       let last = 0, m
       while ((m = re.exec(text)) !== null) {
-        const seg = text.slice(last, m.index + 1).trim()
+        const seg = text.slice(last, m.index + m[0].length).trim()
         if (seg) out.push(seg)
-        last = m.index + 1
+        last = m.index + m[0].length
       }
       const tail = text.slice(last).trim()
       if (tail) out.push(tail)
       const res = []
       for (const s of out) {
-        if (s.length <= maxChars) res.push(s)
-        else for (let i = 0; i < s.length; i += maxChars) res.push(s.slice(i, i + maxChars))
+        if (s.length <= max) res.push(s)
+        else for (let i = 0; i < s.length; i += max) res.push(s.slice(i, i + max))
       }
       return res
     }
@@ -2017,19 +2038,31 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         }
         pendingFinal.delete(sid)
         // RC13（Task 3）：双通道互斥——本机扬声器已播（guide_dog_speak playOnHost）的文本不再入队
-        if (wasHostSpoken(sid, text)) return
+        // RC14：按净化后文本匹配——downlink 文本含 markdown/URL 净化后才与 speakImpl 注册键一致
+        if (wasHostSpoken(sid, sanitizeSpeechText(text))) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(text).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
         // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队（"同一内容重复播放"贡献因子）
         const tkey = streamTurnKey(data.turn, data.step)
         if (tkey !== 'undefined:undefined' && lastStreamTurn.get(sid) === tkey) return
         lastStreamTurn.set(sid, tkey)
         const streamCfg = (cfg.call && cfg.call.stream) || {}
-        const sentences = splitSentences(text, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const clean = sanitizeSpeechText(text)
+        if (!clean) return
+        const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
-        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) }) })
-        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        sentences.forEach(function (s) {
+          // RC14：诊断埋点——同句已在队列则告警（仅日志，不丢弃）
+          const dup = q.some(function (e) { return e.text === s })
+          if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
+          q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) })
+        })
+        // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
+        while (q.length > VOICE_QUEUE_MAX) q.pop()
         voiceQueue.set(sid, q)
-        // RC12 诊断日志（DSH 终端可见）
-        try { console.log('[gd-host] enqueue n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
+        // RC12 诊断日志（DSH 终端可见）；RC14：补来源标签（downlink 入队）
+        try { console.log('[gd-host] enqueue from=downlink n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
     })
     // RC13：回合结束兜底——本回合无可播最终消息（终结型工具回合：最后一条 assistant/message
@@ -2046,13 +2079,26 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const pend = pendingFinal.get(sid)
         if (!pend || pend.turn !== turn || !pend.text) return
         pendingFinal.delete(sid)
+        // RC14：本机已播（guide_dog_speak playOnHost）不再兜底入队
+        if (wasHostSpoken(sid, sanitizeSpeechText(pend.text))) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(pend.text).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
         const streamCfg = (cfg.call && cfg.call.stream) || {}
-        const sentences = splitSentences(pend.text, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const clean = sanitizeSpeechText(pend.text)
+        if (!clean) return
+        const sentences = splitSentences(clean, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
         const q = voiceQueue.get(sid) || []
-        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) }) })
-        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        sentences.forEach(function (s) {
+          // RC14：诊断埋点——同句已在队列则告警（仅日志，不丢弃）
+          const dup = q.some(function (e) { return e.text === s })
+          if (dup) { try { console.log('[gd-host] QUEUE-DUP text=' + String(s).slice(0, 20)) } catch (e) { /* ignore */ } }
+          q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) })
+        })
+        // RC14：丢队尾保内容——先入内容优先（旧 splice 从队头删 → 主内容被裁）
+        while (q.length > VOICE_QUEUE_MAX) q.pop()
         voiceQueue.set(sid, q)
-        try { console.log('[gd-host] turn-end flush n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
+        try { console.log('[gd-host] enqueue from=turnend n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
     })
     // ---- 容错（spec §6.8） ----
@@ -2137,7 +2183,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     //   - 文本提取: const data = event.data || {}；content 取 data.content（或 data.message.content）blocks；
     //     text = content 中 type==='text' 的 b.text 拼接
     //   - seq = event.seq；sessionId = session 参数（对象时 session.id）
-    const VOICE_QUEUE_MAX = 10 // M5：每会话队列上限（防 voiceQueue 无界增长；超限丢最旧）
+    const VOICE_QUEUE_MAX = 40 // RC14：40 上限（净化后句子数骤减；超长回复截尾不截头）
     const voiceQueue = new Map() // sessionId -> Array<{url,key} | {error,message}>
     ctx.on('session/event', function (session, event) {
       try {
@@ -2154,16 +2200,21 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
         const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
         if (!text) return
+        const clean = sanitizeSpeechText(text)
+        if (!clean) return
         // RC13：语音模式同样只播回合最终消息——"非通话语音模式也反复播放同一内容"同根因
         // （逐 step 播近同文案）。带 tool-call 的中间消息直接跳过（语音模式终结工具回合
         // 极少见，不设 turn/end 兜底）。
         const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
         if (hasToolCall) return
         // RC13（Task 3）：双通道互斥
-        if (wasHostSpoken(sid, text)) return
+        if (wasHostSpoken(sid, clean)) {
+          try { console.log('[gd-host] skip host-spoken sid=' + sid + ' text=' + String(clean).slice(0, 30)) } catch (e) { /* ignore */ }
+          return
+        }
         // 异步串行 TTS，不阻塞事件循环
         serialSpeak(function () {
-          return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
+          return speakImpl({ text: clean, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
             const q = voiceQueue.get(sid) || []
             if (r && r.ok && r.url && !r.skipped) q.push({ url: r.url, key: sid + ':' + seq })
             // M6：错误项统一 { error: <码>, message: <人读文本> }，client 优先显示 message
@@ -2188,7 +2239,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
           const q = voiceQueue.get(sid) || []
           const entry = q.length ? q.shift() : null
           if (!q.length) voiceQueue.delete(sid)
-          if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?')) } catch (e) { /* ignore */ } }
+          if (entry) { try { console.log('[gd-host] shift key=' + String(entry.key || '?') + ' remain=' + q.length) } catch (e) { /* ignore */ } }
           return { ok: true, entry: entry }
         })
       } catch (e) { return function () {} }

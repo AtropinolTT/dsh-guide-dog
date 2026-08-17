@@ -55,9 +55,9 @@ return {
 
     const h = React.createElement
 
-    // RC13 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
+    // RC14 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc13-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc14-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -910,6 +910,7 @@ return {
       // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
       if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
       callSessionRef = null // RC13：最后清归属——clear-queue/停播已完成（其 callSid() 需在清空前有效）
+      playCounts.clear() // RC14：挂断即清播放计数（防跨会话错位汇总）
     }
 
     function resetSegment() {
@@ -1096,6 +1097,15 @@ return {
           else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
         }
+        // RC14：仅在确认本轮播放窗口结束（r.ok && !r.entry，队列空）时落汇总埋点——按 key 列出本轮播放次数
+        // !r.ok 时跳过（RPC 失败/异常时跳过，避免把跨回合累积误归零）
+        else if (r && r.ok && !r.entry) {
+          if (playCounts.size) {
+            const summary = Array.from(playCounts.entries()).map(function (e) { return e[0] + '=' + e[1] }).join(' | ')
+            gdLog('PLAY-SUMMARY ' + summary)
+            playCounts.clear()
+          }
+        }
       }).catch(function () {}).then(function () {
         callPollBusy = false
         // RC6：流条目播放完成立即续取下句（不等 1s tick）；队列空（consumed=false）时停止，
@@ -1129,6 +1139,8 @@ return {
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
     const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, gen: 0, fetching: false }
+    // RC14：播放计数——一次复测定位「读两遍」（同一 key 播 2 次即双播铁证）
+    const playCounts = new Map()
     // RC13（三路评审定案）：重试记账按 (sid,text) 维度——旧模块级单例记账：句 A 重试后
     // 5s 内句 B 失败不再重试（单例被 A 占用）。429（host 忙门）不重试（立即重试必再 429，
     // 且与在途合成并发；串行 poll 下一轮会取队列下一条）。
@@ -1214,6 +1226,10 @@ return {
     async function playStreamEntry(entry, sid) {
       // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
       const playId = ++streamPlayer.playSeq
+      // RC14：入口埋点——按 key/text 维度记播放次数（一次复测定位双播）
+      const k = entry.key || entry.text
+      const c = (playCounts.get(k) || 0) + 1
+      playCounts.set(k, c)
       const gen = streamPlayer.gen // RC13：解码代际（仅 stopStreamPlayback 递增；句间保持同代际，前句尾帧可续接）
       const rkey = sid + '|' + entry.text // RC13：重试记账键（(sid,text) 维度）
       // C2（最终审稿）：句间预合成——前一句仍在播放/排队（active）时**不再**停播覆盖（v2.1
@@ -1228,7 +1244,7 @@ return {
       const cfg = voiceState.cfg || {}
       const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
       const firstSentence = !streamPlayer.active // C2：仅在链空闲时走完整起播路径
-      gdLog('playStreamEntry playId=' + playId + ' first=' + firstSentence + ' key=' + (entry.key || '?') + ' text=' + String(entry.text || '').slice(0, 16))
+      gdLog('playStreamEntry playId=' + playId + ' first=' + firstSentence + ' key=' + (entry.key || '?') + ' text=' + String(entry.text || '').slice(0, 16) + ' times=' + c)
       if (firstSentence) {
         stopCurrent() // RC9：反向防叠——起播新链时终止仍在播的 mp3（如 repeat 命令直接调用时）
         streamPlayer.active = true
