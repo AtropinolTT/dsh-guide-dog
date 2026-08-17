@@ -55,9 +55,9 @@ return {
 
     const h = React.createElement
 
-    // RC9 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
+    // RC13 构建标记：用户硬刷新后可在 DevTools 控制台看到此行，用于确认浏览器加载了新客户端
     // （客户端 bundle 在页面加载时注入——只重启 DSH 不会更新浏览器里的旧客户端）
-    try { console.log('[guide-dog] client build rc12-20260817') } catch (e) { /* ignore */ }
+    try { console.log('[guide-dog] client build rc13-20260817') } catch (e) { /* ignore */ }
 
     // ============ VOICE 群组（Phase 1 修订：输入框左下角 + 会话切换播放修复） ============
     // 播放与轮询解耦：curAudio 为模块级对象，切换会话不销毁 → 播放中的音频自然播到结束；
@@ -671,7 +671,12 @@ return {
     }
     function subscribeCall(fn) { callSubs.push(fn); return function () { const i = callSubs.indexOf(fn); if (i >= 0) callSubs.splice(i, 1) } }
     // 会话切换：通话状态随会话（header action 是会话级）；切会话时 phase 回 idle 但不自动挂断音频
-    let callSessionId = null
+    // RC13（三路评审定案）：通话归属（会话 + inputActions）在 startCall 时一次性捕获；
+    // 渲染期不再写全局——多会话 header 渲染互相覆盖曾导致转写串台（12:33-12:35 双会话
+    // 错投）与渲染期误挂断。对齐 Phase 1 M9 recSessionRef 模式。
+    let callSessionRef = null // { sid: string, actions: object|null }
+    function callSid() { return (callSessionRef && callSessionRef.sid) || '' }
+    function callActions() { return (callSessionRef && callSessionRef.actions) || null }
 
     // ---- 会话 header 发起/挂断按钮（conversation.session.header.actions，order 30） ----
     ctx.effect(function () {
@@ -680,34 +685,34 @@ return {
           return slots.register(
             { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
             function (props) {
-              // R12：header.actions 直接携带 inputActions（Task 4 探测定案）→ 存模块级，stopSegment 提交用
-              if (props.inputActions) gdInputActions = props.inputActions
-              const sid = props.sessionId || callSessionId
-              // I3（最终审稿）：渲染会话与记录会话不同且通话激活 → 先自动挂断（丢弃当前片段、
-              // 撤销 host 激活、停下行播放），再切到新会话——避免下行流停更、上行误投旧 sid。
-              if (sid !== callSessionId && callState.active) stopCall()
-              callSessionId = sid
+              // RC13：渲染期只读——任何会话的 header 渲染都不再写模块级全局（旧代码在渲染期
+              // 覆盖全局 inputActions 与会话归属 → 多会话互相串台；渲染期自动挂断 → 切会话即误挂）
+              const sid = props.sessionId || (callSessionRef && callSessionRef.sid) || ''
+              // 激活态按"通话归属会话"判定：只有归属会话的按钮显示"通话中"
+              const myCall = callState.active && callSessionRef && callSessionRef.sid === sid
               const [, force] = React.useState(0)
               React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
-              const active = callState.active
               const style = {
                 display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
                 borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
-                background: active ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
-                color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
+                background: myCall ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
+                color: myCall ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
                 fontFamily: 'inherit', fontSize: '12px',
               }
               return React.createElement('button', {
-                style: style, title: active ? '挂断通话' : '发起语音通话',
+                style: style, title: myCall ? '挂断通话' : '发起语音通话',
                 onClick: function () {
-                  if (!active) {
+                  if (!myCall) {
+                    // RC13：仅在用户点击时切换通话会话——先挂断旧通话再开新通话（挂断动作
+                    // 不再由渲染期触发）。通话跨会话切换继续存活（浮动面板可挂断）。
+                    if (callState.active && callSessionRef) stopCall()
                     setCallState({ active: true, phase: 'listening', recording: false })
-                    startCall(sid) // Task 7 定义：初始化采集
+                    startCall(sid, props.inputActions) // RC13：归属（sid + inputActions）开播时刻捕获
                   } else {
-                    stopCall() // Task 7 定义：停止采集与播放
+                    stopCall()
                   }
                 },
-              }, active ? '📞 通话中' : '📞 通话')
+              }, myCall ? '📞 通话中' : '📞 通话')
             })
         })
       } catch (e) { return function () {} }
@@ -797,10 +802,11 @@ return {
     let callSegmentActive = false
     let callBargeCb = null // Task 12 设置：用户发声回调（bargeIn 钩子）
     let callRms = 0 // 最新 RMS（isUserSpeaking 供 Task 8/9 共识窗口查询）
-    let gdInputActions = null // R12：header.actions 的 inputActions（CallButton 渲染时捕获）
 
-    function startCall(sid) {
+    function startCall(sid, inputActions) {
       if (callMic) return
+      // RC13：通话归属开播时刻捕获——上传/打断/轮询/回退提交一律用此快照，杜绝渲染期覆盖串台
+      callSessionRef = { sid: String(sid || ''), actions: inputActions || null }
       setCallState({ active: true, phase: 'listening', recording: false, error: null })
       callActiveRpc('session', true) // C4：持久通话激活（Task 10 进度播报 / Task 11 下行流式判据）
       try {
@@ -899,10 +905,11 @@ return {
       callSegmentActive = false
       callActiveRpc('session', false) // C4：持久激活关闭
       // RC11：挂断清 host 待播队列——防陈旧条目在下次通话/页面刷新后重放
-      host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+      host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'clear-queue' }).catch(function () {})
       setCallState({ active: false, phase: 'idle', recording: false })
       // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
       if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
+      callSessionRef = null // RC13：最后清归属——clear-queue/停播已完成（其 callSid() 需在清空前有效）
     }
 
     function resetSegment() {
@@ -976,7 +983,7 @@ return {
 
     // 段上传 → 转写 → 插入 + 提交（与语音输入同路径；C1：raw `audio/webm` body）
     function uploadSegmentBlob(blob) {
-      const sid = callSessionId || ''
+      const sid = callSid()
       fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid, 'content-type': 'audio/webm' }, body: blob }).then(function (r) {
         return r.json()
       }).then(function (r) {
@@ -991,22 +998,22 @@ return {
           if (bargedAt && Date.now() - bargedAt < 10000) {
             bargedAt = 0
             gdLog('segment route=interrupt')
-            host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'interrupt', text: r.text }).then(function (rr) {
+            host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'interrupt', text: r.text }).then(function (rr) {
               if (!(rr && rr.ok)) {
                 gdLog('interrupt fallback -> submit')
-                const actions = gdInputActions
+                const actions = callActions()
                 if (actions) { insertText(actions, r.text); submitInput(actions) }
               }
             }).catch(function () {
               gdLog('interrupt fallback -> submit (err)')
-              const actions = gdInputActions
+              const actions = callActions()
               if (actions) { insertText(actions, r.text); submitInput(actions) }
             })
             setCallState({ phase: 'listening' })
             return
           }
           gdLog('segment route=submit')
-          const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
+          const actions = callActions() // RC13：开播时刻捕获的 inputActions
           if (actions) { insertText(actions, r.text); submitInput(actions) }
           setCallState({ phase: 'listening' })
         } else {
@@ -1029,7 +1036,7 @@ return {
     }
 
     function callActiveRpc(kind, active) {
-      host.call('guide-dog/call-active', { sessionId: callSessionId || '', kind: kind, active: active }).catch(function () {})
+      host.call('guide-dog/call-active', { sessionId: callSid(), kind: kind, active: active }).catch(function () {})
     }
 
     let consensusWindow = false
@@ -1070,7 +1077,7 @@ return {
       if (!callState.active || callPollBusy) return
       callPollBusy = true
       let consumed = false
-      host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
+      host.call('guide-dog/voice-queue', { sessionId: callSid() }).then(function (r) {
         if (r && r.ok && r.entry) {
           gdLog('poll ' + (r.entry.consensus ? 'consensus' : r.entry.stream ? 'stream' : r.entry.url ? 'url' : 'error') + ' key=' + (r.entry.key || '?') + ' text=' + String(r.entry.text || '').slice(0, 16))
           // RC8：全部条目类型都串行等待（consumed=true + return Promise）——进度播报 mp3 未播完
@@ -1084,7 +1091,7 @@ return {
           else if (r.entry.stream && r.entry.text) {
             if (!r.entry.key || r.entry.key.indexOf('stream:') === 0) lastSpokenSentence = r.entry.text
             consumed = true
-            return playStreamEntry(r.entry, callSessionId || '')
+            return playStreamEntry(r.entry, callSid())
           }
           else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
@@ -1122,6 +1129,10 @@ return {
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
     const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, fetching: false }
+    // RC13（三路评审定案）：重试记账按 (sid,text) 维度——旧模块级单例记账：句 A 重试后
+    // 5s 内句 B 失败不再重试（单例被 A 占用）。429（host 忙门）不重试（立即重试必再 429，
+    // 且与在途合成并发；串行 poll 下一轮会取队列下一条）。
+    const retryKeys = new Map() // 'sid|text' -> true（5s 后释放）
     // RC12 诊断日志：浏览器控制台打点（[gd] 前缀）——一次复测即可定位播放管线问题（爆音/重复/中断）
     function gdLog(msg) { try { console.log('[gd] ' + msg) } catch (e) { /* ignore */ } }
     // RC9（2026-08-17 验收）：流链排空等待——playStreamEntry 在 fetch 结束即 resolve（C2 预取
@@ -1163,22 +1174,24 @@ return {
       out.set(pcm, 44)
       return out
     }
-    function scheduleChunk(audioCtx, wavBytes) {
+    function scheduleChunk(audioCtx, wavBytes, playId) {
       return audioCtx.decodeAudioData(wavBytes.buffer.slice(0)).then(function (buf) {
-        if (!streamPlayer.active) return
+        // RC13：代际守卫——重试/打断后旧 fetch 的解码帧（异步 decode）不得加入新链，
+        // 否则同句尾帧在新旧链上重叠 → 重复播放 + 同相叠加削波爆音
+        if (playId !== streamPlayer.playSeq || !streamPlayer.active) return
         const src = audioCtx.createBufferSource()
         src.buffer = buf
         const when = Math.max(audioCtx.currentTime + 0.05, streamPlayer.nextTime)
-        // RC12：断链后淡入（5ms）——链排空后新块从全幅起播会咔哒一声（"句子被切断时爆"候选）
+        // RC12：断链后淡入（5ms）；RC13：每帧恒接 GainNode（停播淡出需要），阈值收窄到 3ms
+        // ——5-20ms 帧间隙同样淡入，消除小间隙咔哒
         const gapMs = Math.round((when - streamPlayer.nextTime) * 1000)
-        if (gapMs > 20) {
-          const g = audioCtx.createGain()
+        const g = audioCtx.createGain()
+        if (gapMs > 3) {
           g.gain.setValueAtTime(0.0001, when)
           g.gain.linearRampToValueAtTime(1, when + 0.005)
-          src.connect(g); g.connect(audioCtx.destination)
-        } else {
-          src.connect(audioCtx.destination)
         }
+        src._gdGain = g
+        src.connect(g); g.connect(audioCtx.destination)
         src.start(when)
         streamPlayer.nextTime = when + buf.duration
         streamPlayer.nodes.push(src)
@@ -1200,6 +1213,7 @@ return {
     async function playStreamEntry(entry, sid) {
       // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
       const playId = ++streamPlayer.playSeq
+      const rkey = sid + '|' + entry.text // RC13：重试记账键（(sid,text) 维度）
       // C2（最终审稿）：句间预合成——前一句仍在播放/排队（active）时**不再**停播覆盖（v2.1
       // 语义仅保留给非流条目 playEntry/playEntryConsensus）；本句流取来后解码帧追加调度到
       // 既有无缝链（scheduleChunk 按 streamPlayer.nextTime 续接），不重置 nextTime/active/phase，
@@ -1225,13 +1239,14 @@ return {
       // C6（最终审稿）：fetch 在途标志——追加句 fetch 期间即使既有链排空也不停 active；
       // finally 在 catch/重连逻辑之后清除，重连再入时看到的仍是 false
       streamPlayer.fetching = true
+      let noRetry = false // RC13：429 不重试标记
       const controller = new AbortController()
       streamPlayer.controller = controller
       const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
       try {
         const resp = await fetch(url, { signal: controller.signal })
         gdLog('fetch status=' + resp.status + ' playId=' + playId)
-        if (!resp.ok || !resp.body) { throw new Error('http ' + resp.status) }
+        if (!resp.ok || !resp.body) { noRetry = resp.status === 429; throw new Error('http ' + resp.status) }
         const reader = resp.body.getReader()
         let acc = new Uint8Array(0)
         let totalBytes = 0
@@ -1252,34 +1267,32 @@ return {
               const frame = acc.subarray(0, even)
               acc = acc.subarray(even)
               const wav = pcmToWav(frame, sr)
-              scheduleChunk(audioCtx, wav)
+              scheduleChunk(audioCtx, wav, playId)
               frameCount += 1
             }
           }
         }
         if (acc.length > 1) {
           const even = acc.length - (acc.length % 2)
-          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav); frameCount += 1 }
+          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav, playId); frameCount += 1 }
         }
         gdLog('stream done playId=' + playId + ' bytes=' + totalBytes + ' frames=' + frameCount + ' nodes=' + streamPlayer.nodes.length)
       } catch (e) {
         // R15 修复：新播放已接管（playSeq 已递增）→ 旧 abort rejection 直接退出，不拆新播放状态
         if (playId !== streamPlayer.playSeq) return
-        gdLog('stream FAIL playId=' + playId + ' active=' + streamPlayer.active + ' retried=' + !!playStreamEntry._retried + ' nodes=' + streamPlayer.nodes.length + ' err=' + String((e && e.message) || e).slice(0, 60))
+        gdLog('stream FAIL playId=' + playId + ' active=' + streamPlayer.active + ' retried=' + retryKeys.has(rkey) + ' nodes=' + streamPlayer.nodes.length + ' err=' + String((e && e.message) || e).slice(0, 60))
         if (streamPlayer.active) {
-          // RC11（V4-Pro 诊断确认）：重试前**完整停链**——已 src.start 的旧帧仍在播放，
-          // 仅置 active=false 会让重试以 firstSentence 另起新链（nextTime=0），同句在新旧
-          // 两条链上重叠 → "同一内容重复播放" + 同相 16bit PCM 叠加削波爆音。
+          // RC11（V4-Pro 诊断确认）：重试前完整停链——stopStreamPlayback 内部递增 playSeq，
+          // 重试以新代际起播，旧帧（含已 src.start 的）全部作废
           stopStreamPlayback()
           setCallState({ phase: 'listening', error: '播放中断' })
-          // 重连一次（C3：每句已重新取 token，playStreamEntry 内部即新 token + GET）
-          if (!playStreamEntry._retried) {
-            playStreamEntry._retried = true
+          // RC13：429 不重试（host 忙门，立即重试必再 429）；同 (sid,text) 5s 内至多重试一次。
+          // 重试必须并入串行链——return 让 callPoll 等到重试结束（RC8）。
+          if (!noRetry && !retryKeys.has(rkey)) {
+            retryKeys.set(rkey, true)
+            setTimeout(function () { retryKeys.delete(rkey) }, 5000)
             showToast('播放中断，已尝试重连')
-            // RC8：重试必须并入串行链——旧代码 fire-and-forget 重试与 poll 下一条并发
-            // （双 fetch → 429/重叠帧 → 双播 + 噪声）；return 让 callPoll 等到重试结束
             const retried = playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
-            setTimeout(function () { playStreamEntry._retried = false }, 5000)
             return retried
           } else {
             showToast('播放中断')
@@ -1296,11 +1309,28 @@ return {
       }
     }
     function stopStreamPlayback() {
+      // RC13：代际递增——在途 fetch 的解码帧/abort 回调全部作废（catch 的 playId 归属检查直接退出）
+      streamPlayer.playSeq += 1
       if (streamPlayer.controller) { try { streamPlayer.controller.abort() } catch (e) { /* ignore */ } streamPlayer.controller = null }
       streamPlayer.active = false
-      streamPlayer.nodes.forEach(function (src) { try { src.stop() } catch (e) { /* ignore */ } })
+      // RC13：淡出停播（10ms 线性落零再延时停源）——src.stop() 硬切在句切断处产生咔哒爆音
+      const now = streamPlayer.audioCtx ? streamPlayer.audioCtx.currentTime : 0
+      streamPlayer.nodes.forEach(function (src) {
+        try {
+          const g = src._gdGain
+          if (g && streamPlayer.audioCtx) {
+            g.gain.cancelScheduledValues(now)
+            g.gain.setValueAtTime(g.gain.value || 1, now)
+            g.gain.linearRampToValueAtTime(0.0001, now + 0.01)
+            src.stop(now + 0.015)
+          } else {
+            src.stop()
+          }
+        } catch (e) { /* ignore */ }
+      })
       streamPlayer.nodes = []
       streamPlayer.nextTime = 0
+      streamPlayer.fetching = false // RC13：停播即清在途标志（C6 的"fetch 在途保 active"仅用于自然排空）
       notifyConsensusSpeech(false)
     }
     // Task 13：打断接线（spec §6.6）——Task 7 VAD 轮询在 phase==='speaking' 且发声时调用本回调
@@ -1313,7 +1343,7 @@ return {
       stopStreamPlayback()
       setCallState({ phase: 'listening' })
       // RC3：打断须清 host 待播队列——否则下个 poll tick 又 shift 出下一句，打断被队列复活
-      host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+      host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'clear-queue' }).catch(function () {})
     }
 
     // ============ 语音命令节（Phase 2） ============
@@ -1338,13 +1368,13 @@ return {
         case 'pause':
           if (streamPlayer.active) { stopStreamPlayback(); setCallState({ phase: 'listening' }) }
           // 清 host 待播队列（防停播后下一句仍到）
-          host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+          host.call('guide-dog/call-command', { sessionId: callSid(), cmd: 'clear-queue' }).catch(function () {})
           break
         case 'resume':
           setCallState({ phase: 'listening' }) // 恢复=回到收听（无缓冲重播；Task 14 增强：恢复未播队列）
           break
         case 'repeat':
-          if (lastSpokenSentence) { playStreamEntry({ stream: true, text: lastSpokenSentence, consensus: false }, callSessionId || '') }
+          if (lastSpokenSentence) { playStreamEntry({ stream: true, text: lastSpokenSentence, consensus: false }, callSid()) }
           break
         case 'slower': { const s = Math.min(1.2, callState.speed + 0.2); setCallState({ speed: s }) } break
         case 'faster': { const s = Math.max(0.8, callState.speed - 0.2); setCallState({ speed: s }) } break

@@ -127,6 +127,27 @@ return {
     let indexChain = Promise.resolve()
     const players = new Map()
     const spokenTurns = new Map() // sessionId -> Set<turnSeq>
+    // RC13（三路评审定案）：双通道互斥——playOnHost 已在本机扬声器播放的文本，不得再经
+    // voice-mode/downlink 队列通道播一遍（本机 + 浏览器双响）。消费即删（同文本只挡一次，
+    // 用户合法要求重复播放不受影响）。
+    const hostSpoken = new Map() // sessionId -> Map<normalizedText, true>
+    function normSpeech(s) { return String(s || '').replace(/\s+/g, ' ').trim() }
+    function markHostSpoken(sid, text) {
+      const k = normSpeech(text)
+      if (!k) return
+      let m = hostSpoken.get(String(sid))
+      if (!m) { m = new Map(); hostSpoken.set(String(sid), m) }
+      m.set(k, true)
+    }
+    function wasHostSpoken(sid, text) {
+      const m = hostSpoken.get(String(sid))
+      if (!m) return false
+      const k = normSpeech(text)
+      if (!k || !m.has(k)) return false
+      m.delete(k) // 消费一次
+      if (!m.size) hostSpoken.delete(String(sid))
+      return true
+    }
 
     console.log('[guide-dog] apply shell=' + !!shell + ' fs=' + !!fsSvc + ' webServer=' + !!webServer + ' sandboxPolicy=' + !!sandboxPolicy + ' systemPrompt=' + !!systemPrompt + ' subprocess=' + !!subprocess + ' timer=' + !!timerSvc)
 
@@ -888,7 +909,8 @@ if __name__ == '__main__':
       const st = await statFile(abs)
       if (!st) { release(); return { ok: false, error: 'tts_failed', message: 'TTS finished but the mp3 is missing' } }
       await pushIndex({ name: name, kind: 'audio', prompt: text.slice(0, 200), voice: voice, ts: Date.now(), bytes: st.size || 0, source: source, turnSeq: seq, spoken: transformed.slice(0, 160) })
-      if (args.playOnHost) await playOnHost(abs)
+      // RC13：本机扬声器播放成功后登记文本——队列通道（语音模式/下行）消费即删，防双响
+      if (args.playOnHost) { const played = await playOnHost(abs); if (played) markHostSpoken(sid, transformed) }
       return { ok: true, kind: 'audio', url: MEDIA_ROUTE + '/' + name, file: abs, voice: voice, bytes: st.size || 0 }
     }
     async function playOnHost(abs) {
@@ -901,7 +923,7 @@ if __name__ == '__main__':
       for (const p of ['afplay', 'play', 'ffplay']) {
         if (found.some(function (f) { return f.endsWith('/' + p) })) { player = p; break }
       }
-      if (!player) return
+      if (!player) return false
       const argv = player === 'ffplay'
         ? ['ffplay', '-nodisp', '-autoexit', '-hide_banner', '-loglevel', 'warning', abs]
         : [player, abs]
@@ -916,7 +938,8 @@ if __name__ == '__main__':
         handle.done.catch(function () {}).then(function () {
           if (players.get(abs) === handle) players.delete(abs)
         })
-      } catch (e) { /* playback is best effort */ }
+        return true
+      } catch (e) { return false }
     }
 
     // ---------- vision ----------
@@ -1695,6 +1718,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
               callActiveSessions.add(String(sid))
               // RC11：新通话 = 新队列——清掉挂断/刷新残留的旧条目，防陈旧内容重放
               voiceQueue.delete(String(sid))
+              pendingFinal.delete(String(sid)) // RC13：同清中间文本缓冲（pendingFinal 在后文声明，RPC 回调运行时已初始化）
             } else callActiveSessions.delete(String(sid))
           } else {
             callActiveFlags.set(String(sid), active)
@@ -1966,6 +1990,8 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     // 下行主通道：assistant 消息 → 分句 → 流条目入队列（client 播放器识别 stream 条目走 GET）
     // RC11：按 (turn,step) 去重——同一事件重复/重放时不重复入队
     const lastStreamTurn = new Map() // sessionId -> 'turn:step'
+    // RC13：只播回合最终消息——中间步骤（带 tool-call 块）只缓冲不播；turn/end 兜底
+    const pendingFinal = new Map() // sessionId -> { turn, text }（中间文本最后一条为准）
     function streamTurnKey(turn, step) { return String(turn) + ':' + String(step) }
     ctx.on('session/event', function (session, event) {
       try {
@@ -1980,6 +2006,18 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
         const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
         if (!text) return
+        // RC13（三路评审定案）：中间步骤的 assistant/message 必带 tool-call 块（dsh-agent-loop
+        // step()：无 tool-call 即返回 completed）——逐 step 播放 = "同一内容反复播报"。带
+        // tool-call 的消息：文本入 pendingFinal（只留最后一条），本回合最终消息缺失时由
+        // turn/end 监听兜底播放（终结型工具回合不静音）。
+        const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
+        if (hasToolCall) {
+          if (text) pendingFinal.set(sid, { turn: data.turn, text: text })
+          return
+        }
+        pendingFinal.delete(sid)
+        // RC13（Task 3）：双通道互斥——本机扬声器已播（guide_dog_speak playOnHost）的文本不再入队
+        if (wasHostSpoken(sid, text)) return
         // RC11：同一 (turn,step) 只入队一次——防重复事件/重放把同一内容多次入队（"同一内容重复播放"贡献因子）
         const tkey = streamTurnKey(data.turn, data.step)
         if (tkey !== 'undefined:undefined' && lastStreamTurn.get(sid) === tkey) return
@@ -1992,6 +2030,29 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         voiceQueue.set(sid, q)
         // RC12 诊断日志（DSH 终端可见）
         try { console.log('[gd-host] enqueue n=' + sentences.length + ' qlen=' + q.length + ' text=' + text.slice(0, 20)) } catch (e) { /* ignore */ }
+      } catch (e) { /* best effort */ }
+    })
+    // RC13：回合结束兜底——本回合无可播最终消息（终结型工具回合：最后一条 assistant/message
+    // 带 tool-call 块被过滤）时，把 pendingFinal 缓冲的中间文本播出去，避免整回合静音。
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'turn/end') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        if (!isCallActive(sid) && !(cfg.a11y && cfg.a11y.enabled)) return
+        const turn = (typeof (event.data && event.data.turn) === 'number') ? event.data.turn : null
+        if (turn === null) return
+        const pend = pendingFinal.get(sid)
+        if (!pend || pend.turn !== turn || !pend.text) return
+        pendingFinal.delete(sid)
+        const streamCfg = (cfg.call && cfg.call.stream) || {}
+        const sentences = splitSentences(pend.text, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const q = voiceQueue.get(sid) || []
+        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':turnend:' + turn + ':' + s.slice(0, 8) }) })
+        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        voiceQueue.set(sid, q)
+        try { console.log('[gd-host] turn-end flush n=' + sentences.length + ' turn=' + turn) } catch (e) { /* ignore */ }
       } catch (e) { /* best effort */ }
     })
     // ---- 容错（spec §6.8） ----
@@ -2093,6 +2154,13 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
         const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
         if (!text) return
+        // RC13：语音模式同样只播回合最终消息——"非通话语音模式也反复播放同一内容"同根因
+        // （逐 step 播近同文案）。带 tool-call 的中间消息直接跳过（语音模式终结工具回合
+        // 极少见，不设 turn/end 兜底）。
+        const hasToolCall = content.some(function (b) { return b && b.type === 'tool-call' })
+        if (hasToolCall) return
+        // RC13（Task 3）：双通道互斥
+        if (wasHostSpoken(sid, text)) return
         // 异步串行 TTS，不阻塞事件循环
         serialSpeak(function () {
           return speakImpl({ text: text, sessionId: sid, turnSeq: seq, source: 'voice-mode' }).then(function (r) {
