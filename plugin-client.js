@@ -1092,6 +1092,10 @@ return {
 
     // ============ STREAM PLAYER 节（Phase 2，client） ============
     const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0, fetching: false }
+    // RC13（三路评审定案）：重试记账按 (sid,text) 维度——旧模块级单例记账：句 A 重试后
+    // 5s 内句 B 失败不再重试（单例被 A 占用）。429（host 忙门）不重试（立即重试必再 429，
+    // 且与在途合成并发；串行 poll 下一轮会取队列下一条）。
+    const retryKeys = new Map() // 'sid|text' -> true（5s 后释放）
     // RC12 诊断日志：浏览器控制台打点（[gd] 前缀）——一次复测即可定位播放管线问题（爆音/重复/中断）
     function gdLog(msg) { try { console.log('[gd] ' + msg) } catch (e) { /* ignore */ } }
     // RC9（2026-08-17 验收）：流链排空等待——playStreamEntry 在 fetch 结束即 resolve（C2 预取
@@ -1133,22 +1137,24 @@ return {
       out.set(pcm, 44)
       return out
     }
-    function scheduleChunk(audioCtx, wavBytes) {
+    function scheduleChunk(audioCtx, wavBytes, playId) {
       return audioCtx.decodeAudioData(wavBytes.buffer.slice(0)).then(function (buf) {
-        if (!streamPlayer.active) return
+        // RC13：代际守卫——重试/打断后旧 fetch 的解码帧（异步 decode）不得加入新链，
+        // 否则同句尾帧在新旧链上重叠 → 重复播放 + 同相叠加削波爆音
+        if (playId !== streamPlayer.playSeq || !streamPlayer.active) return
         const src = audioCtx.createBufferSource()
         src.buffer = buf
         const when = Math.max(audioCtx.currentTime + 0.05, streamPlayer.nextTime)
-        // RC12：断链后淡入（5ms）——链排空后新块从全幅起播会咔哒一声（"句子被切断时爆"候选）
+        // RC12：断链后淡入（5ms）；RC13：每帧恒接 GainNode（停播淡出需要），阈值收窄到 3ms
+        // ——5-20ms 帧间隙同样淡入，消除小间隙咔哒
         const gapMs = Math.round((when - streamPlayer.nextTime) * 1000)
-        if (gapMs > 20) {
-          const g = audioCtx.createGain()
+        const g = audioCtx.createGain()
+        if (gapMs > 3) {
           g.gain.setValueAtTime(0.0001, when)
           g.gain.linearRampToValueAtTime(1, when + 0.005)
-          src.connect(g); g.connect(audioCtx.destination)
-        } else {
-          src.connect(audioCtx.destination)
         }
+        src._gdGain = g
+        src.connect(g); g.connect(audioCtx.destination)
         src.start(when)
         streamPlayer.nextTime = when + buf.duration
         streamPlayer.nodes.push(src)
@@ -1170,6 +1176,7 @@ return {
     async function playStreamEntry(entry, sid) {
       // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
       const playId = ++streamPlayer.playSeq
+      const rkey = sid + '|' + entry.text // RC13：重试记账键（(sid,text) 维度）
       // C2（最终审稿）：句间预合成——前一句仍在播放/排队（active）时**不再**停播覆盖（v2.1
       // 语义仅保留给非流条目 playEntry/playEntryConsensus）；本句流取来后解码帧追加调度到
       // 既有无缝链（scheduleChunk 按 streamPlayer.nextTime 续接），不重置 nextTime/active/phase，
@@ -1195,13 +1202,14 @@ return {
       // C6（最终审稿）：fetch 在途标志——追加句 fetch 期间即使既有链排空也不停 active；
       // finally 在 catch/重连逻辑之后清除，重连再入时看到的仍是 false
       streamPlayer.fetching = true
+      let noRetry = false // RC13：429 不重试标记
       const controller = new AbortController()
       streamPlayer.controller = controller
       const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
       try {
         const resp = await fetch(url, { signal: controller.signal })
         gdLog('fetch status=' + resp.status + ' playId=' + playId)
-        if (!resp.ok || !resp.body) { throw new Error('http ' + resp.status) }
+        if (!resp.ok || !resp.body) { noRetry = resp.status === 429; throw new Error('http ' + resp.status) }
         const reader = resp.body.getReader()
         let acc = new Uint8Array(0)
         let totalBytes = 0
@@ -1222,34 +1230,32 @@ return {
               const frame = acc.subarray(0, even)
               acc = acc.subarray(even)
               const wav = pcmToWav(frame, sr)
-              scheduleChunk(audioCtx, wav)
+              scheduleChunk(audioCtx, wav, playId)
               frameCount += 1
             }
           }
         }
         if (acc.length > 1) {
           const even = acc.length - (acc.length % 2)
-          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav); frameCount += 1 }
+          if (even > 0) { const wav = pcmToWav(acc.subarray(0, even), sr); scheduleChunk(audioCtx, wav, playId); frameCount += 1 }
         }
         gdLog('stream done playId=' + playId + ' bytes=' + totalBytes + ' frames=' + frameCount + ' nodes=' + streamPlayer.nodes.length)
       } catch (e) {
         // R15 修复：新播放已接管（playSeq 已递增）→ 旧 abort rejection 直接退出，不拆新播放状态
         if (playId !== streamPlayer.playSeq) return
-        gdLog('stream FAIL playId=' + playId + ' active=' + streamPlayer.active + ' retried=' + !!playStreamEntry._retried + ' nodes=' + streamPlayer.nodes.length + ' err=' + String((e && e.message) || e).slice(0, 60))
+        gdLog('stream FAIL playId=' + playId + ' active=' + streamPlayer.active + ' retried=' + retryKeys.has(rkey) + ' nodes=' + streamPlayer.nodes.length + ' err=' + String((e && e.message) || e).slice(0, 60))
         if (streamPlayer.active) {
-          // RC11（V4-Pro 诊断确认）：重试前**完整停链**——已 src.start 的旧帧仍在播放，
-          // 仅置 active=false 会让重试以 firstSentence 另起新链（nextTime=0），同句在新旧
-          // 两条链上重叠 → "同一内容重复播放" + 同相 16bit PCM 叠加削波爆音。
+          // RC11（V4-Pro 诊断确认）：重试前完整停链——stopStreamPlayback 内部递增 playSeq，
+          // 重试以新代际起播，旧帧（含已 src.start 的）全部作废
           stopStreamPlayback()
           setCallState({ phase: 'listening', error: '播放中断' })
-          // 重连一次（C3：每句已重新取 token，playStreamEntry 内部即新 token + GET）
-          if (!playStreamEntry._retried) {
-            playStreamEntry._retried = true
+          // RC13：429 不重试（host 忙门，立即重试必再 429）；同 (sid,text) 5s 内至多重试一次。
+          // 重试必须并入串行链——return 让 callPoll 等到重试结束（RC8）。
+          if (!noRetry && !retryKeys.has(rkey)) {
+            retryKeys.set(rkey, true)
+            setTimeout(function () { retryKeys.delete(rkey) }, 5000)
             showToast('播放中断，已尝试重连')
-            // RC8：重试必须并入串行链——旧代码 fire-and-forget 重试与 poll 下一条并发
-            // （双 fetch → 429/重叠帧 → 双播 + 噪声）；return 让 callPoll 等到重试结束
             const retried = playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
-            setTimeout(function () { playStreamEntry._retried = false }, 5000)
             return retried
           } else {
             showToast('播放中断')
@@ -1266,11 +1272,28 @@ return {
       }
     }
     function stopStreamPlayback() {
+      // RC13：代际递增——在途 fetch 的解码帧/abort 回调全部作废（catch 的 playId 归属检查直接退出）
+      streamPlayer.playSeq += 1
       if (streamPlayer.controller) { try { streamPlayer.controller.abort() } catch (e) { /* ignore */ } streamPlayer.controller = null }
       streamPlayer.active = false
-      streamPlayer.nodes.forEach(function (src) { try { src.stop() } catch (e) { /* ignore */ } })
+      // RC13：淡出停播（10ms 线性落零再延时停源）——src.stop() 硬切在句切断处产生咔哒爆音
+      const now = streamPlayer.audioCtx ? streamPlayer.audioCtx.currentTime : 0
+      streamPlayer.nodes.forEach(function (src) {
+        try {
+          const g = src._gdGain
+          if (g && streamPlayer.audioCtx) {
+            g.gain.cancelScheduledValues(now)
+            g.gain.setValueAtTime(g.gain.value || 1, now)
+            g.gain.linearRampToValueAtTime(0.0001, now + 0.01)
+            src.stop(now + 0.015)
+          } else {
+            src.stop()
+          }
+        } catch (e) { /* ignore */ }
+      })
       streamPlayer.nodes = []
       streamPlayer.nextTime = 0
+      streamPlayer.fetching = false // RC13：停播即清在途标志（C6 的"fetch 在途保 active"仅用于自然排空）
       notifyConsensusSpeech(false)
     }
     // Task 13：打断接线（spec §6.6）——Task 7 VAD 轮询在 phase==='speaking' 且发声时调用本回调
