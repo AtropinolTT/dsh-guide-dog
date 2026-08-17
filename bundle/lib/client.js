@@ -100,26 +100,37 @@ return {
         curAudio = null
       }
     }
+    // RC8（2026-08-17 验收）：playEntry 返回 Promise（onended/onerror 结算）——callPoll 串行消费
+    // url 条目（进度播报 mp3）时须等播完，否则播报与后续条目（另一条播报/回复流）重叠
+    // → "同时播报多条" + 噪声。30s 兜底超时防队列卡死（stopCurrent 中断的音频不触发 onended）。
     function playEntry(url) {
       stopCurrent()
       if (typeof Audio !== 'function') {
-        showToast('播放器不可用'); return
+        showToast('播放器不可用'); return Promise.resolve()
       }
-      try {
-        const a = new Audio(String(url))
-        curAudio = a
-        a.onended = function () { if (curAudio === a) curAudio = null }
-        a.onerror = function () {
-          if (curAudio === a) { curAudio = null; showToast('播放失败') }
+      return new Promise(function (resolve) {
+        let settled = false
+        const timer = setTimeout(function () { if (!settled) { settled = true; resolve() } }, 30000)
+        const done = function () { if (!settled) { settled = true; clearTimeout(timer); resolve() } }
+        try {
+          const a = new Audio(String(url))
+          curAudio = a
+          a.onended = function () { if (curAudio === a) curAudio = null; done() }
+          a.onerror = function () {
+            if (curAudio === a) { curAudio = null; showToast('播放失败') }
+            done()
+          }
+          const p = a.play()
+          if (p && typeof p.catch === 'function') p.catch(function () {
+            if (curAudio === a) { curAudio = null; showToast('浏览器阻止了自动播放，请先点击页面') }
+            done()
+          })
+        } catch (e) {
+          curAudio = null
+          showToast('播放失败')
+          done()
         }
-        const p = a.play()
-        if (p && typeof p.catch === 'function') p.catch(function () {
-          if (curAudio === a) { curAudio = null; showToast('浏览器阻止了自动播放，请先点击页面') }
-        })
-      } catch (e) {
-        curAudio = null
-        showToast('播放失败')
-      }
+      })
     }
     function beepFallback() {
       // WebAudio 振荡器兜底：Audio 元素被自动播放策略拦截时使用
@@ -446,7 +457,8 @@ return {
               pollBusy = true
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
-                  if (r.entry.url) playEntry(r.entry.url)
+                  // RC8：url 条目同样串行等待（防语音模式多条 mp3 重叠）
+                  if (r.entry.url) return playEntry(r.entry.url)
                   else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
                 }
               }).catch(function () {}).then(function () { pollBusy = false })
@@ -1018,14 +1030,14 @@ return {
       let consumed = false
       host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
         if (r && r.ok && r.entry) {
-          // C5 修复：consensus 摘要条目（mp3 url + consensus 标记）→ 播放前开共识窗口
-          if (r.entry.consensus) { notifyConsensusSpeech(true); playEntryConsensus(r.entry.url) }
-          // RC6（2026-08-17 验收）：流条目必须串行——host tts-stream 每会话 busy 门
-          // （speechStreamBusy）拒绝并发合成；预合成重叠 fetch 实测第二请求 1.8ms 即 429 →
-          // '播放中断' + 句子丢失 + 重试 nextTime=0 与在播帧重叠（噪声）。await 本句播放
+          // RC8：全部条目类型都串行等待（consumed=true + return Promise）——进度播报 mp3 未播完
+          // 不得播下一条（旧代码 url 分支不 await → 播报与回复流重叠 → "同时播报多条" + 噪声）
+          if (r.entry.consensus) { consumed = true; return playEntryConsensus(r.entry.url) }
+          // RC6：流条目串行——host tts-stream 每会话 busy 门（speechStreamBusy）拒绝并发合成；
+          // 预合成重叠 fetch 实测第二请求 1.8ms 即 429 → '播放中断' + 句子丢失。await 本句播放
           // 结束再取下句：句 N 合成（~1-2s）通常短于播放时长，链仍无缝续接。
           else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; consumed = true; return playStreamEntry(r.entry, callSessionId || '') }
-          else if (r.entry.url) playEntry(r.entry.url)
+          else if (r.entry.url) { consumed = true; return playEntry(r.entry.url) }
           else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
         }
       }).catch(function () {}).then(function () {
@@ -1036,18 +1048,26 @@ return {
       })
     }
     // C5：共识 mp3 播放（window 关闭由 onended 触发；与 playEntry 同机制，附加回调）
+    // RC7b：摘要必须抢占流播放（拦截发生在回复播放中时，摘要与在播帧叠加 → 噪声 + 听不清确认）
+    // RC8：返回 Promise 供 callPoll 串行等待（摘要未播完不得播下一条）
     function playEntryConsensus(url) {
-      // RC7b（2026-08-17 验收）：摘要必须抢占流播放——拦截发生在回复播放中时，摘要与在播帧
-      // 叠加 → 噪声 + 听不清确认。stopStreamPlayback 会 notify(false)，随后重新开窗保持 3s 窗口
-      stopStreamPlayback()
+      stopStreamPlayback() // 内部 notify(false)，随后重开窗口保持 3s 窗
       notifyConsensusSpeech(true)
       stopCurrent()
-      const a = new Audio(String(url))
-      curAudio = a
-      a.onended = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false) }
-      a.onerror = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false); showToast('播放失败') }
-      const p = a.play()
-      if (p && typeof p.catch === 'function') p.catch(function () { if (curAudio === a) { curAudio = null; notifyConsensusSpeech(false) } })
+      if (typeof Audio !== 'function') { showToast('播放器不可用'); return Promise.resolve() }
+      return new Promise(function (resolve) {
+        let settled = false
+        const timer = setTimeout(function () { if (!settled) { settled = true; notifyConsensusSpeech(false); resolve() } }, 30000)
+        const done = function () { if (!settled) { settled = true; clearTimeout(timer); notifyConsensusSpeech(false); resolve() } }
+        try {
+          const a = new Audio(String(url))
+          curAudio = a
+          a.onended = function () { if (curAudio === a) curAudio = null; done() }
+          a.onerror = function () { if (curAudio === a) { curAudio = null; showToast('播放失败') } done() }
+          const p = a.play()
+          if (p && typeof p.catch === 'function') p.catch(function () { if (curAudio === a) { curAudio = null } done() })
+        } catch (e) { curAudio = null; showToast('播放失败'); done() }
+      })
     }
     // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
 
@@ -1161,15 +1181,21 @@ return {
           if (!playStreamEntry._retried) {
             playStreamEntry._retried = true
             showToast('播放中断，已尝试重连')
-            playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
+            // RC8：重试必须并入串行链——旧代码 fire-and-forget 重试与 poll 下一条并发
+            // （双 fetch → 429/重叠帧 → 双播 + 噪声）；return 让 callPoll 等到重试结束
+            const retried = playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
             setTimeout(function () { playStreamEntry._retried = false }, 5000)
+            return retried
           } else {
             showToast('播放中断')
           }
         }
       } finally {
-        streamPlayer.fetching = false // C6：在 catch/重连之后清除（重连再入时看到 false）
-        streamPlayer.controller = null
+        // RC8：归属检查——重试已接管 controller/fetching 时，陈旧 finally 不得清除新状态
+        if (streamPlayer.controller === controller) {
+          streamPlayer.fetching = false // C6：在 catch/重连之后清除（重连再入时看到 false）
+          streamPlayer.controller = null
+        }
         if (entry.consensus) notifyConsensusSpeech(false)
       }
     }
