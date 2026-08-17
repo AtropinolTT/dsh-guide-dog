@@ -242,6 +242,143 @@ sessions mid-playback → the clip continues to the end and is NOT replayed;
 use the mic button → recognized text appears in the input box; Settings →
 Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
 
+## Phase 2 — call mode (通话模式)
+
+### Feature list
+
+- **零 WebSocket 双通道** — 上行整段 POST `/guide-dog/call-transcribe`
+  （webm/opus，≤20MB，复用 Phase 1 `transcribeImpl` 与本地 whisper 管线）
+  → `{ok, text, language, durationMs}`；下行 `GET /guide-dog/tts-stream`
+  走 chunked HTTP 流（host 按句 spawn `mmx speech synthesize --stream
+  --format pcm --sample-rate 24000`，stdout 管道增量喂 `res.write`；client
+  用 `fetch().body.getReader()` 读流 → PCM→WAV → Web Audio 无缝调度）。
+  传输层无 WebSocket 新协议面，浏览器与 CLI 复用同一管线。
+- **VAD 自动 + 按住说话（PTT）** — 默认 VAD（`call.mode='vad'`）：
+  MediaRecorder（`audio/webm;codecs=opus`，250ms timeslice 整通录音）+
+  并行 AnalyserNode 能量检测（RMS ≥ `vad.threshold`、静音 `vad.silenceMs`
+  判定说话结束、`vad.minSpeechMs` 最短语音、`vad.maxSegmentSeconds` 单段
+  上限）——说话-停顿-说话自动成两段回合；面板可切换 `ptt` 按住说话
+  （按住麦克风说话、松开即发送；VAD 参数不参与端点判定，仅做打断监测）。
+- **共识优先（Consensus-first，核心交互范式）** — 仅通话/a11y 开启时生效，
+  打字模式保持 Phase 1 现状：prompt 软约束（`guide_dog_call_consensus`
+  systemPrompt variable，聊天式措辞：先理解意图、不清楚就问、写入/修改前
+  说明并等用户点头）+ 机制硬保证（`tools/pre-execute` 瀑布拦截：write/edit
+  与 bash 破坏性命令启发式 rm/mv/cp/truncate/dd/覆盖重定向/git push 等 →
+  未确认返回 `{kind:'deny', reason:'needs_voice_confirmation'}`，模型语音
+  提问；用户确认词命中 → 本轮放行；每次执行前 host 用工具入参生成一句话
+  摘要直接 TTS 播报（不走模型），随后开启 `consensus.summaryWindowMs` 打断
+  窗口，窗口内用户发声即中止本次执行——工具物理上尚未启动）。拦截器自身
+  失败 → 拒绝并口播"共识检查失败"（宁可拦错不可放错，spec §6.8）。
+- **进度播报（不静默原则）** — `agent/status`（running → "正在处理"）、
+  `tools/result`（工具名→短语：bash→"正在执行命令"、write/edit→
+  "正在修改文件"、web_search→"正在搜索网页"、
+  guide_dog_image/video/music/speak→"正在生成媒体"、未知→"正在执行操作"；
+  read/grep/glob/skill 静默不播）、`agent/error`（"处理出错：<短原因>"）；
+  通话中 >120s 无任何事件 → 心跳播报"仍在处理，请稍候"。播报与回复朗读
+  共用队列：播报优先（队首）、回复让路。
+- **流式 TTS** — 回复文本按句切分（`stream.sentenceSplit` 字符集
+  `。！？.!?\n`；`stream.maxSentenceChars` 超长句强制截断）逐句合成；每句
+  经 `guide-dog/tts-token` 重新签发一次性 token（单次消费、5 分钟有效、
+  绑定 sessionId）；句间预合成（当前句播放期间 client 提前请求下一句流）。
+  实测中文短句首字节 ~600ms，满足"首音频 <1.5s"判据。
+- **打断（Barge-in）** — VAD 检测到播放中用户发声（≥ `vad.interruptMinMs`
+  300ms 防误触）→ 浏览器立即停止播放并清空未播缓冲 → abort 当前
+  `tts-stream` fetch → 新语音自然成为下一回合（Pipecat InterruptionFrame
+  语义）。
+- **语音命令** — 通话转写命中命令表（停/暂停、继续/恢复、重复/再说一遍、
+  慢一点/快一点、看看屏幕〔Phase 3 桩〕）→ 本地执行且不提交到对话；
+  `guide-dog/call-command` RPC 提供 `clear-queue` 等 host 侧命令。
+- **容错** — 流中断自动重连一次（每句重新取 token；失败 toast 提示
+  "播放中断"）；STT 失败不提交 + 提示音 + toast；TTS 失败文字照常落地 +
+  失败提示音 + 面板错误状态（绝不静默）；共识拦截器失败保守拒绝并口播原因。
+
+### config.json schema（Phase 2：call / a11y）
+
+Phase 1 的 config（`~/.dsh/guide-dog/.guide-dog/config.json`）基础上新增，
+全部可选、深合并默认值（spec §4 复制）：
+
+```json
+{
+  "call": {
+    "mode": "vad",
+    "vad": {
+      "method": "energy",
+      "threshold": 0.02,
+      "silenceMs": 700,
+      "minSpeechMs": 300,
+      "maxSegmentSeconds": 60,
+      "interruptMinMs": 300
+    },
+    "stream": {
+      "format": "pcm",
+      "sampleRate": 24000,
+      "sentenceSplit": "。！？.!?\n",
+      "maxSentenceChars": 200
+    },
+    "voice": "English_expressive_narrator",
+    "speed": 1.0,
+    "progress": true,
+    "consensus": { "enabled": true, "summaryWindowMs": 3000 }
+  },
+  "a11y": {
+    "enabled": false,
+    "autoNarrate": true,
+    "visionCloud": true,
+    "summaryFirst": true
+  }
+}
+```
+
+- `call.mode`: `vad`（默认，自动端点检测）| `ptt`（按住说话）。
+- `call.vad.method`: `energy`（Phase 2 v1，RMS 能量阈值；背景噪声大时调高
+  `threshold`）→ 升级位 `silero`（web-vad 浏览器 WASM）/ `sherpa`
+  （VAD+ASR 一体）。
+- `call.stream.format/sampleRate`: `mmx speech synthesize --stream` 参数
+  （s16le 单声道 PCM；24000 为显式覆盖值，mmx 自身默认 32000）。
+- `call.consensus`: `enabled` 开关共识优先（仅通话/a11y 生效）；
+  `summaryWindowMs` 摘要播报后等待用户打断的窗口。
+- `a11y`: Phase 3 无障碍模式配置（本阶段仅 `enabled` 参与通话流式/共识
+  判定；`autoNarrate`/`visionCloud`/`summaryFirst` 为 Phase 3 预留）。
+
+### Routes (Phase 2)
+
+| Method & Path | Purpose |
+|---|---|
+| `POST /guide-dog/call-transcribe` | 上行：整段音频（client 以 multipart form-data `audio` 字段发送 webm/opus，`x-session-id` 头），≤20MB 硬上限；host 复用 Phase 1 `transcribeImpl` → `{ok, text, language, durationMs}` |
+| `GET /guide-dog/tts-stream?token=…&sid=…&text=<句>` | 下行：chunked PCM 音频流（`content-type: audio/pcm`，`cache-control: no-store`）；需 `guide-dog/tts-token` 签发的一次性 token——无/错 token → 403，该会话有在途流 → 429 |
+
+RPC 风格接口（`tts-token` / `call-active` / `call-command`）走同一 JSON POST
+兼容层，物理 URL 为 `/guide-dog/api/guide-dog/<name>`（双重前缀，同 Phase 1
+`guide-dog/status` 示例）——见下方 RPC surface 表新增三行。
+
+### Verification
+
+```
+node --check bundle/lib/index.js && node --check bundle/lib/client.js       # bundle 语法 ×2
+curl -s -X POST http://127.0.0.1:3080/guide-dog/call-transcribe \
+  -H 'content-type: application/json' -d '{}' | head -5                    # 上行路由可达（空音频 → 错误 JSON）
+curl -s -o /dev/null -w '%{http_code}\n' \
+  'http://127.0.0.1:3080/guide-dog/tts-stream?token=bad&sid=x&text=hi'      # 无有效 token → 403
+```
+
+Manual acceptance checklist（完整判据见 `specs/2026-08-14-guide-dog-v2-design.md`
+§6.9，部署并重启 DSH 后逐项验证）：
+
+1. VAD：说话-停顿-说话两段分别成回合；静音判定不误切（`threshold` 可调）。
+2. 回合循环：语音 → 转写 → 提交 → agent 执行（含工具调用）→ 回复朗读，
+   端到端可完成一次"用语音让 agent 生成图片/搜索"。
+3. 打断：播放中说话即停，下一回合正常。
+4. 进度播报：agent 执行工具期间至少播报一次阶段状态。
+5. 流安全：非白名单 Origin 与无/错 token 拒绝；断流重连后恢复。
+6. 全量流式：长回复完整朗读；"重复/停/慢一点"命令生效；首音频延迟 ≤1.5s、
+   播放间隙 ≤400ms（实测）。
+7. 共识优先：语音"把 README 的 X 改成 Y"→ 不立即执行 → 语音确认 → 确认后
+   每次写操作前听到简短摘要 → 摘要期间说话 → 该次执行被中止、用户语音成为
+   新回合；未确认时 write/edit 被拦截（检查 `tools/pre-execute` 拦截路径）。
+8. 意图模糊（如"改一下那个文件"无上下文）→ agent 语音追问关键问题，不臆测
+   执行；用户反问"为什么要改？"→ agent 语音解释。
+9. PTT：按住说话/松开发送；VAD 模式下模式开关切换生效。
+
 ## RPC surface (Client → Host)
 
 | Method | Args | Returns |
@@ -256,6 +393,9 @@ Guide Dog shows the 语音模式 / 语音输入 / STT blocks.
 | `guide-dog/transcribe` | `{audioB64, mime, sessionId?, language?}` | `{ok, text, language, durationMs}` / `{ok:false, error}` |
 | `guide-dog/beep` | — | `{ok, dataUri}` (WAV beep data URI) |
 | `guide-dog/voice-queue` | `{sessionId}` | `{ok, entry}` — pops one entry (play/error) or `null` |
+| `guide-dog/tts-token` | `{sessionId}` | `{ok, token}` — one-time stream token (5 min, single-use, bound to session) |
+| `guide-dog/call-active` | `{sessionId, kind ('session'\|'speaking'), active}` | `{ok}` — session persistence vs instantaneous speaking flag (C4) |
+| `guide-dog/call-command` | `{sessionId, cmd}` | `{ok}` — host-side call commands (`clear-queue` …) |
 
 ## Security notes
 

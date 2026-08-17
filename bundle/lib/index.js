@@ -135,6 +135,16 @@ return {
       voiceMode: { default: false, sessions: {} },
       voiceInput: { autoSend: false, engine: 'whisper', language: 'auto', maxSeconds: 60, whisper: { python: 'python3', model: 'small' } },
       tts: { voiceEn: 'English_expressive_narrator', voiceZh: 'Chinese (Mandarin)_Gentle_Youth', speed: 0.95, format: 'mp3' },
+      call: {
+        mode: 'vad',
+        vad: { method: 'energy', threshold: 0.02, silenceMs: 700, minSpeechMs: 300, maxSegmentSeconds: 60, interruptMinMs: 300 },
+        stream: { format: 'pcm', sampleRate: 24000, sentenceSplit: '。！？.!?\n', maxSentenceChars: 200 },
+        voice: 'English_expressive_narrator',
+        speed: 1.0,
+        progress: true,
+        consensus: { enabled: true, summaryWindowMs: 3000 },
+      },
+      a11y: { enabled: false, autoNarrate: true, visionCloud: true, summaryFirst: true },
     }
     function deepMerge(base, over) {
       if (over === null || typeof over !== 'object' || Array.isArray(over)) return over === undefined ? base : over
@@ -690,6 +700,14 @@ if __name__ == '__main__':
         return await fsSvc.readBytes(t, undefined, maxBytes)
       } catch (e) { return null }
     }
+    // M10: fsSvc.readBytes 无 offset，只读文件开头 maxBytes；
+    // readRange 经 shell (dd + head/tail + base64) 只读 [start, start+len)。
+    async function readRange(abs, start, len) {
+      if (!runRaw || !quote) return null
+      const r = await runRaw('dd if=' + quote(abs) + ' bs=4096 skip=' + Math.floor(start / 4096) + ' 2>/dev/null | head -c ' + (len + (start % 4096)) + ' | tail -c +' + ((start % 4096) + 1) + ' | base64 -w0', { timeoutMs: 30000 })
+      if (r.exitCode !== 0 || !r.stdout) return null
+      try { return Buffer.from(r.stdout.trim(), 'base64') } catch (e) { return null }
+    }
     async function listDir(abs) {
       if (!fsSvc) return null
       try {
@@ -952,16 +970,14 @@ if __name__ == '__main__':
               if (!st) { res.writeHead(404); res.end(); return }
               const size = st.size || 0
               if (size > MAX_FILE_BYTES) { res.writeHead(413); res.end(); return }
-              const bytes = await readBytes(abs, size || MAX_FILE_BYTES)
-              if (!bytes) { res.writeHead(404); res.end(); return }
               const headers = { 'content-type': mime, 'accept-ranges': 'bytes', 'content-length': String(size) }
               let status = 200
-              let body = bytes
+              let rangeLen = -1 // -1 = 全量
+              let start = -1 // range 起点（rangeLen >= 0 时有效）
               const range = req.headers && req.headers.range ? String(req.headers.range) : ''
               if (range) {
                 const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
                 if (m && (m[1] || m[2])) {
-                  let start = 0
                   let end = size - 1
                   if (m[1] === '') {
                     start = Math.max(0, size - parseInt(m[2] || '0', 10))
@@ -973,14 +989,17 @@ if __name__ == '__main__':
                     res.writeHead(416, { 'content-range': 'bytes */' + size }); res.end(); return
                   }
                   end = Math.min(end, size - 1)
-                  body = bytes.slice(start, end + 1)
+                  rangeLen = end - start + 1
                   status = 206
                   headers['content-range'] = 'bytes ' + start + '-' + end + '/' + size
-                  headers['content-length'] = String(body.length)
+                  headers['content-length'] = String(rangeLen)
                 }
               }
+              // M10：只读所需区段，不全量缓冲（fsSvc.readBytes 无 offset，range 走 readRange）
+              const bytes = rangeLen >= 0 ? await readRange(abs, start, rangeLen) : await readBytes(abs, size || MAX_FILE_BYTES)
+              if (!bytes) { res.writeHead(404); res.end(); return }
               res.writeHead(status, headers)
-              res.end(req.method === 'HEAD' ? undefined : body)
+              res.end(req.method === 'HEAD' ? undefined : bytes)
             } catch (e) {
               try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
             }
@@ -1073,6 +1092,47 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       } catch (e) { return function () {} }
     })
 
+    // ============ CALL 上行（Phase 2，host） ============
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact',
+          path: '/guide-dog/call-transcribe',
+          handler: async function (req, res) {
+            try {
+              if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+              // 同源校验（M5 修订 2026-08-16）：Origin 必须等于 GUI 来源——按 Host 头推导
+              // （'http://' + req.headers.host，GUI 由 dsh web 同源托管）；无 Origin 头（curl）放行，
+              // 便于本地验收。不再用 guideDogRoot() 作 truthy 占位。
+              const origin = req.headers && req.headers.origin ? String(req.headers.origin) : ''
+              const hostHdr = req.headers && req.headers.host ? String(req.headers.host) : ''
+              if (origin && hostHdr && origin !== 'http://' + hostHdr) { res.writeHead(403); res.end(); return }
+              // 收集 body（≤20MB 硬上限）
+              const chunks = []
+              let total = 0
+              for await (const chunk of req) {
+                chunks.push(chunk)
+                total += chunk.length
+                if (total > 20 * 1024 * 1024) { res.writeHead(413); res.end(); return }
+              }
+              const b64 = Buffer.concat(chunks).toString('base64')
+              const r = await transcribeImpl({ audioB64: b64, mime: 'audio/webm', sessionId: req.headers && req.headers['x-session-id'] ? String(req.headers['x-session-id']) : '' })
+              if (r.ok) {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: true, text: r.text, language: r.language, durationMs: r.durationMs }))
+              } else {
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: r.error, message: r.message || '' }))
+              }
+            } catch (e) {
+              try { res.writeHead(500); res.end(JSON.stringify({ ok: false, error: 'stt_failed', message: String(e).slice(0, 200) })) } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+
     // ---------- prompt section: automatic invocation ----------
     ctx.effect(function () {
       if (!systemPrompt) return function () {}
@@ -1108,6 +1168,33 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
       } catch (e) {
         console.error('[guide-dog] voice mode variable failed: ' + String(e))
       }
+    }
+    // ---- 共识优先 prompt 变量（Task 8 Step 4） ----
+    // 接线说明（实证）：cordis ctx.effect(execute) 会立即调用 execute 并把其返回的函数作为
+    // 生命周期 disposer；systemPrompt.variable() 本身已即时注册并返回 exact effect disposer，
+    // 若直接 ctx.effect(disp) 会立刻调用 disp → 变量被即刻注销。故沿用上方 M3 同款接线
+    // （ctx.effect(function () { return disp })）：disp 仅在 scope 注销时被调用。
+    if (systemPrompt && systemPrompt.variable) {
+      try {
+        const disp1 = systemPrompt.variable('guide_dog_call_consensus', function (context) {
+          const cfg = loadConfig()
+          const sid = context && context.sessionId ? String(context.sessionId) : ''
+          const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
+          const a11yOn = cfg.a11y && cfg.a11y.enabled
+          if (!callOn && !a11yOn) return undefined
+          const a11yExtra = a11yOn ? '无障碍模式已开启：所有可能改变状态的操作（发送、删除、覆盖等）执行前都必须先简短说明并得到你的语音确认。' : ''
+          return '用户正通过语音和你对话，像和合作伙伴讨论一样：先理解意图，不清楚就问（问多少看实际情况，语音通道保持简洁）；主动说明关键信息；写入/修改前先简短说明要做什么，等用户点头；用户随时可能提问或插话，认真回应。' + a11yExtra
+        })
+        if (typeof disp1 === 'function') ctx.effect(function () { return disp1 })
+      } catch (e) { /* ignore */ }
+      try {
+        const disp2 = systemPrompt.variable('guide_dog_a11y_constraints', function () {
+          const cfg = loadConfig()
+          if (!(cfg.a11y && cfg.a11y.enabled)) return undefined
+          return '无障碍模式：①破坏性操作必须先语音确认（"将删除 X，确定吗？请说确定或取消"）；②颜色/图标/布局一律用文字描述；③重要状态变化必须口头通知。'
+        })
+        if (typeof disp2 === 'function') ctx.effect(function () { return disp2 })
+      } catch (e) { /* ignore */ }
     }
 
     // ---------- tools ----------
@@ -1470,6 +1557,16 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
     })
     ctx.effect(function () {
       try {
+        return harness.handle('guide-dog/tts-token', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: false, error: 'bad_args', message: 'sessionId required' }
+          const token = await issueTtsToken(sid)
+          return { ok: true, token: token }
+        })
+      } catch (e) { return function () {} }
+    })
+    ctx.effect(function () {
+      try {
         return harness.handle('guide-dog/beep', async function () {
           const rate = 8000, ms = 150, freq = 880
           const n = Math.floor(rate * ms / 1000)
@@ -1491,6 +1588,425 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         })
       } catch (e) { return function () {} }
     })
+    // ============ CALL 节（Phase 2，host） ============
+    const ttsTokens = new Map() // token -> { sessionId, exp }
+    const consent = new Map() // sessionId -> turnSeq（本轮已语音确认）
+    // C1 修复（2026-08-16 审稿）：consentPending 记录"用户刚说过确认词"的会话；
+    // 由 user 消息监听器（Task 8 Step 3b）置位，下一次 pre-execute 消费并 grantConsent。
+    const consentPending = new Set() // sessionId（等待写入放行）
+    const callActiveSessions = new Set() // sessionId（持久通话激活，startCall/stopCall 时置位，C4 修复）
+    async function issueTtsToken(sessionId) {
+      const token = 'gd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+      ttsTokens.set(token, { sessionId: String(sessionId), exp: Date.now() + 5 * 60 * 1000 })
+      return token
+    }
+    function consumeTtsToken(token, sessionId) {
+      if (!token || typeof token !== 'string') return false
+      const rec = ttsTokens.get(token)
+      if (!rec) return false
+      ttsTokens.delete(token) // 单次消费
+      if (rec.sessionId !== String(sessionId)) return false
+      if (rec.exp < Date.now()) return false
+      return true
+    }
+    function grantConsent(sid, turnSeq) { consent.set(String(sid), turnSeq) }
+    function hasConsent(sid, turnSeq) {
+      const v = consent.get(String(sid))
+      return typeof turnSeq === 'number' ? v === turnSeq : v !== undefined
+    }
+    // M10 语义说明（2026-08-16 审稿）：一次确认放行"本轮"全部写操作——grantConsent 在首次
+    // pre-execute 时以该 exec 的 turnSeq 授予；同一 assistant turn 内后续写工具共享同一
+    // exec.agent.turn → hasConsent 精确匹配通过。若 exec.agent.turn 为 null（探测未发现 turn），
+    // hasConsent 退化为"已授予即可"（v !== undefined），新用户回合前 clearConsent 兜底。
+    function clearConsent(sid) { consent.delete(String(sid)) }
+    function markConsentPending(sid) { consentPending.add(String(sid)) }
+    function consumeConsentPending(sid) { return consentPending.delete(String(sid)) }
+    function isCallActive(sid) { return callActiveSessions.has(String(sid)) }
+    // 定期清理过期 token（30s 检查，防泄漏）
+    // I3（2026-08-16 审稿）：host 侧 timerSvc.interval（callback 形式）未验证——
+    // 若 Task 4 探测确认 host interval 不可用，则改为 sleep 轮询（见下方注释替代）。
+    const tokenTimer = timerSvc && typeof timerSvc.interval === 'function'
+      ? timerSvc.interval(function () {
+          const now = Date.now()
+          ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+        }, 30000)
+      : null
+    if (tokenTimer) ctx.effect(tokenTimer)
+    // R2（2026-08-16 控制器裁定）：双路径清扫——interval 不可用时启动 sleep 轮询，
+    // 与上方 interval 分支互斥（仅一条路径运行）。
+    if (!tokenTimer) {
+      // 替代：sleep 轮询（Promise 形式，已验证）
+      ;(function tokenSweeper() {
+        sleep(30000).then(function () {
+          const now = Date.now()
+          ttsTokens.forEach(function (rec, tok) { if (rec.exp < now) ttsTokens.delete(tok) })
+          tokenSweeper()
+        })
+      })()
+    }
+    // ---- 共识优先（spec §6.7） ----
+    const WRITE_TOOL_NAMES = ['write', 'edit']
+    const DESTRUCTIVE_BASH_RE = /(^|\s|\||;|&&)(rm|mv|cp|truncate|dd|mkfs|git\s+push)\b|>>?[\s\S]*$/m
+    function consensusSummary(name, args) {
+      try {
+        if (name === 'write') {
+          const p = args && args.file_path ? String(args.file_path) : '?'
+          const content = args && args.content ? String(args.content) : ''
+          return '写入文件 ' + p + '（' + content.length + ' 字符）'
+        }
+        if (name === 'edit') {
+          const p = args && args.file_path ? String(args.file_path) : '?'
+          const oldS = args && args.old_string ? String(args.old_string) : ''
+          return '修改文件 ' + p + '（替换 ' + oldS.length + ' 字符片段）'
+        }
+        if (name === 'bash') {
+          const cmd = args && args.command ? String(args.command) : ''
+          if (DESTRUCTIVE_BASH_RE.test(cmd)) return '执行命令：' + cmd.slice(0, 80)
+          return ''
+        }
+        return ''
+      } catch (e) { return '' }
+    }
+    const callActiveFlags = new Map() // sessionId -> boolean（瞬时：用户正在发声，Task 9 窗口期高灵敏上报）
+    ctx.effect(function () {
+      try {
+        // C4 修复（2026-08-16 审稿）：call-active RPC 拆两用——
+        //   {active:true, kind:'session'} → callActiveSessions.add（持久激活，Task 7 startCall/stopCall 上报）
+        //   {active:true/false, kind:'speaking'} → callActiveFlags.set（瞬时发声，Task 9 共识窗口上报）
+        return harness.handle('guide-dog/call-active', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          if (!sid) return { ok: false, error: 'bad_args' }
+          const kind = args && args.kind === 'session' ? 'session' : 'speaking'
+          const active = !!(args && args.active)
+          if (kind === 'session') {
+            if (active) callActiveSessions.add(String(sid))
+            else callActiveSessions.delete(String(sid))
+          } else {
+            callActiveFlags.set(String(sid), active)
+          }
+          return { ok: true }
+        })
+      } catch (e) { return function () {} }
+    })
+    async function announceAndWait(sid, text) {
+      // 播报摘要（走同一 TTS 管线，source:'consensus'）；等待窗口；期间用户发声（speaking 置位）→ aborted
+      // C5 修复（2026-08-16 审稿）：① 摘要必须入 voiceQueue 且**带 consensus 标记**（speakImpl 只生成 mp3
+      //   不排队，旧代码直接 speakImpl → client 轮询取不到 → 用户听不到摘要、窗口永不开启）；
+      //   ② 只在生成完成后推最终条目（占位条目会被 client 先弹出——队列是 shift 语义）；
+      //   ③ 窗口在**摘要生成完成**后开始计时（client 播放到它需要 ~1-2s，窗口覆盖播放尾声与之后）；
+      //   ④ 窗口期监听 speaking 标志从 false 变 true（Task 9 开窗即上报的旧语义自噬，已改为仅真实发声上报）。
+      await serialSpeak(function () {
+        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'consensus' }).then(function (r) {
+          const q2 = voiceQueue.get(String(sid)) || []
+          if (r && r.ok && r.url) {
+            q2.push({ url: r.url, key: 'consensus:' + sid + ':' + Date.now(), consensus: true })
+          } else {
+            q2.push({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          }
+          if (q2.length > VOICE_QUEUE_MAX) q2.shift()
+          voiceQueue.set(String(sid), q2)
+        }).catch(function (e) {
+          const q3 = voiceQueue.get(String(sid)) || []
+          q3.push({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.shift()
+          voiceQueue.set(String(sid), q3)
+        })
+      })
+      const cfg = loadConfig()
+      const winMs = (cfg.call && cfg.call.consensus && cfg.call.consensus.summaryWindowMs) || 3000
+      const start = Date.now()
+      // 窗口开始：清瞬时标志，之后任何发声都会置 true → aborted
+      callActiveFlags.set(String(sid), false)
+      while (Date.now() - start < winMs) {
+        if (callActiveFlags.get(String(sid)) === true) return 'aborted'
+        await sleep(100)
+      }
+      return 'proceed'
+    }
+    function consensusEnabled(sid) {
+      const cfg = loadConfig()
+      const a11yOn = cfg.a11y && cfg.a11y.enabled
+      const callOn = cfg.call && cfg.call.consensus && cfg.call.consensus.enabled
+      return !!(a11yOn || callOn)
+    }
+    // C1 修复（2026-08-16 审稿）：user 确认词监听器——用户回复"确定/确认/可以/好"（普通回合内容）
+    // → markConsentPending(sid)；下一次 pre-execute 消费该 pending 并 grantConsent。
+    // 注意：监听 user 消息事件（Phase 1 的 session/event 监听的是 assistant/message，此处是 user 消息分支）。
+    const CONSENT_YES_RE = /^(确定|确认|可以|好的?|行|就这么办|继续)$/
+    const CONSENT_NO_RE = /^(取消|不行|不要|算了|停)$/
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'user/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid || !consensusEnabled(sid)) return
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join(' ').trim()
+        if (!text) return
+        const t = text.replace(/[，。！？\s]/g, '')
+        if (CONSENT_YES_RE.test(t)) markConsentPending(sid)
+        else if (CONSENT_NO_RE.test(t)) { clearConsent(sid); callActiveFlags.set(String(sid), false) }
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('tools/pre-execute', async function (exec, next) {
+      try {
+        // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
+        // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
+        // sessionId 推导：agent.session.id（T4 探针实证待确认；若证伪改为 agents 服务推导）
+        const sid = exec && exec.agent && exec.agent.session ? String(exec.agent.session.id || '') : ''
+        if (!sid || !consensusEnabled(sid)) return next()
+        const name = exec && exec.name ? String(exec.name) : ''
+        const args = exec && exec.arguments ? exec.arguments : {}
+        const isWrite = WRITE_TOOL_NAMES.indexOf(name) >= 0
+        const isDestructiveBash = name === 'bash' && DESTRUCTIVE_BASH_RE.test(String((args && args.command) || ''))
+        if (!isWrite && !isDestructiveBash) return next()
+        // 摘要：写工具强制；bash 仅破坏性命令
+        const summary = consensusSummary(name, args)
+        if (!summary) return next()
+        const turnSeq = exec.agent ? exec.agent.turn : null
+        // C1 修复：未共识但用户刚说过确认词 → 消费 pending 并授予本轮 consent（不拦截）
+        if (!hasConsent(sid, turnSeq) && consumeConsentPending(sid)) {
+          grantConsent(sid, turnSeq) // 原样存储：null → hasConsent 退化为"已授予"；数字 → 精确匹配
+        }
+        if (hasConsent(sid, turnSeq)) {
+          // 已共识：执行前摘要 + 打断窗口
+          const verdict = await announceAndWait(sid, '接下来' + summary)
+          if (verdict === 'aborted') return { kind: 'deny', reason: 'aborted_by_user' }
+          return next()
+        }
+        // 未共识：拦截，让模型语音提问
+        return { kind: 'deny', reason: 'needs_voice_confirmation' }
+      } catch (e) {
+        // spec §6.8：宁可拦错不可放错；口播原因（不静默）
+        try {
+          const sid = exec && exec.agent && exec.agent.session ? String(exec.agent.session.id || '') : ''
+          if (sid) serialSpeak(function () { return speakImpl({ text: '共识检查失败，已阻止本次操作', sessionId: sid, turnSeq: null, source: 'consensus' }).catch(function () { return null }) })
+        } catch (e2) { /* ignore */ }
+        return { kind: 'deny', reason: 'consensus_failed' }
+      }
+    })
+    // ---- 进度播报（spec §6.4） ----
+    function progressPhrase(name) {
+      const map = { bash: '正在执行命令', read: '正在查找文件', grep: '正在查找文件', glob: '正在查找文件',
+        write: '正在修改文件', edit: '正在修改文件', web_search: '正在搜索网页',
+        guide_dog_image: '正在生成媒体', guide_dog_video: '正在生成媒体', guide_dog_music: '正在生成媒体', guide_dog_speak: '正在生成媒体',
+        skill: '正在调用技能' }
+      return map[name] || '正在执行操作'
+    }
+    const PROGRESS_SILENT = { read: 1, grep: 1, glob: 1, skill: 1 } // 静默类（Phase 3 自动播报同白名单基础）
+    function shouldAnnounce(name) { return !PROGRESS_SILENT[name] }
+    function callOrA11yActive(sid) {
+      const cfg = loadConfig()
+      // C4 修复：读持久 callActiveSessions（isCallActive），不再读瞬时 callActiveFlags
+      return !!((cfg.call && cfg.call.progress && isCallActive(sid)) || (cfg.a11y && cfg.a11y.enabled))
+    }
+    function announce(sid, text) {
+      // 播报优先：生成完成后才入队（C5 同款修复——占位条目 {url:null, phrase} 会被 client 轮询
+      // shift 弹出后丢弃，旧代码先 unshift 占位再回填 → 播报大概率丢失）
+      serialSpeak(function () {
+        return speakImpl({ text: text, sessionId: sid, turnSeq: null, source: 'progress' }).then(function (r) {
+          const q2 = voiceQueue.get(String(sid)) || []
+          if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'progress:' + sid + ':' + text })
+          else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+          if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+          voiceQueue.set(String(sid), q2)
+        }).catch(function (e) {
+          const q3 = voiceQueue.get(String(sid)) || []
+          q3.unshift({ error: 'tts_failed', message: String(e).slice(0, 200) })
+          if (q3.length > VOICE_QUEUE_MAX) q3.pop()
+          voiceQueue.set(String(sid), q3)
+        })
+      })
+    }
+    // ⚠️ agent→sessionId 推导依赖 Task 4 探测（agent.session.id 形状待定案；
+    // 若 agent 无 session 字段，改从 exec.agent 的会话属性或 agents 服务推导）
+    // sessionId 推导：agent.session.id（T4 探针实证待确认；若证伪改为 agents 服务推导）
+    ctx.on('agent/status', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (!sid || !callOrA11yActive(sid)) return
+        if (payload.status === 'running') announce(sid, '正在处理')
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('tools/result', function (exec, result) {
+      try {
+        const agent = exec && exec.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        const name = exec && exec.name ? String(exec.name) : ''
+        if (!sid || !callOrA11yActive(sid) || !shouldAnnounce(name)) return
+        const phrase = progressPhrase(name)
+        announce(sid, phrase)
+      } catch (e) { /* best effort */ }
+    })
+    ctx.on('agent/error', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (!sid || !callOrA11yActive(sid)) return
+        const err = payload.error || {}
+        announce(sid, '处理出错：' + String((err && err.message) || err).slice(0, 60))
+      } catch (e) { /* best effort */ }
+    })
+    // ---- 下行流式 TTS（spec §6.5，零 WebSocket） ----
+    function splitSentences(text, splitChars, maxChars) {
+      if (!text) return []
+      const chars = splitChars || '。！？.!?\n'
+      const esc = chars.replace(/[\\\]]/g, '\\$&')
+      const re = new RegExp('[' + esc + ']', 'g')
+      const out = []
+      let last = 0, m
+      while ((m = re.exec(text)) !== null) {
+        const seg = text.slice(last, m.index + 1).trim()
+        if (seg) out.push(seg)
+        last = m.index + 1
+      }
+      const tail = text.slice(last).trim()
+      if (tail) out.push(tail)
+      const res = []
+      for (const s of out) {
+        if (s.length <= maxChars) res.push(s)
+        else for (let i = 0; i < s.length; i += maxChars) res.push(s.slice(i, i + maxChars))
+      }
+      return res
+    }
+    const speechStreamBusy = new Map() // sessionId -> bool
+    ctx.effect(function () {
+      if (!webServer) return function () {}
+      try {
+        return webServer.register({
+          kind: 'exact',
+          path: '/guide-dog/tts-stream',
+          handler: async function (req, res) {
+            try {
+              if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return }
+              const url = new URL(String(req.url || '/'), 'http://local')
+              const token = url.searchParams.get('token') || ''
+              const sid = url.searchParams.get('sid') || ''
+              const text = url.searchParams.get('text') || ''
+              if (!sid || !text || !consumeTtsToken(token, sid)) { res.writeHead(403); res.end(); return }
+              if (speechStreamBusy.get(sid)) { res.writeHead(429); res.end(); return }
+              speechStreamBusy.set(sid, true)
+              const cfg = loadConfig()
+              const streamCfg = (cfg.call && cfg.call.stream) || {}
+              const format = streamCfg.format || 'pcm'
+              const sampleRate = streamCfg.sampleRate || 24000
+              const voice = (cfg.call && cfg.call.voice) || 'English_expressive_narrator'
+              const speed = (cfg.call && cfg.call.speed) || 1.0
+              res.writeHead(200, { 'content-type': 'audio/' + format, 'cache-control': 'no-store' })
+              let handle = null
+              try {
+                handle = subprocess.spawn({
+                  argv: ['mmx', 'speech', 'synthesize', '--stream', '--text', text, '--format', format, '--sample-rate', String(sampleRate), '--voice', voice, '--speed', String(speed)],
+                  cwd: (await guideDogRoot()) + '/.guide-dog',
+                  stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 1024 * 1024 } },
+                  graceMs: 3000,
+                })
+                let first = true
+                handle.stdout.on('data', function (chunk) {
+                  if (first) { first = false; if (req.method === 'HEAD') { try { handle.terminate() } catch (e) { /* ignore */ } } }
+                  if (req.method === 'HEAD') return
+                  try { res.write(chunk) } catch (e) { try { handle.terminate() } catch (e2) { /* ignore */ } }
+                })
+                await handle.done
+                try { res.end() } catch (e) { /* ignore */ }
+              } catch (e) {
+                try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+              } finally {
+                speechStreamBusy.delete(sid)
+              }
+            } catch (e) {
+              try { res.writeHead(500); res.end() } catch (e2) { /* ignore */ }
+            }
+          },
+        })
+      } catch (e) { return function () {} }
+    })
+    // 下行主通道：assistant 消息 → 分句 → 流条目入队列（client 播放器识别 stream 条目走 GET）
+    ctx.on('session/event', function (session, event) {
+      try {
+        if (!event || event.type !== 'assistant/message') return
+        const sid = (typeof session === 'string' ? session : (session && session.id)) || ''
+        if (!sid) return
+        const cfg = loadConfig()
+        const callActive = isCallActive(sid) // C4 修复：持久激活（Task 7 startCall/stopCall 上报）
+        const a11yOn = cfg.a11y && cfg.a11y.enabled
+        if (!callActive && !a11yOn) return // 仅通话/a11y 会话走流式；语音模式走 Phase 1 队列
+        const data = event.data || {}
+        const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])
+        const text = content.filter(function (b) { return b && b.type === 'text' && typeof b.text === 'string' }).map(function (b) { return b.text }).join('\n').trim()
+        if (!text) return
+        const streamCfg = (cfg.call && cfg.call.stream) || {}
+        const sentences = splitSentences(text, streamCfg.sentenceSplit, streamCfg.maxSentenceChars || 200)
+        const q = voiceQueue.get(sid) || []
+        sentences.forEach(function (s) { q.push({ stream: true, text: s, key: 'stream:' + sid + ':' + event.seq + ':' + s.slice(0, 8) }) })
+        if (q.length > VOICE_QUEUE_MAX) q.splice(0, q.length - VOICE_QUEUE_MAX)
+        voiceQueue.set(sid, q)
+      } catch (e) { /* best effort */ }
+    })
+    // ---- 容错（spec §6.8） ----
+    const lastAgentEvent = new Map() // sessionId -> ts
+    ctx.on('agent/status', function (payload) {
+      try {
+        const agent = payload && payload.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (sid) lastAgentEvent.set(sid, Date.now())
+      } catch (e) { /* ignore */ }
+    })
+    ctx.on('tools/result', function (exec) {
+      try {
+        const agent = exec && exec.agent
+        const sid = agent && agent.session ? String(agent.session.id || '') : ''
+        if (sid) lastAgentEvent.set(sid, Date.now())
+      } catch (e) { /* ignore */ }
+    })
+    function heartbeatCheck() {
+      const now = Date.now()
+      // C4 修复：遍历持久激活集合（callActiveSessions），不再读瞬时 callActiveFlags
+      callActiveSessions.forEach(function (sid) {
+        const last = lastAgentEvent.get(String(sid)) || now
+        if (now - last > 120000) {
+          lastAgentEvent.set(String(sid), now) // 防重复轰炸
+          // C5 同款：生成完成后才入队（占位条目会被 client 先弹出）
+          serialSpeak(function () {
+            return speakImpl({ text: '仍在处理，请稍候', sessionId: String(sid), turnSeq: null, source: 'progress' }).then(function (r) {
+              const q2 = voiceQueue.get(String(sid)) || []
+              if (r && r.ok && r.url) q2.unshift({ url: r.url, key: 'hb:' + String(sid) })
+              else q2.unshift({ error: (r && r.error) || 'tts_failed', message: (r && r.message) || '' })
+              if (q2.length > VOICE_QUEUE_MAX) q2.pop()
+              voiceQueue.set(String(sid), q2)
+            }).catch(function () {})
+          })
+        }
+      })
+    }
+    // R2（2026-08-16 控制器裁定）：双路径心跳——interval 可用走 timerSvc.interval
+    // （disposer 挂 ctx.effect），否则 sleep 递归清扫；两条路径互斥，仅一条运行。
+    // T3 守护：timerSvc 为 null 时 sleep 路径绝不启动（sleep 早退 → Promise 立即 resolve → 忙循环）。
+    function startSleepSweeper() {
+      // 前置分号防 ASI 合并（IIFE 语句）
+      ;(function hb() {
+        sleep(30000).then(function () {
+          heartbeatCheck()
+          hb()
+        })
+      })()
+    }
+    const heartbeatTimer = timerSvc && typeof timerSvc.interval === 'function'
+      ? timerSvc.interval(heartbeatCheck, 30000)
+      : (timerSvc ? startSleepSweeper() : null)
+    if (heartbeatTimer) ctx.effect(heartbeatTimer)
+    ctx.effect(function () {
+      try {
+        return harness.handle('guide-dog/call-command', async function (args) {
+          const sid = args && args.sessionId ? String(args.sessionId) : ''
+          const cmd = args && args.cmd ? String(args.cmd) : ''
+          if (!sid || !cmd) return { ok: false, error: 'bad_args' }
+          if (cmd === 'clear-queue') { voiceQueue.delete(sid); return { ok: true } }
+          return { ok: true }
+        })
+      } catch (e) { return function () {} }
+    })
     // ============ VOICE MODE 节（Phase 1，host） ============
     // 事件形状（决策门 probe2.json 回填）：
     //   - assistant/message 事件键: [type, seq, time, data, ...] → 判定字段 event.type === 'assistant/message'
@@ -1508,6 +2024,7 @@ cp.onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);cp
         const vm = cfg.voiceMode || {}
         const effective = vm.sessions && vm.sessions[sid] !== undefined ? vm.sessions[sid] : vm.default
         if (!effective) return
+        if (isCallActive(sid) || (loadConfig().a11y && loadConfig().a11y.enabled)) return // Phase 2：通话/a11y 由流式通道接管，防双播
         const seq = (typeof event.seq === 'number') ? event.seq : null // M11：缺失时不参与去重（speakImpl 对 null 不去重）
         const data = event.data || {}
         const content = Array.isArray(data.content) ? data.content : (data.message && Array.isArray(data.message.content) ? data.message.content : [])

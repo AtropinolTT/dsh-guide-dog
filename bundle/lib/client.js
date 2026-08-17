@@ -82,16 +82,18 @@ return {
         }
       }).catch(function () {})
     }
-    function setVoiceOverride(sid, v) {
-      const cur = (voiceState.cfg && voiceState.cfg.voiceMode && voiceState.cfg.voiceMode.sessions) || {}
-      const sessions = Object.assign({}, cur)
-      sessions[sid] = !!v // 显式布尔：全局默认开时也能用 false 覆盖关闭该会话
-      return host.call('guide-dog/set-config', { patch: { voiceMode: { sessions: sessions } } }).then(function (r) {
-        if (r && r.ok) return loadVoiceCfg()
-      }).catch(function () {})
+    function setVoiceOverride(sid, value) {
+      const patch = { voiceMode: { sessions: {} } }
+      patch.voiceMode.sessions[sid] = value // M11：单键 patch，不重建整表（host deepMerge 合并）
+      return host.call('guide-dog/set-config', { patch: patch }).then(function (r) {
+        if (r && r.ok) loadVoiceCfg()
+        return r
+      }).catch(function () { return null })
     }
     // ---- 模块级播放器：会话切换不中断；新播放任务覆盖旧任务 ----
     let curAudio = null
+    // ---- M9：录音归属会话（修复：卸载后 onstop 校验归属，丢弃陈旧提交） ----
+    let recSessionRef = null // { sid, alive }：录音归属；卸载置 alive=false → onstop 丢弃
     function stopCurrent() {
       if (curAudio) {
         try { curAudio.pause() } catch (e) { /* ignore */ }
@@ -417,6 +419,7 @@ return {
             React.useEffect(function () {
               // 卸载（切换会话/插件停止）时停止录音器与麦克风流，防隐私泄漏
               return function () {
+                if (recSessionRef) recSessionRef.alive = false // M9：标记录音已死 → 迟到的 onstop 丢弃
                 if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
                 if (micRec) {
                   try { micRec.rec.stop() } catch (e) { /* ignore */ }
@@ -437,7 +440,9 @@ return {
             }, [])
             React.useEffect(function () {
               // 语音模式生效时每秒轮询本会话队列；播放本身在模块级，不受会话切换影响
-              if (!effective || !sid || pollBusy) return
+              // I1（2026-08-16 审稿）：通话期间 stream 条目由通话专用轮询（callPoll）独家消费
+              // ——本轮询停用，保证队列单消费者（Phase 1 的 pop 语义会丢弃无 url 的 stream 条目）
+              if (!effective || callState.active || !sid || pollBusy) return
               pollBusy = true
               host.call('guide-dog/voice-queue', { sessionId: sid }).then(function (r) {
                 if (r && r.ok && r.entry) {
@@ -517,9 +522,14 @@ return {
                   rec.onstop = function () {
                     if (volTimer) { try { volTimer() } catch (e) { /* ignore */ } volTimer = null }
                     if (partialTimer) { try { partialTimer() } catch (e) { /* ignore */ } partialTimer = null }
-                    partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写
+                    partialStale = true // 丢弃在途 partial 结果，防覆盖最终转写（须在守卫之前：陈旧路径上迟到的 partial 也不得 ghost 插入旧会话草稿）
+                    // M9：卸载（会话切换）后 MediaRecorder.stop() 仍异步触发本闭包，而闭包里的 sid/inputActions
+                    // 是录音开始时的值 → 提交前校验录音归属：不属本会话或已卸载（alive=false）→ 丢弃陈旧提交。
+                    // 不能以 micRec==null 判陈旧：正常停止路径（toggleMic）也是先置 micRec=null 再 stop。
+                    if (!recSessionRef || recSessionRef.sid !== sid || !recSessionRef.alive) return // M9：丢弃陈旧提交
                     transcribe(sid, props.inputActions, set)
                   }
+                  recSessionRef = { sid: sid, alive: true } // M9：录音归属当前会话（onstop 提交前校验）
                   rec.start(1000)
                   micRec = { rec: rec, stream: stream, analyser: analyser, volTimer: volTimer }
                   set(function (prev) { return Object.assign({}, prev, { phase: 1, seconds: 0, error: null, vol: null }) })
@@ -628,6 +638,510 @@ return {
           })
       })
     })
+
+    // ============ CALL PANEL 节（Phase 2，client） ============
+    const callState = { active: false, mode: 'vad', phase: 'idle', muted: false, speed: 1, recording: false, error: null }
+    const callSubs = []
+    function setCallState(patch) {
+      Object.assign(callState, patch)
+      callSubs.forEach(function (fn) { try { fn(callState) } catch (e) { /* ignore */ } })
+    }
+    function subscribeCall(fn) { callSubs.push(fn); return function () { const i = callSubs.indexOf(fn); if (i >= 0) callSubs.splice(i, 1) } }
+    // 会话切换：通话状态随会话（header action 是会话级）；切会话时 phase 回 idle 但不自动挂断音频
+    let callSessionId = null
+
+    // ---- 会话 header 发起/挂断按钮（conversation.session.header.actions，order 30） ----
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.session.header.actions', function () {
+          return slots.register(
+            { name: 'conversation.session.header.actions', id: 'guide-dog-call-btn', order: 30, label: function () { return 'Call' } },
+            function (props) {
+              // R12：header.actions 直接携带 inputActions（Task 4 探测定案）→ 存模块级，stopSegment 提交用
+              if (props.inputActions) gdInputActions = props.inputActions
+              const sid = props.sessionId || callSessionId
+              callSessionId = sid
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              const active = callState.active
+              const style = {
+                display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '4px 8px',
+                borderRadius: '6px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l1, #ccc)',
+                background: active ? 'var(--dsw-alias-state-success-primary, #2e7d32)' : 'transparent',
+                color: active ? '#fff' : 'var(--dsw-alias-label-secondary, #666)',
+                fontFamily: 'inherit', fontSize: '12px',
+              }
+              return React.createElement('button', {
+                style: style, title: active ? '挂断通话' : '发起语音通话',
+                onClick: function () {
+                  if (!active) {
+                    setCallState({ active: true, phase: 'listening', recording: false })
+                    startCall(sid) // Task 7 定义：初始化采集
+                  } else {
+                    stopCall() // Task 7 定义：停止采集与播放
+                  }
+                },
+              }, active ? '📞 通话中' : '📞 通话')
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ---- 输入框 dock 状态条（conversation.input.dock，order 31） ----
+    ctx.effect(function () {
+      try {
+        return slots.inject('conversation.input.dock', function () {
+          return slots.register(
+            { name: 'conversation.input.dock', id: 'guide-dog-call-status', order: 31, label: function () { return 'Call status' } },
+            function (props) {
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              if (!callState.active) return null
+              const text = { listening: '收听中…', processing: '处理中…', speaking: '播报中…', idle: '就绪' }[callState.phase] || ''
+              const style = { fontSize: '11px', color: 'var(--dsw-alias-label-secondary, #666)', padding: '0 4px', fontFamily: 'inherit' }
+              return React.createElement('span', { style: style }, text + (callState.muted ? ' · 静音' : ''))
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ---- 通话面板（shell.overlay，order 40：模式切换/录音/静音/语速） ----
+    ctx.effect(function () {
+      try {
+        return slots.inject('shell.overlay', function () {
+          return slots.register(
+            { name: 'shell.overlay', id: 'guide-dog-call-panel', order: 40, label: function () { return 'Call panel' } },
+            function () {
+              const [, force] = React.useState(0)
+              React.useEffect(function () { return subscribeCall(function () { force(Date.now() % 100000) }) }, [])
+              // Task 12：通话专用下行轮询（I1：stream 条目仅由 callPoll 消费；timerSvc 可选）
+              React.useEffect(function () {
+                if (!timerSvc || typeof timerSvc.interval !== 'function') return
+                const stop = timerSvc.interval(function () { callPoll() }, 1000)
+                return function () { try { stop() } catch (e) { /* ignore */ } }
+              }, [])
+              if (!callState.active) return null
+              const panelStyle = {
+                position: 'fixed', right: '16px', bottom: '64px', width: '260px', zIndex: 1000,
+                background: 'var(--dsw-alias-bg-layer-2, #fff)', border: '1px solid var(--dsw-alias-border-l1, #ddd)',
+                borderRadius: '10px', padding: '12px', boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
+                fontFamily: 'inherit', fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #333)',
+              }
+              const rowStyle = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '6px 0' }
+              const btnStyle = { padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--dsw-alias-border-l1, #ccc)', background: 'transparent', cursor: 'pointer', fontFamily: 'inherit', fontSize: '12px' }
+              const micBtnStyle = Object.assign({}, btnStyle, callState.recording ? { background: '#c62828', color: '#fff' } : {})
+              return React.createElement('div', { style: panelStyle },
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('span', null, '语音通话'),
+                  React.createElement('button', { style: btnStyle, onClick: function () { stopCall() } }, '挂断')),
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('span', null, '模式'),
+                  React.createElement('select', {
+                    style: btnStyle, value: callState.mode,
+                    onChange: function (ev) { setCallState({ mode: ev.target.value }) },
+                  },
+                    React.createElement('option', { value: 'vad' }, 'VAD 自动'),
+                    React.createElement('option', { value: 'ptt' }, '按住说话'))),
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('button', { style: micBtnStyle, title: callState.mode === 'ptt' ? '按住说话' : '点击手动结束/开始一段',
+                    onPointerDown: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); startSegment() } },
+                    onPointerUp: function (ev) { if (callState.mode === 'ptt') { ev.preventDefault(); stopSegment() } },
+                    onClick: function () { if (callState.mode !== 'ptt' && !callState.recording) startSegment(); else if (callState.mode !== 'ptt' && callState.recording) stopSegment() },
+                  }, callState.recording ? '■ 录音中' : '🎤 说话'),
+                  React.createElement('span', null, callState.mode === 'ptt' ? '按住说话' : 'VAD 自动')),
+                React.createElement('div', { style: rowStyle },
+                  React.createElement('button', { style: btnStyle, onClick: function () { setCallState({ muted: !callState.muted }) } }, callState.muted ? '🔇 取消静音' : '🔊 静音'),
+                  React.createElement('span', null, '语速 '),
+                  React.createElement('select', {
+                    style: btnStyle, value: String(callState.speed),
+                    onChange: function (ev) { setCallState({ speed: parseFloat(ev.target.value) }) },
+                  },
+                    React.createElement('option', { value: '0.8' }, '0.8x'),
+                    React.createElement('option', { value: '1' }, '1x'),
+                    React.createElement('option', { value: '1.2' }, '1.2x'))),
+                callState.error ? React.createElement('div', { style: { color: 'var(--dsw-alias-state-error-primary, #c62828)', marginTop: '6px' } }, callState.error) : null)
+            })
+        })
+      } catch (e) { return function () {} }
+    })
+
+    // ---- 采集控制接口（Task 7：MediaRecorder + AnalyserNode VAD + PTT + 上传提交） ----
+    // 模块级采集状态（Phase 1 惯例：全部状态模块级，不用 useRef）
+    let callMic = null // { stream, rec, analyser, raf, segmentStart, chunks, segmentSeconds, audioCtx }
+    let callSegmentActive = false
+    let callBargeCb = null // Task 12 设置：用户发声回调（bargeIn 钩子）
+    let callRms = 0 // 最新 RMS（isUserSpeaking 供 Task 8/9 共识窗口查询）
+    let gdInputActions = null // R12：header.actions 的 inputActions（CallButton 渲染时捕获）
+
+    function startCall(sid) {
+      if (callMic) return
+      setCallState({ active: true, phase: 'listening', recording: false, error: null })
+      callActiveRpc('session', true) // C4：持久通话激活（Task 10 进度播报 / Task 11 下行流式判据）
+      try {
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+          // AC 获取（Phase 1 已验证模式）：全局优先，window 兜底
+          var AC = null
+          try { AC = typeof AudioContext !== 'undefined' ? AudioContext : null } catch (e) { AC = null }
+          if (!AC) { try { AC = window.AudioContext || window.webkitAudioContext } catch (e2) { AC = null } }
+          const audioCtx = new AC()
+          const src = audioCtx.createMediaStreamSource(stream)
+          const analyser = audioCtx.createAnalyser()
+          analyser.fftSize = 2048
+          analyser.smoothingTimeConstant = 0.3
+          src.connect(analyser)
+          if (typeof audioCtx.resume === 'function') { try { audioCtx.resume() } catch (e) { /* ignore */ } }
+          let rec = null
+          try { rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' }) } catch (e) { rec = new MediaRecorder(stream) }
+          rec.ondataavailable = function (ev) {
+            if (callMic && callSegmentActive && ev.data && ev.data.size > 0) callMic.chunks.push(ev.data)
+          }
+          callMic = { stream: stream, rec: rec, analyser: analyser, raf: 0, segmentStart: 0, chunks: [], segmentSeconds: 0, audioCtx: audioCtx }
+          // 修正（Task 7）：brief 未调 rec.start() → ondataavailable 永不触发、无任何音频数据。
+          // 录音须整通通话持续运行（timeslice 250ms 出片），段采集由 ondataavailable 的 callSegmentActive 门控
+          try { rec.start(250) } catch (e) { /* ignore */ }
+          // VAD 轮询：能量检测（threshold 可配）
+          const cfg = voiceState.cfg || {}
+          const vad = (cfg.call && cfg.call.vad) || {}
+          const threshold = vad.threshold !== undefined ? vad.threshold : 0.02
+          const minSpeechMs = vad.minSpeechMs !== undefined ? vad.minSpeechMs : 300
+          const silenceMs = vad.silenceMs !== undefined ? vad.silenceMs : 700
+          const maxSeg = (cfg.call && cfg.call.vad && cfg.call.vad.maxSegmentSeconds) || 60
+          let voicedSince = 0, silentSince = 0, lastVoiced = false
+          const sampleBuf = new Uint8Array(analyser.fftSize)
+          const tick = function () {
+            // 修正（Task 7）：rAF 循环须整通通话存活——仅 callMic 清空（stopCall）才终止；
+            // 无活动段时保持轮询并重挂（否则首帧即死、VAD 永不工作；段结束分支同样重挂）
+            if (!callMic) return
+            analyser.getByteTimeDomainData(sampleBuf)
+            let sum = 0
+            for (let i = 0; i < sampleBuf.length; i++) { const v = (sampleBuf[i] - 128) / 128; sum += v * v }
+            const rms = Math.sqrt(sum / sampleBuf.length)
+            callRms = rms // isUserSpeaking 查询用
+            const voiced = rms >= threshold
+            if (!callSegmentActive) {
+              // VAD 自动起段（spec 6.9.1：说话-停顿-说话 两段成回合，无需点击）：
+              // 无活动段且检测到语音 → 自动 startSegment；PTT 模式由 mode 门控排除；
+              // barge-in 在段内路径（下方），auto-start 仅在 !callSegmentActive 时触发，互不冲突
+              if (callState.mode === 'vad' && voiced) startSegment()
+              callMic.raf = requestAnimationFrame(tick)
+              return
+            }
+            const now = Date.now()
+            if (voiced) { voicedSince = now; lastVoiced = true }
+            else if (lastVoiced) { silentSince = now; lastVoiced = false }
+            const isSpeaking = voiced || (now - voicedSince < silenceMs)
+            // 端点：静音 ≥ silenceMs 且说过话（VAD 模式）→ 结束段
+            if (callState.mode === 'vad' && voicedSince > 0 && !voiced && (now - voicedSince) >= silenceMs) {
+              if (now - callMic.segmentStart >= minSpeechMs) stopSegment()
+              else resetSegment() // brief 的 callMic.segments 引用是残留，去掉
+              callMic.raf = requestAnimationFrame(tick)
+              return
+            }
+            // 上限：段超 maxSeg 自动结束
+            if (callSegmentActive && (now - callMic.segmentStart) >= maxSeg * 1000) {
+              stopSegment()
+              callMic.raf = requestAnimationFrame(tick)
+              return
+            }
+            // 打断检测：播放中用户发声 → bargeIn 钩子
+            if (isSpeaking && callState.phase === 'speaking' && voiced && callBargeCb) callBargeCb()
+            callMic.raf = requestAnimationFrame(tick)
+          }
+          callMic.raf = requestAnimationFrame(tick)
+          setCallState({ phase: 'listening' })
+        }).catch(function (err) {
+          setCallState({ active: false, phase: 'idle', error: '麦克风不可用：' + String((err && err.message) || err) })
+        })
+      } catch (e) {
+        setCallState({ active: false, phase: 'idle', error: '麦克风初始化失败：' + String(e) })
+      }
+    }
+
+    function stopCall() {
+      if (callMic) {
+        try { cancelAnimationFrame(callMic.raf) } catch (e) { /* ignore */ }
+        try { if (callMic.rec.state !== 'inactive') callMic.rec.stop() } catch (e) { /* ignore */ }
+        try { callMic.stream.getTracks().forEach(function (t) { t.stop() }) } catch (e) { /* ignore */ }
+        try { callMic.audioCtx.close() } catch (e) { /* ignore */ }
+        callMic = null
+      }
+      callSegmentActive = false
+      callActiveRpc('session', false) // C4：持久激活关闭
+      setCallState({ active: false, phase: 'idle', recording: false })
+      // Task 12：停止下行播放（函数届时落地；typeof 防御保证中间构建不崩）
+      if (typeof stopStreamPlayback === 'function') stopStreamPlayback()
+    }
+
+    function resetSegment() {
+      if (!callMic) return
+      callMic.chunks = []
+      callMic.segmentStart = Date.now()
+      callMic.segmentSeconds = 0
+    }
+
+    function startSegment() {
+      if (!callMic || callSegmentActive) return
+      callSegmentActive = true
+      resetSegment()
+      callActiveRpc('speaking', true) // C4：瞬时发声（共识窗口中止判定用；非持久激活）
+      setCallState({ recording: true })
+    }
+
+    function stopSegment() {
+      if (!callMic || !callSegmentActive) return
+      callSegmentActive = false
+      callActiveRpc('speaking', false)
+      setCallState({ recording: false, phase: 'processing' })
+      const chunks = callMic.chunks
+      callMic.chunks = []
+      if (!chunks.length) { setCallState({ phase: 'listening', error: null }); return }
+      const blob = new Blob(chunks, { type: 'audio/webm' })
+      // 上传 → 转写 → 插入 + 提交（与语音输入同路径）
+      const sid = callSessionId || ''
+      const fd = new FormData()
+      fd.append('audio', blob, 'call-' + Date.now() + '.webm')
+      fetch('/guide-dog/call-transcribe', { method: 'POST', headers: { 'x-session-id': sid }, body: fd }).then(function (r) {
+        return r.json()
+      }).then(function (r) {
+        if (r && r.ok && r.text) {
+          // Task 13：语音命令拦截——命中命令则执行且不提交到对话
+          const cmd = matchCallCommand(r.text)
+          if (cmd) { runCallCommand(cmd); setCallState({ phase: 'listening' }); return }
+          const actions = gdInputActions // R12：header.actions 的 inputActions prop（非 window.__gdInputActions 通道）
+          if (actions) { insertText(actions, r.text); submitInput(actions) }
+          setCallState({ phase: 'listening' })
+        } else {
+          const msg = (r && r.message) || '转写失败'
+          setCallState({ phase: 'listening', error: msg })
+          playBeep()
+          showToast('通话转写失败：' + msg)
+        }
+      }).catch(function (e) {
+        setCallState({ phase: 'listening', error: '上传失败：' + String(e) })
+        showToast('通话上传失败')
+      })
+    }
+
+    function callActiveRpc(kind, active) {
+      host.call('guide-dog/call-active', { sessionId: callSessionId || '', kind: kind, active: active }).catch(function () {})
+    }
+
+    let consensusWindow = false
+    function setConsensusWindow(on) {
+      consensusWindow = !!on
+      if (on && callMic) {
+        // 窗口开启：**不**立即上报（C5 修复：host 端 announceAndWait 在窗口开始后清标志并监听
+        // false→true 跳变；开窗即上报会自噬——host 会把"开窗瞬间的 true"当成用户发声）
+        const threshold = ((voiceState.cfg || {}).call && voiceState.cfg.call.vad && voiceState.cfg.call.vad.threshold) || 0.02
+        const sampleBuf = new Uint8Array(callMic.analyser.fftSize)
+        const probe = function () {
+          if (!consensusWindow || !callMic) return
+          callMic.analyser.getByteTimeDomainData(sampleBuf)
+          let sum = 0
+          for (let i = 0; i < sampleBuf.length; i++) { const v = (sampleBuf[i] - 128) / 128; sum += v * v }
+          const rms = Math.sqrt(sum / sampleBuf.length)
+          if (rms >= threshold * 0.6) { callActiveRpc('speaking', true) } // 真实发声才上报（高灵敏，短音即报）
+          setTimeout(probe, 100)
+        }
+        setTimeout(probe, 100)
+      } else if (!on) {
+        callActiveRpc('speaking', false)
+      }
+    }
+    function notifyConsensusSpeech(started) { setConsensusWindow(started) }
+
+    // 供 Task 8/9 共识窗口查询（brief Interfaces 产物）：当前 RMS 是否达到语音阈值
+    function isUserSpeaking() {
+      const cfg = voiceState.cfg || {}
+      const vad = (cfg.call && cfg.call.vad) || {}
+      const threshold = vad.threshold !== undefined ? vad.threshold : 0.02
+      return callRms >= threshold
+    }
+
+    // ---- 通话轮询（CALL PANEL 节内；I1：不受语音模式门控） ----
+    let callPollBusy = false
+    const callPoll = function () {
+      if (!callState.active || callPollBusy) return
+      callPollBusy = true
+      host.call('guide-dog/voice-queue', { sessionId: callSessionId || '' }).then(function (r) {
+        if (r && r.ok && r.entry) {
+          // C5 修复：consensus 摘要条目（mp3 url + consensus 标记）→ 播放前开共识窗口
+          if (r.entry.consensus) { notifyConsensusSpeech(true); playEntryConsensus(r.entry.url) }
+          else if (r.entry.stream && r.entry.text) { lastSpokenSentence = r.entry.text; playStreamEntry(r.entry, callSessionId || '') }
+          else if (r.entry.url) playEntry(r.entry.url)
+          else if (r.entry.error) { showToast('朗读失败：' + (r.entry.message || r.entry.error)); playBeep() }
+        }
+      }).catch(function () {}).then(function () { callPollBusy = false })
+    }
+    // C5：共识 mp3 播放（window 关闭由 onended 触发；与 playEntry 同机制，附加回调）
+    function playEntryConsensus(url) {
+      stopCurrent()
+      const a = new Audio(String(url))
+      curAudio = a
+      a.onended = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false) }
+      a.onerror = function () { if (curAudio === a) curAudio = null; notifyConsensusSpeech(false); showToast('播放失败') }
+      const p = a.play()
+      if (p && typeof p.catch === 'function') p.catch(function () { if (curAudio === a) { curAudio = null; notifyConsensusSpeech(false) } })
+    }
+    // 挂到 CallPanel 组件的 useEffect（timerSvc.interval 1s）——Task 12 已在 guide-dog-call-panel 组件内接线
+
+    // ============ STREAM PLAYER 节（Phase 2，client） ============
+    const streamPlayer = { controller: null, nodes: [], nextTime: 0, active: false, audioCtx: null, playSeq: 0 }
+    function getTtsToken(sid) {
+      return host.call('guide-dog/tts-token', { sessionId: sid }).then(function (r) {
+        return (r && r.ok && r.token) ? r.token : ''
+      }).catch(function () { return '' })
+    }
+    function ensureStreamCtx() {
+      if (streamPlayer.audioCtx) return streamPlayer.audioCtx
+      const AC = window.AudioContext || window.webkitAudioContext
+      streamPlayer.audioCtx = new AC()
+      return streamPlayer.audioCtx
+    }
+    function pcmToWav(pcm, sampleRate) {
+      const n = pcm.length
+      const out = new Uint8Array(44 + n)
+      const dv = new DataView(out.buffer)
+      const w = function (off, str) { for (let i = 0; i < str.length; i++) out[off + i] = str.charCodeAt(i) }
+      w(0, 'RIFF'); dv.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ')
+      dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true)
+      dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true)
+      w(36, 'data'); dv.setUint32(40, n, true)
+      out.set(pcm, 44)
+      return out
+    }
+    function scheduleChunk(audioCtx, wavBytes) {
+      return audioCtx.decodeAudioData(wavBytes.buffer.slice(0)).then(function (buf) {
+        if (!streamPlayer.active) return
+        const src = audioCtx.createBufferSource()
+        src.buffer = buf
+        src.connect(audioCtx.destination)
+        const when = Math.max(audioCtx.currentTime + 0.05, streamPlayer.nextTime)
+        src.start(when)
+        streamPlayer.nextTime = when + buf.duration
+        streamPlayer.nodes.push(src)
+        src.onended = function () {
+          const i = streamPlayer.nodes.indexOf(src)
+          if (i >= 0) streamPlayer.nodes.splice(i, 1)
+          if (!streamPlayer.nodes.length && streamPlayer.active) {
+            streamPlayer.active = false
+            setCallState({ phase: 'listening' })
+          }
+        }
+      }).catch(function () { /* 解码失败：跳过该块 */ })
+    }
+    async function playStreamEntry(entry, sid) {
+      // R15 修复（Task 12 审稿）：每播一次递增 playSeq —— 旧播放的 abort rejection 不得拆掉新播放的状态
+      const playId = ++streamPlayer.playSeq
+      if (streamPlayer.active) { stopStreamPlayback() } // 新任务覆盖（v2.1 语义）
+      // C3 修复（2026-08-16 审稿）：token 为**单次消费**（consumeTtsToken 即删）——每句都必须重新签发，
+      // 不得缓存复用（旧代码 `if (!streamPlayer.token)` 只取一次 → 第二句起 403）。
+      streamPlayer.token = await getTtsToken(sid)
+      if (!streamPlayer.token) { setCallState({ phase: 'listening', error: '流式播放失败：无 token' }); showToast('流式播放失败：无 token'); return }
+      const cfg = voiceState.cfg || {}
+      const sr = ((cfg.call || {}).stream || {}).sampleRate || 24000
+      streamPlayer.active = true
+      streamPlayer.nextTime = 0
+      const audioCtx = ensureStreamCtx()
+      try { await audioCtx.resume() } catch (e) { /* ignore */ }
+      setCallState({ phase: 'speaking' })
+      if (entry.consensus) notifyConsensusSpeech(true) // Task 9：共识摘要播报开窗口
+      const controller = new AbortController()
+      streamPlayer.controller = controller
+      const url = '/guide-dog/tts-stream?token=' + encodeURIComponent(streamPlayer.token) + '&sid=' + encodeURIComponent(sid) + '&text=' + encodeURIComponent(entry.text)
+      try {
+        const resp = await fetch(url, { signal: controller.signal })
+        if (!resp.ok || !resp.body) { throw new Error('http ' + resp.status) }
+        const reader = resp.body.getReader()
+        let acc = new Uint8Array(0)
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (!streamPlayer.active) { try { controller.abort() } catch (e) { /* ignore */ } break }
+          if (value && value.length) {
+            const merged = new Uint8Array(acc.length + value.length)
+            merged.set(acc); merged.set(value, acc.length)
+            acc = merged
+            // 每 ~0.5s 音频（24000*2*0.5=24000 字节）解码一帧，保持播放间隙 <400ms
+            if (acc.length >= 24000) {
+              const frame = acc.subarray(0, acc.length)
+              const wav = pcmToWav(frame, sr)
+              scheduleChunk(audioCtx, wav)
+              acc = new Uint8Array(0)
+            }
+          }
+        }
+        if (acc.length > 0) { const wav = pcmToWav(acc, sr); scheduleChunk(audioCtx, wav) }
+      } catch (e) {
+        // R15 修复：新播放已接管（playSeq 已递增）→ 旧 abort rejection 直接退出，不拆新播放状态
+        if (playId !== streamPlayer.playSeq) return
+        if (streamPlayer.active) {
+          streamPlayer.active = false
+          setCallState({ phase: 'listening', error: '播放中断' })
+          // 重连一次（C3：每句已重新取 token，playStreamEntry 内部即新 token + GET）
+          if (!playStreamEntry._retried) {
+            playStreamEntry._retried = true
+            showToast('播放中断，已尝试重连')
+            playStreamEntry({ stream: true, text: entry.text, consensus: entry.consensus }, sid)
+            setTimeout(function () { playStreamEntry._retried = false }, 5000)
+          } else {
+            showToast('播放中断')
+          }
+        }
+      } finally {
+        streamPlayer.controller = null
+        if (entry.consensus) notifyConsensusSpeech(false)
+      }
+    }
+    function stopStreamPlayback() {
+      if (streamPlayer.controller) { try { streamPlayer.controller.abort() } catch (e) { /* ignore */ } streamPlayer.controller = null }
+      streamPlayer.active = false
+      streamPlayer.nodes.forEach(function (src) { try { src.stop() } catch (e) { /* ignore */ } })
+      streamPlayer.nodes = []
+      streamPlayer.nextTime = 0
+      notifyConsensusSpeech(false)
+    }
+    // Task 13：打断接线（spec §6.6）——Task 7 VAD 轮询在 phase==='speaking' 且发声时调用本回调
+    callBargeCb = function () {
+      // 打断（spec §6.6）：停播 + 清缓冲（abort fetch 由 stopStreamPlayback 完成）
+      stopStreamPlayback()
+      setCallState({ phase: 'listening' })
+    }
+
+    // ============ 语音命令节（Phase 2） ============
+    function matchCallCommand(text) {
+      const t = String(text || '').replace(/[，。！？\s]/g, '')
+      const table = [
+        { re: /^(停|暂停)$/, cmd: 'pause' },
+        { re: /^(继续|恢复)$/, cmd: 'resume' },
+        { re: /^(重复|再说一遍)$/, cmd: 'repeat' },
+        { re: /^(慢一点|慢些)$/, cmd: 'slower' },
+        { re: /^(快一点|快点)$/, cmd: 'faster' },
+        { re: /^(看看屏幕|看一下屏幕)$/, cmd: 'see_screen' },
+      ]
+      for (const row of table) { if (row.re.test(t)) return row.cmd }
+      return null
+    }
+    let lastSpokenSentence = null // repeat 用
+    function runCallCommand(cmd) {
+      switch (cmd) {
+        case 'pause':
+          if (streamPlayer.active) { stopStreamPlayback(); setCallState({ phase: 'listening' }) }
+          // 清 host 待播队列（防停播后下一句仍到）
+          host.call('guide-dog/call-command', { sessionId: callSessionId || '', cmd: 'clear-queue' }).catch(function () {})
+          break
+        case 'resume':
+          setCallState({ phase: 'listening' }) // 恢复=回到收听（无缓冲重播；Task 14 增强：恢复未播队列）
+          break
+        case 'repeat':
+          if (lastSpokenSentence) { playStreamEntry({ stream: true, text: lastSpokenSentence, consensus: false }, callSessionId || '') }
+          break
+        case 'slower': { const s = Math.min(1.2, callState.speed + 0.2); setCallState({ speed: s }) } break
+        case 'faster': { const s = Math.max(0.8, callState.speed - 0.2); setCallState({ speed: s }) } break
+        case 'see_screen': /* Phase 3 桩 */ break
+        default: break
+      }
+    }
 
     const cardStyle = { border: '1px solid rgba(128,128,128,.35)', borderRadius: 10, padding: 10, marginTop: 6, maxWidth: 640 }
     const rowStyle = { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }
